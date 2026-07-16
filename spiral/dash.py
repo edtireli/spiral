@@ -47,6 +47,8 @@ class Dash:
         self._stop = threading.Event()
         self._live: Live | None = None
         self._thread: threading.Thread | None = None
+        self.mode = ""      # 'auto'/'step' — shown in the status line when set
+        self._paused = False
 
     # -- lifecycle -------------------------------------------------------------
     def __enter__(self) -> "Dash":
@@ -69,6 +71,8 @@ class Dash:
 
     def _anim_loop(self) -> None:
         while not self._stop.wait(0.08):
+            if self._paused:
+                continue
             try:
                 self._live.update(self._render())
             except Exception:
@@ -116,6 +120,29 @@ class Dash:
         # with Live active on this console, prints land ABOVE the pinned region
         self.c.print(*args, **kwargs)
 
+    def pause(self):
+        """Context manager: suspend the pinned region for an interactive prompt."""
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _cm():
+            self._paused = True
+            if self._live:
+                try:
+                    self._live.stop()
+                except Exception:
+                    pass
+            try:
+                yield
+            finally:
+                if self._live:
+                    try:
+                        self._live.start(refresh=True)
+                    except Exception:
+                        pass
+                self._paused = False
+        return _cm()
+
     # -- render --------------------------------------------------------------------
     def _frame(self) -> str:
         return CLASSIC[int((time.time() - self._t0) / 0.08) % len(CLASSIC)]
@@ -130,6 +157,8 @@ class Dash:
         if self._model:
             t.append(f" [{self._model}]", style="dim")
         t.append(f" · {tok} · {el:.0f}s", style="dim")
+        if self.mode:
+            t.append(f" · {self.mode} ⇧⇥", style="dim" if self.mode == "auto" else "bold yellow")
         if self._detail:
             t.append(f"\n    {self._detail}", style="dim")
         return t

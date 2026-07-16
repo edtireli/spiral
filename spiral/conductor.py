@@ -383,6 +383,28 @@ class Conductor:
                 return
             self._remediate(goal, atom, verdicts)
 
+    # -- step-mode gatekeeper: shift-tab flips auto↔step live ---------------------
+    def _gatekeep(self, dash, watcher, label: str) -> str:
+        """Returns 'run' | 'skip' | 'quit'. Only prompts in step mode."""
+        if watcher is None or not watcher.enabled:
+            return "run"
+        dash.mode = watcher.mode
+        if watcher.mode != "step":
+            return "run"
+        watcher.drain()
+        with dash.pause():
+            self.c.print(f"  [bold yellow]⏸ step[/] next: [bold]{label}[/]  [dim](enter run · s skip · a auto · q quit)[/]")
+            k = watcher.ask()
+        if k in ("a", "A"):
+            watcher.mode = "auto"
+            dash.mode = "auto"
+            return "run"
+        if k in ("s", "S"):
+            return "skip"
+        if k in ("q", "Q"):
+            return "quit"
+        return "run"
+
     # -- run ---------------------------------------------------------------------
     def _gate_green(self, ui) -> bool:
         ui.phase("checking gate", model="gate")
@@ -449,8 +471,12 @@ class Conductor:
         total = plan.task_count
         self._write_state(goal=goal[:200], gate=self.gate, tasks_total=total, tasks_done=0, blocked=[])
 
+        from spiral.keys import Watcher
+
+        watcher = Watcher().start()
         # the cockpit: pinned plan panel + live status line for the whole grind
         with Dash(console=c, plan=plan, gate=self.gate) as dash:
+            dash.mode = watcher.mode if watcher.enabled else ""
             dash.set_tokens(0)
 
             # ---- milestone 0: the gate must be green before feature work -------
@@ -491,6 +517,17 @@ class Conductor:
                 dash.print(f"[bold {CLAY}]━━ M{mi}/{len(plan.milestones)}: {m.title} ━━[/]")
                 for ti, t in enumerate(m.tasks, 1):
                     done += 1
+                    decision = self._gatekeep(dash, watcher, f"{mi}.{ti} {t.title}")
+                    if decision == "skip":
+                        dash.print(f"  [yellow]⏭ skipped by you:[/] {mi}.{ti} {t.title}")
+                        blocked.append(f"{mi}.{ti} {t.title} (skipped)")
+                        dash.task(mi, ti, "blocked")
+                        continue
+                    if decision == "quit":
+                        dash.print("  [yellow]■ stopped by you — green work is committed; --resume continues[/]")
+                        watcher.stop()
+                        self._write_state(outcome="user_stop", tokens=atom.tokens)
+                        return
                     dash.task(mi, ti, "run")
                     dash.print(f"[bold]▶ {mi}.{ti} {t.title}[/]  [dim]({done}/{total} · {atom.tokens} tok · {(time.time() - t0) / 60:.0f}m)[/]")
                     verify = t.verify.strip()
@@ -528,6 +565,7 @@ class Conductor:
                     dash.print(f"  [yellow]-[/] {b}")
             self._write_state(outcome="plan_complete", minutes=round(mins, 1))
 
+        watcher.stop()
         self._hook("run_complete", f"{done - len(blocked)}/{total} green")
 
         # ---- hygiene: incremental builds can mask staleness — one clean build ----
