@@ -311,7 +311,7 @@ class Conductor:
         must never read as coverage."""
         c = self.c
         spec = self._load_spec(goal)
-        repomap = build_repomap(self.ws, max_file_bytes=2500, max_total=34_000)
+        repomap = build_repomap(self.ws, max_file_bytes=10_000, max_total=120_000)
         c.print(f"[bold {CLAY}]━━ validation {rnd} · {self.cfg.critic.name} judges code vs {len(spec)} requirements ━━[/]")
         self.ol.evict(self.cfg.planner.name)
 

@@ -212,8 +212,10 @@ VALIDATOR_SYSTEM = (
     "does NOT count. A screen no navigation reaches does NOT count.\n"
     "- partial: some of it exists but is incomplete or unwired.\n"
     "- missing: no meaningful trace in the code.\n"
-    "Cite evidence (file paths / symbols) for every verdict. For every partial or "
-    "missing requirement, provide one small concrete fix task: exact files and exactly "
+    "Cite evidence (file paths / symbols) for every verdict. If a file ends with a "
+    "'…(truncated)' marker, content may exist beyond it — do not judge unseen content "
+    "as missing; say so in the evidence instead. For every partial or missing "
+    "requirement, provide one small concrete fix task: exact files and exactly "
     "what to add or wire. Return ONLY JSON matching the schema."
 )
 

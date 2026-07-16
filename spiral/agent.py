@@ -279,9 +279,21 @@ class Atom:
         if not hits:
             return (f"REPO FACTS: '{sym}' does not exist ANYWHERE in the repo — you must "
                     f"CREATE it (e.g. add the id/definition where it belongs), not reference it.")
-        return ("REPO FACTS — actual occurrences related to "
-                f"'{sym}' (use the EXACT existing identifier, or add the missing one HERE):\n"
-                + "\n".join(hits))
+        facts = ("REPO FACTS — actual occurrences related to "
+                 f"'{sym}' (use the EXACT existing identifier, or add the missing one HERE):\n"
+                 + "\n".join(hits))
+        layouts = sorted({h.split(":")[0].strip() for h in hits if "/layout/" in h})
+        if layouts:
+            facts += (
+                "\nVIEWBINDING SCOPE: an android:id belongs ONLY to its own layout's "
+                f"binding class. Ids found in {', '.join(layouts)} are NOT reachable from "
+                "another layout's binding (e.g. ActivityMainBinding). Either (a) reference "
+                "them through that layout's own binding after inflating it, or (b) add "
+                '<include android:id="@+id/x" layout="@layout/..."/> to the activity layout '
+                "and use binding.x.viewId, or (c) define the view directly in the activity's "
+                "own layout."
+            )
+        return facts
 
     def _clean_paths(self, out: str) -> str:
         """Relativize file:///abs/paths in tool output — kills terminal autolink
