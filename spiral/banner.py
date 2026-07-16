@@ -23,26 +23,45 @@ _DOT = {
 }
 
 
-def spiral_braille(cols: int = 20, rows: int = 9, turns: float = 2.4, progress: float = 1.0) -> list[str]:
-    """Rasterize a logarithmic spiral into a braille grid — same curve as the GUI mark.
+STYLES = ("spiral", "galaxy", "uzumaki")
 
-    ``progress`` (0..1) draws only the inner portion of the spiral, so animating it
-    from 0→1→0 makes the mark wind outward then retract — the "working" animation.
+
+def spiral_braille(cols: int = 20, rows: int = 9, turns: float = 2.4,
+                   progress: float = 1.0, style: str = "spiral") -> list[str]:
+    """Rasterize a spiral into a braille grid — same curve as the GUI mark.
+
+    ``progress`` (0..1) draws only the inner portion, so animating it 0→1→0 makes
+    the mark wind outward then retract — the "working" animation. ``style``:
+    spiral (log, default) · galaxy (two log arms) · uzumaki (dense archimedean).
     """
     width, height = cols * 2, rows * 4
     cells = [[0] * cols for _ in range(rows)]
     cx, cy = width / 2, height / 2
-    tmax = turns * 2 * math.pi
-    a = 0.9
-    b = math.log((min(width, height) / 2 - 1) / a) / tmax  # fit to canvas (full extent)
-    t_end = tmax * max(0.0, min(1.0, progress))
-    t = 0.0
-    while t <= t_end:
-        r = a * math.exp(b * t)
-        px, py = int(round(cx + r * math.cos(t))), int(round(cy + r * math.sin(t)))
+    r_fit = min(width, height) / 2 - 1
+    p = max(0.0, min(1.0, progress))
+
+    def plot(r: float, ang: float) -> None:
+        px, py = int(round(cx + r * math.cos(ang))), int(round(cy + r * math.sin(ang)))
         if 0 <= px < width and 0 <= py < height:
             cells[py // 4][px // 2] |= _DOT[(px % 2, py % 4)]
-        t += 0.02
+
+    if style == "uzumaki":
+        tmax = turns * 1.7 * 2 * math.pi        # denser, hypnotic
+        c = r_fit / tmax
+        t = 0.0
+        while t <= tmax * p:
+            plot(c * t, t)
+            t += 0.015
+    else:
+        tmax = turns * 2 * math.pi
+        a = 0.9
+        b = math.log(r_fit / a) / tmax
+        arms = (0.0, math.pi) if style == "galaxy" else (0.0,)
+        for off in arms:
+            t = 0.0
+            while t <= tmax * p:
+                plot(a * math.exp(b * t), t + off)
+                t += 0.02
     return ["".join(chr(_BRAILLE_BASE + cells[r][c]) for c in range(cols)) for r in range(rows)]
 
 
@@ -140,11 +159,11 @@ class Spinner:
             sys.stdout.flush()
 
 
-def _banner_frame(progress: float, tagline: str):
+def _banner_frame(progress: float, tagline: str, style: str = "spiral"):
     """Compact banner: 4-row spiral beside tracked wordmark + tagline."""
     from rich.console import Group
 
-    sp = spiral_braille(cols=9, rows=4, turns=2.2, progress=progress)
+    sp = spiral_braille(cols=9, rows=4, turns=2.2, progress=progress, style=style)
     lines = []
     for i, ln in enumerate(sp):
         t = Text("  " + ln, style=_rgb(CLAY))
@@ -156,20 +175,31 @@ def _banner_frame(progress: float, tagline: str):
     return Group(*lines)
 
 
-def print_banner(console: Console | None = None, tagline: str = "local autonomous coder · on-device") -> None:
+def _current_style() -> str:
+    try:
+        from spiral.config import Config
+        st = Config.load().spiral_style
+        return st if st in STYLES else "spiral"
+    except Exception:
+        return "spiral"
+
+
+def print_banner(console: Console | None = None, tagline: str = "local autonomous coder · on-device",
+                 style: str | None = None) -> None:
     """Compact launch banner. On a TTY the spiral draws itself in once (~1.1s),
     then settles; piped output gets the static banner only."""
     console = console or Console()
+    style = style or _current_style()
     console.print()
     if sys.stdout.isatty():
         steps = 26
-        with Live(_banner_frame(0.02, tagline), console=console,
+        with Live(_banner_frame(0.02, tagline, style), console=console,
                   refresh_per_second=30, transient=True) as live:
             for i in range(steps):
                 p = (1 - math.cos(math.pi * (i + 1) / steps)) / 2  # eased 0→1
-                live.update(_banner_frame(max(p, 0.02), tagline))
+                live.update(_banner_frame(max(p, 0.02), tagline, style))
                 time.sleep(1.1 / steps)
-    console.print(_banner_frame(1.0, tagline))
+    console.print(_banner_frame(1.0, tagline, style))
     console.print()
 
 

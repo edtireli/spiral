@@ -68,6 +68,8 @@ def main(workspace: str = ".") -> int:
         row(True, "last run", f"{s.get('outcome', '?')} · {s.get('tokens', 0):,} tok · {s.get('ts', '')}")
 
     c.print()
+    if any(spec.name not in installed for spec in (cfg.worker, cfg.escalation)):
+        c.print("  [yellow]→ missing models?[/] run [bold]spiral setup[/] to pull a RAM-matched crew\n")
     if problems:
         c.print(f"  [red]{problems} problem(s) need attention[/]\n")
         return 1

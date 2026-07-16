@@ -98,6 +98,11 @@ def main() -> None:
     doc = sub.add_parser("doctor", help="health check: ollama, models, tune, gate, git, disk")
     doc.add_argument("--dir", default=".")
 
+    sub.add_parser("setup", help="first-run: detect Ollama + pull a RAM-matched model crew")
+
+    sty = sub.add_parser("style", help="set the banner spiral shape: spiral · galaxy · uzumaki")
+    sty.add_argument("name", nargs="?", help="omit to preview all three")
+
     note = sub.add_parser("note", help="record project wisdom the workers will always see")
     note.add_argument("text")
     note.add_argument("--dir", default=".")
@@ -121,6 +126,34 @@ def main() -> None:
         from spiral.doctor import main as doctor_main
 
         raise SystemExit(doctor_main(args.dir))
+
+    if args.cmd == "setup":
+        from spiral.setup import main as setup_main
+
+        raise SystemExit(setup_main())
+
+    if args.cmd == "style":
+        from spiral.banner import STYLES, spiral_braille, _rgb, CLAY as _CL, _current_style
+        import json as _json
+
+        if args.name and args.name in STYLES:
+            f = Path.home() / ".config" / "spiral" / "config.json"
+            f.parent.mkdir(parents=True, exist_ok=True)
+            d = _json.loads(f.read_text()) if f.is_file() else {}
+            d["style"] = args.name
+            f.write_text(_json.dumps(d, indent=2))
+            console.print(f"  [green]●[/] banner style set to [bold]{args.name}[/]\n")
+        else:
+            if args.name:
+                console.print(f"  [yellow]unknown style '{args.name}'[/] — choose one of:\n")
+            cur = _current_style()
+            for st in STYLES:
+                console.print(f"  [bold]{st}[/]" + ("  [dim](current)[/]" if st == cur else ""))
+                for ln in spiral_braille(cols=10, rows=4, turns=2.2, style=st):
+                    console.print(f"    [{_rgb(_CL)}]{ln}[/]")
+                console.print()
+            console.print("  set with: [bold]spiral style <name>[/]\n")
+        return
 
     if args.cmd == "note":
         from spiral.extras import add_note

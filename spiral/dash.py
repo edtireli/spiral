@@ -56,7 +56,8 @@ class Dash:
     # -- lifecycle -------------------------------------------------------------
     def __enter__(self) -> "Dash":
         if self.c.is_terminal:
-            self._live = Live(self._render(), console=self.c, refresh_per_second=12)
+            self._live = Live(self._render(), console=self.c, refresh_per_second=12,
+                              vertical_overflow="crop")
             self._live.__enter__()
             self._thread = threading.Thread(target=self._anim_loop, daemon=True)
         else:
@@ -188,17 +189,28 @@ class Dash:
             if (0, 0) in self.status:
                 mark, style = self._MARKS.get(self.status[(0, 0)], ("○", "dim"))
                 rows.append(Text(f" {mark} M0 make the build gate pass", style=style))
-            for mi, m in enumerate(self.plan.milestones, 1):
+            # Only EXPAND the active milestone's tasks — collapse the rest to header
+            # lines. Keeps the pinned panel short enough to fit ANY terminal height
+            # (a live region taller than the screen cascades — the cause of the spam).
+            ms = self.plan.milestones
+            active = next((mi for mi, m in enumerate(ms, 1)
+                           if any(self.status.get((mi, ti)) == "run" for ti in range(1, len(m.tasks) + 1))), None)
+            if active is None:
+                active = next((mi for mi, m in enumerate(ms, 1)
+                               if sum(1 for (a, _), s in self.status.items() if a == mi and s == "done") < len(m.tasks)), None)
+            for mi, m in enumerate(ms, 1):
                 mdone = sum(1 for (a, _), s in self.status.items() if a == mi and s == "done")
+                done_all = mdone >= len(m.tasks)
                 head = Text()
-                head.append(f" ◆ M{mi} ", style=f"bold {CLAY}")
-                head.append(m.title[:52], style="bold")
+                head.append(f" ◆ M{mi} ", style=f"bold {CLAY}" if mi == active else ("green" if done_all else "dim"))
+                head.append(m.title[:46], style="bold" if mi == active else "dim")
                 head.append(f"  {mdone}/{len(m.tasks)}", style="dim")
                 rows.append(head)
-                for ti, t in enumerate(m.tasks, 1):
-                    s = self.status.get((mi, ti))
-                    mark, style = self._MARKS.get(s, ("○", "dim"))
-                    rows.append(Text(f"   {mark} {mi}.{ti} {t.title[:56]}", style=style))
+                if mi == active:
+                    for ti, t in enumerate(m.tasks, 1):
+                        s = self.status.get((mi, ti))
+                        mark, style = self._MARKS.get(s, ("○", "dim"))
+                        rows.append(Text(f"   {mark} {mi}.{ti} {t.title[:52]}", style=style))
             total = self.plan.task_count
             el = (time.time() - self._t0) / 60
             footer = (f"\n {self._done}/{total} green · {self._blocked} blocked · "

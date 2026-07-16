@@ -81,6 +81,7 @@ class Config:
 
     # theme — clay brand + a hacker triad mapped to verify-loop states
     clay: str = "#D97757"          # brand / prompt / the mark
+    spiral_style: str = "spiral"   # banner shape: spiral · galaxy · uzumaki
     live_green: str = "#35f0a0"    # tests green / task committed
     working_amber: str = "#ffb000" # generating / verifying
     fail_red: str = "#ff5c57"      # verify failed / stuck
@@ -117,6 +118,7 @@ class Config:
                     spec.num_ctx = int(overlay["num_ctx"][spec.name])
             cfg.base_url = os.environ.get("SPIRAL_BASE_URL", overlay.get("base_url", cfg.base_url))
             cfg.extra_gate = overlay.get("extra_gate", cfg.extra_gate)
+            cfg.spiral_style = os.environ.get("SPIRAL_STYLE", overlay.get("style", cfg.spiral_style))
         except Exception:
             pass  # a broken overlay must never break spiral
         return cfg
