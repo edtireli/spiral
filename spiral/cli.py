@@ -84,6 +84,8 @@ def main() -> None:
         p.add_argument("--dir", default=".")
         if name == "build":
             p.add_argument("--resume", action="store_true")
+            p.add_argument("--approve", action="store_true",
+                           help="show the plan and wait for confirmation before executing")
 
     res = sub.add_parser("research", help="search the web and read top hits (GET-only)")
     res.add_argument("query")
@@ -93,6 +95,20 @@ def main() -> None:
     tune.add_argument("--apply", action="store_true")
     tune.add_argument("--wired", action="store_true", help="also raise the GPU wired-memory limit (sudo)")
 
+    doc = sub.add_parser("doctor", help="health check: ollama, models, tune, gate, git, disk")
+    doc.add_argument("--dir", default=".")
+
+    note = sub.add_parser("note", help="record project wisdom the workers will always see")
+    note.add_argument("text")
+    note.add_argument("--dir", default=".")
+
+    st = sub.add_parser("stats", help="run history from the ledger: tokens, tok/s, outcomes")
+    st.add_argument("--dir", default=".")
+
+    rw = sub.add_parser("rewind", help="list task checkpoints; rewind the spiral branch to one")
+    rw.add_argument("n", nargs="?", type=int, help="checkpoint number to rewind to")
+    rw.add_argument("--dir", default=".")
+
     args = parser.parse_args()
     console = make_console()
 
@@ -100,6 +116,29 @@ def main() -> None:
         from spiral.tune import main as tune_main
 
         raise SystemExit(tune_main())
+
+    if args.cmd == "doctor":
+        from spiral.doctor import main as doctor_main
+
+        raise SystemExit(doctor_main(args.dir))
+
+    if args.cmd == "note":
+        from spiral.extras import add_note
+
+        add_note(console, args.dir, args.text)
+        return
+
+    if args.cmd == "stats":
+        from spiral.extras import show_stats
+
+        show_stats(console, args.dir)
+        return
+
+    if args.cmd == "rewind":
+        from spiral.extras import rewind
+
+        rewind(console, args.dir, args.n)
+        return
 
     if args.cmd == "research":
         from spiral.research import research
@@ -134,7 +173,8 @@ def main() -> None:
         elif args.cmd == "validate":
             cond.validate_only(goal)
         else:
-            cond.build(goal, resume=getattr(args, "resume", False))
+            cond.build(goal, resume=getattr(args, "resume", False),
+                       approve=getattr(args, "approve", False))
         return
 
     print_banner(console)

@@ -75,6 +75,10 @@ class Config:
     run_token_budget: int = 4_000_000  # global ceiling for a whole run
     verify_timeout: int = 900          # seconds; real build gates (gradle) are slow
 
+    # user-defined extra gate welded into every task's verify (your own linter,
+    # tests, anything) — set "extra_gate" in ~/.config/spiral/config.json
+    extra_gate: str = ""
+
     # theme — clay brand + a hacker triad mapped to verify-loop states
     clay: str = "#D97757"          # brand / prompt / the mark
     live_green: str = "#35f0a0"    # tests green / task committed
@@ -112,6 +116,7 @@ class Config:
                 if spec.name in overlay.get("num_ctx", {}):
                     spec.num_ctx = int(overlay["num_ctx"][spec.name])
             cfg.base_url = os.environ.get("SPIRAL_BASE_URL", overlay.get("base_url", cfg.base_url))
+            cfg.extra_gate = overlay.get("extra_gate", cfg.extra_gate)
         except Exception:
             pass  # a broken overlay must never break spiral
         return cfg
