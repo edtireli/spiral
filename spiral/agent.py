@@ -47,6 +47,9 @@ SYSTEM = (
     "- Make the SMALLEST change that makes the verification command pass.\n"
     "- If the TASK is ALREADY fully implemented in the FILES shown, reply with "
     "exactly: ALREADY_DONE (nothing else).\n"
+    "- If you must reference an identifier, signature, or file you cannot SEE in "
+    "FILES, do NOT invent it. Reply exactly:  ASK: grep <name>   (or: ASK: file "
+    "<path>) and nothing else. Max 2 ASKs per task, never repeat one.\n"
     "- Output ONLY blocks — no prose, no explanations, no code fences."
 )
 
@@ -114,7 +117,8 @@ class Atom:
             return ""
 
     def _prompt(self, task: TaskSpec, files: list[str], verify_out: str, apply_errs: str,
-                skills_text: str = "", tried: list[str] | None = None) -> str:
+                skills_text: str = "", tried: list[str] | None = None,
+                repo_answers: str = "") -> str:
         """Prompt layout is cache-conscious: stable content (project, task, files)
         FIRST, volatile content (verify output, apply errors) LAST. Ollama reuses
         the KV cache for the unchanged prefix between attempts — on a 10k-token
@@ -142,6 +146,9 @@ class Atom:
             budget -= len(body)
             parts += [f"--- {rel} ---", body, ""]
         parts += ["CURRENT VERIFY OUTPUT:", verify_out or "(none)", ""]
+        if repo_answers:
+            parts += ["REPO ANSWERS (from your ASKs — ground truth, use these exact names):",
+                      repo_answers, ""]
         if tried:
             parts += ["ALREADY TRIED THIS TASK (do NOT repeat these — take a DIFFERENT approach):",
                       *[f"- {t}" for t in tried[-6:]], ""]
@@ -340,12 +347,17 @@ class Atom:
         stall = 0
         tried: list[str] = []          # per-task attempt memory — no more synonym roulette
         err_seen: dict[str, int] = {}  # repeated error sigs trigger the symbol hunter
+        asks_used = 0
+        asked: set[str] = set()
+        repo_answers = ""
         scratch = self.ws / ".spiral" / "scratch"
         scratch.mkdir(parents=True, exist_ok=True)
-        for attempt in range(1, budget + 1):
+        attempt = 0
+        while attempt < budget:
+            attempt += 1
             ui.print(f"  [dim]— attempt {attempt}/{budget} · {model_name} —[/]")
             tried = self._compact_tried(tried)
-            prompt = self._prompt(task, files, verify_out, apply_errs, skills_text, tried)
+            prompt = self._prompt(task, files, verify_out, apply_errs, skills_text, tried, repo_answers)
             msgs = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": prompt}]
 
             ui.phase("building", model=model_name)
@@ -372,6 +384,30 @@ class Atom:
             self.tokens += res.total_tokens
             gen_s = round(time.time() - t_gen, 1)
             (scratch / "last_reply.txt").write_text(res.text)  # always inspectable
+
+            ask = re.match(r"^ASK:\s*(grep|file)\s+(.+?)\s*$", res.text.strip()[:300], re.I | re.M)
+            if ask:
+                what, q = ask.group(1).lower(), ask.group(2).strip()
+                key = f"{what}:{q}"
+                if asks_used >= 2 or key in asked:
+                    apply_errs = "ASK budget exhausted or repeated — emit SEARCH/REPLACE edits with what you have."
+                    ui.print(f"  [yellow]⌕ ask rejected ({'repeat' if key in asked else 'budget'}):[/] [dim]{what} {q[:50]}[/]")
+                    continue
+                asked.add(key)
+                asks_used += 1
+                attempt -= 1  # asks are cheap (no gate run) — they don't consume attempts
+                if what == "grep":
+                    answer = tools.grep(self.ws, q, max_hits=12)
+                    self._absorb_error_files(answer, files)
+                else:
+                    answer = self._read(q, cap=6_000) or f"(no such file: {q})"
+                    if (self.ws / q).is_file() and q not in files and len(files) < 14:
+                        files.append(q)
+                repo_answers += f"\n--- ASK {what} {q} ---\n{answer[:3000]}\n"
+                n_hits = answer.count(chr(10)) + 1 if answer else 0
+                ui.print(f"  [rgb(217,119,87)]⌕ ask:[/] {what} [bold]{q[:60]}[/] [dim]→ {n_hits} line(s) fed back[/]")
+                self.ledger.log("ask", task=task.goal[:60], what=what, q=q[:80], lines=n_hits)
+                continue
 
             blocks = parse_edits(res.text)
             if not blocks and "ALREADY_DONE" in res.text[:80]:
