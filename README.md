@@ -25,7 +25,7 @@
   <a href="#philosophy">Philosophy</a>
 </p>
 
----
+<p align="center"><img src="assets/divider.svg" width="520" alt=""/></p>
 
 spiral is a local-first autonomous coding CLI. It decomposes your goal into a
 spec, writes itself a design brief, plans against a critic's review, then grinds
@@ -34,7 +34,7 @@ gate, every green task a git commit, every failure banked as progress instead of
 lost. At the end, a validator audits the code against every requirement and
 keeps working until the spec is green. No API keys. No cloud. No babysitting.
 
-## Install
+## <img src="assets/mark.svg" width="21" alt=""/> Install
 
 ```bash
 pip install spiral-coder
@@ -43,7 +43,7 @@ pip install spiral-coder
 Requires Python 3.11+, [Ollama](https://ollama.com), and a capable local model
 (Apple Silicon with 32 GB+ recommended — see [Requirements](#requirements)).
 
-## Sixty seconds
+## <img src="assets/mark.svg" width="21" alt=""/> Sixty seconds
 
 ```bash
 spiral doctor                     # is this machine ready?
@@ -63,7 +63,7 @@ touched), commits every verified step, and ends with the receipts:
 ╰────────────────────────────────────────────────────────────────────────╯
 ```
 
-## What a run looks like
+## <img src="assets/mark.svg" width="21" alt=""/> What a run looks like
 
 A pinned cockpit shows the plan with live markers while events scroll above it:
 
@@ -111,7 +111,7 @@ every extracted requirement, and gaps become new work:
 ▶ V.1 implement R14 …
 ```
 
-## How it works
+## <img src="assets/mark.svg" width="21" alt=""/> How it works
 
 ```
  spec extraction ──▶ design brief ──▶ plan ──▶ critic review ──▶ repair
@@ -148,7 +148,7 @@ repo facts injected) → escalation to the stronger model.
 | critic / validator / designer | `qwen3.6:27b`, thinking | a different brain reviews plans, judges specs, writes design briefs |
 | janitor | `llama3.2:1b` | compacts attempt history |
 
-## Commands
+## <img src="assets/mark.svg" width="21" alt=""/> Commands
 
 | command | what it does |
 |---|---|
@@ -165,7 +165,7 @@ repo facts injected) → escalation to the stronger model.
 | `spiral rewind [n]` | list task checkpoints; roll the spiral branch back |
 | `spiral research "query"` | GET-only web search + page reading |
 
-## Live controls
+## <img src="assets/mark.svg" width="21" alt=""/> Live controls
 
 While a run is grinding:
 
@@ -173,7 +173,7 @@ While a run is grinding:
 - **step mode** — pauses at every task boundary: `enter` run · `s` skip · `a` back to auto · `q` stop cleanly
 - **Ctrl-C** — always safe: green work is committed, banked checkpoints kept, `--resume` continues
 
-## Configuration
+## <img src="assets/mark.svg" width="21" alt=""/> Configuration
 
 Models are plugs — swap per-shell or persistently:
 
@@ -203,7 +203,7 @@ export SPIRAL_BASE_URL=http://localhost:11434
 - **`hooks`** — shell commands fired at `task_green` / `blocked` /
   `run_complete` / `spec_green`, with `$SPIRAL_EVENT` and `$SPIRAL_INFO` set.
 
-## Teaching spiral
+## <img src="assets/mark.svg" width="21" alt=""/> Teaching spiral
 
 spiral learns your project three ways:
 
@@ -222,41 +222,41 @@ motion timings in ms, verbatim microcopy) is generated once per project — or
 written by you at `.spiral/design.md` — and rides every prompt. The executor
 implements decisions, not vibes.
 
-## Philosophy
+## <img src="assets/mark.svg" width="21" alt=""/> Philosophy
 
 Every rule below was bought with a real failure:
 
-- **Never trust the model's opinion of "done."** Exit codes, artifacts, audits,
+<img src="assets/dot.svg" width="13" alt=""/> **Never trust the model's opinion of "done."** Exit codes, artifacts, audits,
   and spec verdicts — a green gate is not a built feature.
-- **Progress is banked.** Bootstrap repairs commit checkpoints per resolved
+<img src="assets/dot.svg" width="13" alt=""/> **Progress is banked.** Bootstrap repairs commit checkpoints per resolved
   error; a failed marathon resumes where it stopped.
-- **Terminate on progress, not budgets.** A lane stops after 3 attempts without
+<img src="assets/dot.svg" width="13" alt=""/> **Terminate on progress, not budgets.** A lane stops after 3 attempts without
   a newly-resolved error — never wastes 12 attempts saying the same thing.
-- **The harness drives; models only generate.** That inversion is why ~3B active
+<img src="assets/dot.svg" width="13" alt=""/> **The harness drives; models only generate.** That inversion is why ~3B active
   parameters can do this job at all.
-- **Silence must never read as coverage.** Unjudged requirements are shouted,
+<img src="assets/dot.svg" width="13" alt=""/> **Silence must never read as coverage.** Unjudged requirements are shouted,
   truncated JSON is salvaged, empty commits are rejected.
 
-## Extras
+## <img src="assets/mark.svg" width="21" alt=""/> Extras
 
 ```bash
 python -m spiral.banner --vortex     # you'll see
 python experiments/sinks_test.py     # what survives context overflow?
 ```
 
-## Requirements
+## <img src="assets/mark.svg" width="21" alt=""/> Requirements
 
 - macOS on Apple Silicon (32 GB+ unified memory recommended) or Linux
 - [Ollama](https://ollama.com) with at least one strong local model
 - Python 3.11+ · git
 
-## Roadmap
+## <img src="assets/mark.svg" width="21" alt=""/> Roadmap
 
 LSP fast-gate (instant diagnostics between full builds) · evidence-based lane
 routing from the ledger · esc-to-interrupt mid-attempt · parallel tasks via git
 worktrees · `--json` event stream + CI action.
 
----
+<p align="center"><img src="assets/divider.svg" width="520" alt=""/></p>
 
 <p align="center">
   MIT · Built by <b>Edis Devin Tireli</b> · Ph.D. Fellow, University of Copenhagen
