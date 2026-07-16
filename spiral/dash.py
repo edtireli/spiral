@@ -12,6 +12,7 @@ rendered as the one-line spinner.
 """
 from __future__ import annotations
 
+import collections
 import sys
 import threading
 import time
@@ -49,6 +50,8 @@ class Dash:
         self._thread: threading.Thread | None = None
         self.mode = ""      # 'auto'/'step' — shown in the status line when set
         self._paused = False
+        self._samples: collections.deque = collections.deque(maxlen=60)  # (t, tok) for live t/s
+        self._done_times: list[float] = []                               # green timestamps for ETA
 
     # -- lifecycle -------------------------------------------------------------
     def __enter__(self) -> "Dash":
@@ -85,7 +88,7 @@ class Dash:
             line = f"  ⠿ [{stamp}] {self._phase}"
             if self._model:
                 line += f" [{self._model}]"
-            line += f" · {tok} · {time.time() - self._phase_t0:.0f}s"
+            line += f" · {tok} · {time.time() - self._phase_t0:.0f}s · Σ{(time.time() - self._t0) / 60:.0f}m"
             if self._detail:
                 line += f" · {self._detail}"
             sys.stdout.write(line + "\n")
@@ -96,9 +99,18 @@ class Dash:
         self._phase, self._model = name, model
         self._phase_t0 = time.time()
         self._detail = ""
+        self._samples.clear()  # t/s is per-generation, not across phases
 
     def tick(self, n: int = 1) -> None:
         self._tokens += n
+        self._samples.append((time.time(), self._tokens))
+
+    def _tps(self) -> float:
+        if len(self._samples) < 2:
+            return 0.0
+        (t0, k0), (t1, k1) = self._samples[0], self._samples[-1]
+        dt = t1 - t0
+        return (k1 - k0) / dt if dt > 0.5 else 0.0
 
     def set_tokens(self, n: int) -> None:
         self._tokens = n
@@ -113,6 +125,7 @@ class Dash:
             return  # M0 bootstrap shows in the panel but isn't a plan task (no 13/12)
         if state == "done" and prev != "done":
             self._done += 1
+            self._done_times.append(time.time())
         if state == "blocked" and prev != "blocked":
             self._blocked += 1
 
@@ -157,6 +170,9 @@ class Dash:
         if self._model:
             t.append(f" [{self._model}]", style="dim")
         t.append(f" · {tok} · {el:.0f}s", style="dim")
+        tps = self._tps()
+        if tps > 0:
+            t.append(f" · {tps:.0f} t/s", style="dim")
         if self.mode:
             t.append(f" · {self.mode} ⇧⇥", style="dim" if self.mode == "auto" else "bold yellow")
         if self._detail:
@@ -185,10 +201,13 @@ class Dash:
                     rows.append(Text(f"   {mark} {mi}.{ti} {t.title[:56]}", style=style))
             total = self.plan.task_count
             el = (time.time() - self._t0) / 60
-            rows.append(Text(
-                f"\n {self._done}/{total} green · {self._blocked} blocked · {el:.0f}m elapsed",
-                style="dim",
-            ))
+            footer = (f"\n {self._done}/{total} green · {self._blocked} blocked · "
+                      f"Σ {self._tokens / 1000:.1f}k tok · {el:.0f}m elapsed")
+            remaining = total - self._done - self._blocked
+            if len(self._done_times) >= 2 and remaining > 0:
+                pace = (self._done_times[-1] - self._done_times[0]) / (len(self._done_times) - 1)
+                footer += f" · eta ~{pace * remaining / 60:.0f}m"
+            rows.append(Text(footer, style="dim"))
             parts.append(Panel(Group(*rows), title=f"[{CLAY}]⠷ plan[/]", border_style=CLAY, padding=(0, 1)))
         parts.append(self._status_text(final))
         return Group(*parts)
