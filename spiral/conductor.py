@@ -271,6 +271,27 @@ class Conductor:
         except Exception:
             pass  # distillation must never break the run
 
+    # -- the victory lap: one card that tells the whole run ------------------------
+    def _summary_card(self, atom: Atom, t0: float, done: int, blocked: list, total: int) -> None:
+        st = atom.run_stats
+        mins = (time.time() - t0) / 60
+        # what this run would have cost on a typical cloud API (Sonnet-class rates)
+        cloud = st["ptok"] * 3 / 1e6 + st["ctok"] * 15 / 1e6
+        lines = []
+        spec_green = self.state.get("spec_green")
+        verdict = ("[bold green]SPEC-GREEN[/]" if spec_green
+                   else f"[yellow]{len(self.state.get('gaps', []))} spec gap(s) remain[/]" if spec_green is False
+                   else "[dim]spec not validated[/]")
+        lines.append(f"[bold]{done - len(blocked)}/{total}[/] tasks green · {len(blocked)} blocked · {verdict}")
+        lines.append(f"Σ [bold]{atom.tokens:,}[/] tok ({st['ptok'] // 1000}k in / {st['ctok'] // 1000}k out) "
+                     f"· {st['attempts']} attempts · {st['esc_lanes']} escalation(s) · {mins:.0f}m wall")
+        for m, tps in sorted(st["tps"].items()):
+            med = sorted(tps)[len(tps) // 2]
+            lines.append(f"[dim]{m}[/] · {len(tps)} gen · median {med:.0f} t/s")
+        lines.append(f"≈ [bold]${cloud:.2f}[/] of cloud API · spent [bold green]$0.00[/] · your hardware, your tokens")
+        self.c.print(Panel("\n".join(lines), title=f"[{CLAY}]⠷ run summary[/]",
+                           border_style=CLAY, padding=(0, 1)))
+
     # -- validation: judge the CODE against the SPEC, then close the gaps ---------
     def _load_spec(self, goal: str) -> list[dict]:
         f = self._dir() / "spec.json"
@@ -423,6 +444,7 @@ class Conductor:
         if atom.run(spec, attempts=attempts, strict_green=strict, ratchet=ratchet, ui=ui):
             return "green"
         ui.print(f"  [rgb(217,119,87)]⇑ escalating to {self.cfg.escalation.name}[/]")
+        atom.run_stats["esc_lanes"] += 1
         if atom.run(
             spec, model=self.cfg.escalation.name,
             attempts=esc_attempts or self.cfg.escalation_attempts,
@@ -579,3 +601,4 @@ class Conductor:
         self._validate_loop(goal, atom)
         self._write_state(outcome="complete", tokens=atom.tokens,
                           minutes=round((time.time() - t0) / 60, 1))
+        self._summary_card(atom, t0, done, blocked, total)

@@ -87,6 +87,8 @@ class Atom:
         self.ol = Ollama(self.cfg.base_url)
         self.c = console or make_console()
         self.tokens = 0  # cumulative, for the conductor's budget
+        self.run_stats: dict = {"attempts": 0, "green": 0, "ptok": 0, "ctok": 0,
+                                "tps": {}, "esc_lanes": 0}
         self.ledger = Ledger(self.ws)
         self.skills = load_skills(self.ws)
 
@@ -442,6 +444,14 @@ class Atom:
                 tps=round(res.completion_tokens / gen_s, 1) if gen_s > 0 else None,
                 applied=len(applied), failed=len(failed), verify_exit=verify.code,
             )
+            st = self.run_stats
+            st["attempts"] += 1
+            st["ptok"] += res.prompt_tokens
+            st["ctok"] += res.completion_tokens
+            if verify.ok:
+                st["green"] += 1
+            if gen_s > 0:
+                st["tps"].setdefault(model_name, []).append(res.completion_tokens / gen_s)
             if failed:
                 ui.print(f"  [yellow]○[/] {len(failed)} block(s) didn't apply")
             if not verify.ok:
