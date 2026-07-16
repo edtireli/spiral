@@ -72,6 +72,9 @@ class Conductor:
             # runtime-footgun linter rides the gate: compiles-fine-crashes-at-runtime
             # patterns get fixed by the same loop as compile errors
             self.gate = f"({self.gate}) && ({sys.executable} -m spiral.footguns .)"
+        if self.cfg.extra_gate:
+            # user-defined blocking gate (their linter/tests) — veto power on every task
+            self.gate = f"({self.gate}) && ({self.cfg.extra_gate})" if self.gate else self.cfg.extra_gate
         self.state: dict = {}
         self.ledger = Ledger(self.ws)
 
@@ -420,7 +423,7 @@ class Conductor:
         except Exception:
             pass
 
-    def build(self, goal: str, resume: bool = False) -> None:
+    def build(self, goal: str, resume: bool = False, approve: bool = False) -> None:
         from spiral.dash import Dash
 
         c = self.c
@@ -433,6 +436,13 @@ class Conductor:
             plan = self.make_plan(goal)
         goal = self._goal_with_design(goal)
         self.show_plan(plan)
+        if approve:
+            import sys as _sys
+            if _sys.stdin.isatty():
+                ans = input("  execute this plan? [y/N] ").strip().lower()
+                if ans != "y":
+                    c.print("  [dim]aborted — plan is saved; rerun with --resume to use it[/]")
+                    return
 
         atom = Atom(self.ws, self.cfg, console=c)
         blocked: list[str] = []

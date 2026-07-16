@@ -323,6 +323,9 @@ class Atom:
             ui.print("  [yellow]⚠ no verify gate for this task — applying blind[/]")
 
         cards = match_skills(task.goal, self.skills, files=files)
+        notes = next((c_ for c_ in self.skills if c_.name == "project-notes"), None)
+        if notes and notes not in cards:
+            cards.append(notes)  # user notes ALWAYS ride along
         skills_text = render_for_prompt(cards, budget=5_000) if cards else ""
         if cards:
             ui.print(f"  [dim]skills: {', '.join(c.name for c in cards)}[/]")
