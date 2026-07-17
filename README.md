@@ -38,8 +38,13 @@ which ones remain. No API keys and no network calls to a model provider.
 ## <img src="assets/mark.svg" width="21" alt=""/> Install
 
 ```bash
+pipx install spiral-coder     # isolated, puts `spiral` on your PATH (recommended)
+# or
 pip install spiral-coder
 ```
+
+Either way you get a global `spiral` command. From a clone, `pip install -e .`
+installs it in editable mode.
 
 Requires Python 3.11+, [Ollama](https://ollama.com), and at least one local
 model. Apple Silicon with 32 GB+ of unified memory is recommended for the
@@ -177,7 +182,10 @@ spiral supplies context in stages rather than relying on the model to ask:
 | `spiral note "text"` | add a note that is included in every worker prompt |
 | `spiral rewind [n]` | list task checkpoints and reset the run branch to one |
 | `spiral style [name]` | set the banner shape: `spiral`, `galaxy`, or `uzumaki` |
-| `spiral research "query"` | web search and page fetch (GET only) |
+| `spiral search "query"` | fast ranked web results, no synthesis (`--sci` adds arXiv) |
+| `spiral research "query"` | gather web/arXiv/PubMed sources and synthesize a cited answer (`--deep`, `--sci`) |
+| `spiral chat ["message"]` | talk to the local thinking model; reasoning shown dimmed |
+| `spiral consult ["question"]` | send the whole project to a big-context API model for review |
 
 ## <img src="assets/mark.svg" width="21" alt=""/> Live controls
 
