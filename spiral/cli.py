@@ -42,6 +42,24 @@ def _info_line(console: Console, workspace: str) -> None:
     console.print("  [dim]▸[/] " + " [dim]·[/] ".join(parts) + "\n")
 
 
+def _apply_tier(cfg, console, tier):
+    """Remap roles onto the configured API model. None → local crew (default);
+    'boost' → escalation + critic/validator/designer on the API; 'api' → all."""
+    if not tier:
+        return cfg
+    if not cfg.providers:
+        raise SystemExit(f"--{tier} needs an API provider in ~/.config/spiral/config.json "
+                         "(see README: providers). Also export its api_key_env.")
+    model = next(iter(cfg.providers))
+    targets = (cfg.worker, cfg.planner, cfg.escalation, cfg.critic) if tier == "api" else (cfg.escalation, cfg.critic)
+    for spec in targets:
+        spec.name = model
+    console.print(f"  [rgb(217,119,87)]◆ {tier}[/] — {model} on: "
+                  + (", ".join(sorted({'worker','planner','escalation','critic/validator'})) if tier == "api"
+                     else "escalation, critic/validator") + "\n")
+    return cfg
+
+
 def _load_goal(args) -> str:
     if getattr(args, "goal_pos", None):
         return args.goal_pos
@@ -86,6 +104,10 @@ def main() -> None:
             p.add_argument("--resume", action="store_true")
             p.add_argument("--approve", action="store_true",
                            help="show the plan and wait for confirmation before executing")
+            p.add_argument("--boost", action="store_true",
+                           help="local worker + API model for the reasoning roles (escalation, critic, validator)")
+            p.add_argument("--api", action="store_true",
+                           help="run the entire crew on the configured API model")
 
     res = sub.add_parser("research", help="search the web and read top hits (GET-only)")
     res.add_argument("query")
@@ -99,6 +121,10 @@ def main() -> None:
     doc.add_argument("--dir", default=".")
 
     sub.add_parser("setup", help="first-run: detect Ollama + pull a RAM-matched model crew")
+
+    cons = sub.add_parser("consult", help="ask a big-context API model to review the whole project")
+    cons.add_argument("question", nargs="?", default="")
+    cons.add_argument("--dir", default=".")
 
     sty = sub.add_parser("style", help="set the banner spiral shape: spiral · galaxy · uzumaki")
     sty.add_argument("name", nargs="?", help="omit to preview all three")
@@ -131,6 +157,14 @@ def main() -> None:
         from spiral.setup import main as setup_main
 
         raise SystemExit(setup_main())
+
+    if args.cmd == "consult":
+        from spiral.conductor import Conductor
+
+        print_banner(console)
+        _info_line(console, args.dir)
+        Conductor(workspace=args.dir).consult(args.question)
+        return
 
     if args.cmd == "style":
         from spiral.banner import STYLES, spiral_braille, _rgb, CLAY as _CL, _current_style
@@ -200,7 +234,9 @@ def main() -> None:
         goal = _load_goal(args)
         print_banner(console)
         _info_line(console, args.dir)
-        cond = Conductor(workspace=args.dir)
+        cfg = _apply_tier(Config.load(), console,
+                          "api" if getattr(args, "api", False) else ("boost" if getattr(args, "boost", False) else None))
+        cond = Conductor(workspace=args.dir, cfg=cfg)
         if args.cmd == "plan":
             cond.show_plan(cond.make_plan(goal))
         elif args.cmd == "validate":

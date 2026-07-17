@@ -292,6 +292,60 @@ class Conductor:
         self.c.print(Panel("\n".join(lines), title=f"[{CLAY}]⠷ run summary[/]",
                            border_style=CLAY, padding=(0, 1)))
 
+    # -- consult: a big-context API model reviews the WHOLE project at once -------
+    def consult(self, question: str = "") -> None:
+        """Send the entire project to a large-context API model and get its
+        highest-value observations. Local models are scope-limited (per-task
+        files); this spends the big model's context reading everything, then asks
+        for a lot of insight in few output tokens — the cheap, high-leverage call."""
+        if not self.cfg.providers:
+            self.c.print("  [yellow]no API provider configured.[/] Add one to "
+                         "~/.config/spiral/config.json and export its api_key_env. See README.")
+            return
+        model = next(iter(self.cfg.providers))
+        # full dump — big model, big context: whole files, generous budget
+        repo = build_repomap(self.ws, max_file_bytes=24_000, max_total=350_000)
+        pf = self._dir() / "plan.json"
+        goal = json.loads(pf.read_text()).get("goal", "") if pf.is_file() else ""
+        val = self._dir() / "validation.json"
+        gaps = ""
+        if val.is_file():
+            try:
+                vs = json.loads(val.read_text())
+                gaps = "\n".join(f"  {v['id']} [{v['status']}]: {v.get('evidence','')[:120]}"
+                                 for v in vs if v.get("status") != "implemented")
+            except Exception:
+                pass
+
+        system = (
+            "You are a staff engineer reviewing an ENTIRE project in one pass. Give only "
+            "high-value, specific, actionable observations — reference exact files. Cover: "
+            "(1) correctness bugs and half-wired features, (2) architecture/structure risks, "
+            "(3) anything the goal asks for that is missing or weak, (4) concrete improvement "
+            "ideas the team likely hasn't considered. Terse. No preamble, no summary of what "
+            "the project is."
+        )
+        user = (
+            f"GOAL:\n{goal or '(none recorded)'}\n\n"
+            + (f"KNOWN VALIDATION GAPS:\n{gaps}\n\n" if gaps else "")
+            + f"YOUR FOCUS: {question or 'the most important issues and the best ideas to improve this project'}\n\n"
+            f"PROJECT:\n{repo}"
+        )
+        self.c.print(f"  [dim]consulting {model} · {len(repo):,} chars of project (~{len(repo)//4:,} tokens in)[/]")
+        with Spinner(f"consulting {model}") as sp:
+            res = self.ol.chat(
+                model, [{"role": "system", "content": system}, {"role": "user", "content": user}],
+                num_predict=6000, temperature=1,
+                on_delta=lambda kind, piece: sp.tick(),
+            )
+        if not res.text.strip():
+            self.c.print(f"  [red]no response[/] [dim]{res.raw.get('error','')}[/]")
+            return
+        self.c.print(Panel(res.text.strip(), title=f"[{CLAY}]⠷ {model} · project consult[/]",
+                           border_style=CLAY, padding=(0, 1)))
+        (self._dir() / "consult.md").write_text(res.text)
+        self.c.print(f"  [dim]{res.prompt_tokens:,} in / {res.completion_tokens:,} out · saved to .spiral/consult.md[/]\n")
+
     # -- validation: judge the CODE against the SPEC, then close the gaps ---------
     def _load_spec(self, goal: str) -> list[dict]:
         f = self._dir() / "spec.json"
