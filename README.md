@@ -126,11 +126,14 @@ requirement. Requirements that are missing or incomplete become new tasks:
 
 ```
  spec extraction ──▶ design brief ──▶ plan ──▶ critic review ──▶ repair
-       │                (color tokens,           (a separate model
-       │                 type scale, copy)        reviews the plan)
+       │             (UI projects only:         (a separate model
+       │              tokens + a real icon)      reviews the plan)
        ▼
  bootstrap the gate to green            each resolved error is committed, so
        │                                repair converges across attempts
+       ▼
+ foundation: design system + launcher icon    (deterministic, for UI apps)
+       │
        ▼
  implement tasks against the gate       matched skills · attempt memory ·
        │                                ASK protocol · symbol search ·
@@ -237,10 +240,15 @@ spiral takes project-specific guidance from three sources:
    could not, the error and the fix are appended to
    `.spiral/skills/learned-fixes.md` so the worker can reuse it on later runs.
 
-For UI work, a **design brief** with concrete values (color tokens, type sizes,
-spacing, motion durations, sample copy) is generated once per project, or
-written by hand at `.spiral/design.md`, and included in every prompt so
-implementation follows fixed decisions instead of choices made per task.
+For UI work (Android, iOS, web, desktop — detected from the repo and goal; a
+CLI, TUI, or library skips it), a **design brief** with concrete values (color
+tokens, type sizes, spacing, motion durations, sample copy) is generated once
+per project, or written by hand at `.spiral/design.md`, and included in every
+prompt so implementation follows fixed decisions instead of choices made per
+task. The brief is distilled into `.spiral/design_tokens.json`, and for an
+Android app spiral draws a **launcher icon** from those tokens and wires the
+manifest before feature work — so the app ships a real icon, not the stock
+robot, without a small model having to hand-write adaptive-icon XML.
 
 ## <img src="assets/mark.svg" width="21" alt=""/> Principles
 
