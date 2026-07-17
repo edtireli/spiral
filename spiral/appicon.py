@@ -77,16 +77,39 @@ def _circle(radius: float, color: str, cx: float = 54, cy: float = 54) -> str:
             f'android:fillColor="{color}"/>')
 
 
+_VEC_HEAD = (
+    '<vector xmlns:android="http://schemas.android.com/apk/res/android"\n'
+    '    android:width="108dp" android:height="108dp"\n'
+    '    android:viewportWidth="108" android:viewportHeight="108">\n'
+)
+
+
 def icon_vector(accent: str, background: str, glyph: str = "spiral") -> str:
-    """A self-contained 108×108 vector: filled disc + centered mark."""
+    """A self-contained 108×108 vector: filled disc + centered mark.
+    Used as the pre-26 fallback (a plain vector launcher icon, minSdk 21+)."""
     inner = "\n    ".join([_circle(50, background)] + _glyph_paths(glyph, accent))
-    return (
-        '<vector xmlns:android="http://schemas.android.com/apk/res/android"\n'
-        '    android:width="108dp" android:height="108dp"\n'
-        '    android:viewportWidth="108" android:viewportHeight="108">\n'
-        f'    {inner}\n'
-        '</vector>\n'
-    )
+    return _VEC_HEAD + f"    {inner}\n</vector>\n"
+
+
+def foreground_vector(accent: str, glyph: str = "spiral") -> str:
+    """Adaptive-icon FOREGROUND: the mark alone on a transparent 108 canvas.
+    The mark sits inside the center safe zone so launcher masks never clip it."""
+    return _VEC_HEAD + "    " + "\n    ".join(_glyph_paths(glyph, accent)) + "\n</vector>\n"
+
+
+def background_vector(background: str) -> str:
+    """Adaptive-icon BACKGROUND: a full-bleed fill the launcher mask shapes."""
+    rect = f'<path android:pathData="M0,0h108v108h-108z" android:fillColor="{background}"/>'
+    return _VEC_HEAD + f"    {rect}\n</vector>\n"
+
+
+_ADAPTIVE = (
+    '<?xml version="1.0" encoding="utf-8"?>\n'
+    '<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">\n'
+    '    <background android:drawable="@drawable/ic_launcher_background"/>\n'
+    '    <foreground android:drawable="@drawable/ic_launcher_foreground"/>\n'
+    '</adaptive-icon>\n'
+)
 
 
 def _norm_hex(c: str, fallback: str) -> str:
@@ -112,14 +135,13 @@ def _find_manifest(ws: Path) -> Path | None:
     return hits[0] if hits else None
 
 
-def _wire_manifest(manifest: Path, name: str = "ic_launcher") -> bool:
-    """Ensure <application> carries android:icon (and roundIcon) → our drawable.
-    Returns True if the file changed."""
+def _wire_manifest(manifest: Path) -> bool:
+    """Ensure <application> carries android:icon → @mipmap/ic_launcher and
+    android:roundIcon → @mipmap/ic_launcher_round. Returns True if changed."""
     text = manifest.read_text()
-    ref = f"@drawable/{name}"
     changed = False
 
-    def set_attr(t: str, attr: str) -> str:
+    def set_attr(t: str, attr: str, ref: str) -> str:
         nonlocal changed
         pat = re.compile(rf'({attr}\s*=\s*")[^"]*(")')
         if pat.search(t):
@@ -131,8 +153,8 @@ def _wire_manifest(manifest: Path, name: str = "ic_launcher") -> bool:
             changed = True
         return new
 
-    text = set_attr(text, "android:icon")
-    text = set_attr(text, "android:roundIcon")
+    text = set_attr(text, "android:icon", "@mipmap/ic_launcher")
+    text = set_attr(text, "android:roundIcon", "@mipmap/ic_launcher_round")
     if changed:
         manifest.write_text(text)
     return changed
@@ -140,9 +162,17 @@ def _wire_manifest(manifest: Path, name: str = "ic_launcher") -> bool:
 
 def write_android_icon(ws: str | Path, accent: str, background: str,
                        glyph: str = "spiral") -> list[str]:
-    """Write a launcher-icon vector from tokens and point the manifest at it.
-    Returns the repo-relative paths written/changed (empty if not an Android app).
-    Idempotent: re-running overwrites the same files."""
+    """Draw an adaptive launcher icon from tokens and wire the manifest.
+
+    Emits (all vector, no raster — builds on any minSdk):
+      drawable/ic_launcher_foreground.xml + _background.xml  — adaptive layers
+      mipmap-anydpi-v26/ic_launcher{,_round}.xml             — adaptive (API 26+)
+      mipmap-anydpi/ic_launcher{,_round}.xml                 — plain-vector fallback (24-25)
+    then points android:icon/roundIcon at @mipmap/ic_launcher{,_round}.
+
+    Returns the repo-relative paths written/changed (empty if not an Android app
+    or nothing changed). Idempotent: unchanged files are left untouched.
+    """
     ws = Path(ws)
     res = _find_res(ws)
     manifest = _find_manifest(ws)
@@ -152,14 +182,22 @@ def write_android_icon(ws: str | Path, accent: str, background: str,
     background = _norm_hex(background, "#0A0A0A")
     glyph = glyph if glyph in GLYPHS else "spiral"
 
-    drawable = res / "drawable"
-    drawable.mkdir(parents=True, exist_ok=True)
-    icon = drawable / "ic_launcher.xml"
-    vec = icon_vector(accent, background, glyph)
+    fallback = icon_vector(accent, background, glyph)
+    files = {
+        "drawable/ic_launcher_foreground.xml": foreground_vector(accent, glyph),
+        "drawable/ic_launcher_background.xml": background_vector(background),
+        "mipmap-anydpi-v26/ic_launcher.xml": _ADAPTIVE,
+        "mipmap-anydpi-v26/ic_launcher_round.xml": _ADAPTIVE,
+        "mipmap-anydpi/ic_launcher.xml": fallback,
+        "mipmap-anydpi/ic_launcher_round.xml": fallback,
+    }
     written: list[str] = []
-    if not icon.is_file() or icon.read_text() != vec:
-        icon.write_text(vec)
-        written.append(str(icon.relative_to(ws)))
+    for rel, content in files.items():
+        f = res / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        if not f.is_file() or f.read_text() != content:
+            f.write_text(content)
+            written.append(str(f.relative_to(ws)))
     if _wire_manifest(manifest):
         written.append(str(manifest.relative_to(ws)))
     return written

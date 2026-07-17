@@ -1,7 +1,8 @@
 """spiral chat — a plain conversation with the local thinking model.
 
 Streams token by token; the model's reasoning is shown dimmed, the answer in
-normal weight. History is kept for the session. /exit or Ctrl-D to quit.
+normal weight. History is kept for the session and trimmed to fit the model's
+context window. /exit or Ctrl-D to quit.
 """
 from __future__ import annotations
 
@@ -18,19 +19,14 @@ DIM = "\x1b[2m"
 RST = "\x1b[0m"
 
 
-def _supports_think(ol: Ollama, model: str, cfg) -> bool:
-    """Ollama returns 400 when asked to think on a model without a reasoning
-    channel. Providers (API models) handle their own reasoning, so assume yes."""
-    if model in getattr(ol, "providers", {}):
-        return True
-    try:
-        ol.chat(model, [{"role": "user", "content": "hi"}], think=True,
-                num_predict=1, keep_alive=cfg.keep_alive)
-        return True
-    except httpx.HTTPStatusError:
-        return False
-    except Exception:
-        return True  # network/other errors surface on the real call, not here
+def _fit(history: list[dict], budget_chars: int) -> list[dict]:
+    """Drop whole oldest turns until the transcript fits the budget, always
+    keeping the most recent exchange. Cheap char proxy for tokens — a long chat
+    should degrade by forgetting the start, never by overflowing num_ctx."""
+    total = sum(len(m["content"]) for m in history)
+    while len(history) > 2 and total > budget_chars:
+        total -= len(history.pop(0)["content"])
+    return history
 
 
 def chat(first: str = "", model: str | None = None) -> None:
@@ -38,13 +34,13 @@ def chat(first: str = "", model: str | None = None) -> None:
     ol = Ollama(cfg.base_url, providers=cfg.providers)
     model = model or cfg.planner.name
     c = make_console()
+    c.print(f"  [dim]chat · {model} · reasoning shown dimmed · /exit or Ctrl-D to quit[/]\n")
 
-    # not every model exposes a reasoning channel; probe once and degrade quietly.
-    thinks = _supports_think(ol, model, cfg)
-    tag = "thinking shown dimmed" if thinks else "no reasoning channel"
-    c.print(f"  [dim]chat · {model} · {tag} · /exit or Ctrl-D to quit[/]\n")
-
+    # leave ~40% of the window for the reply; ~4 chars/token is a safe proxy
+    budget = int(cfg.planner.num_ctx * 4 * 0.6)
     history: list[dict] = []
+    thinks = model in getattr(ol, "providers", {}) or True  # assumed; corrected lazily on a 400
+
     while True:
         if first:
             user, first = first, ""
@@ -62,6 +58,7 @@ def chat(first: str = "", model: str | None = None) -> None:
             return
 
         history.append({"role": "user", "content": user})
+        history = _fit(history, budget)
         sys.stdout.write(f"{CLAY}spiral ›{RST} ")
         sys.stdout.flush()
         in_think = False
@@ -80,9 +77,21 @@ def chat(first: str = "", model: str | None = None) -> None:
                 sys.stdout.write(piece)
             sys.stdout.flush()
 
+        def generate(think: bool):
+            return ol.chat(model, history, think=think, num_predict=cfg.planner_max_tokens,
+                           num_ctx=cfg.planner.num_ctx, keep_alive=cfg.keep_alive, on_delta=on)
+
         try:
-            res = ol.chat(model, history, think=thinks, num_predict=cfg.planner_max_tokens,
-                          num_ctx=cfg.planner.num_ctx, keep_alive=cfg.keep_alive, on_delta=on)
+            try:
+                res = generate(thinks)
+            except httpx.HTTPStatusError as e:
+                # some models have no reasoning channel → Ollama 400s. Learn once,
+                # retry plainly; the 400 lands before any tokens, so nothing is lost.
+                if thinks and e.response is not None and e.response.status_code == 400:
+                    thinks = False
+                    res = generate(False)
+                else:
+                    raise
         except KeyboardInterrupt:
             sys.stdout.write(RST + "\n  [interrupted]\n")
             history.pop()
