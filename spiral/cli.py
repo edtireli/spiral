@@ -109,9 +109,17 @@ def main() -> None:
             p.add_argument("--api", action="store_true",
                            help="run the entire crew on the configured API model")
 
-    res = sub.add_parser("research", help="search the web and read top hits (GET-only)")
+    srch = sub.add_parser("search", help="fast web search — ranked results, no synthesis")
+    srch.add_argument("query")
+    srch.add_argument("-k", type=int, default=8)
+    srch.add_argument("--sci", action="store_true", help="also include arXiv results")
+
+    res = sub.add_parser("research", help="gather sources across web/arXiv/PubMed and synthesize a cited answer")
     res.add_argument("query")
-    res.add_argument("-k", type=int, default=3, help="pages to read")
+    res.add_argument("-k", type=int, default=6, help="sources per channel")
+    res.add_argument("--deep", action="store_true", help="more sources, follow links, longer thinking synthesis")
+    res.add_argument("--sci", action="store_true", help="include arXiv + PubMed")
+    res.add_argument("--dir", default=".", help="where to save the report")
 
     tune = sub.add_parser("tune", help="size context windows to this machine (KV math)")
     tune.add_argument("--apply", action="store_true")
@@ -142,6 +150,7 @@ def main() -> None:
 
     args = parser.parse_args()
     console = make_console()
+    print_banner(console)   # shows for every command, holds ~1s, then work follows
 
     if args.cmd == "tune":
         from spiral.tune import main as tune_main
@@ -161,7 +170,6 @@ def main() -> None:
     if args.cmd == "consult":
         from spiral.conductor import Conductor
 
-        print_banner(console)
         _info_line(console, args.dir)
         Conductor(workspace=args.dir).consult(args.question)
         return
@@ -207,21 +215,50 @@ def main() -> None:
         rewind(console, args.dir, args.n)
         return
 
-    if args.cmd == "research":
-        from spiral.research import research
+    if args.cmd == "search":
+        from spiral.research import search as _search, arxiv as _arxiv
 
-        for h in research(args.query, k=args.k):
-            console.print(f"[bold rgb(217,119,87)]▸ {h.title}[/]\n  [dim]{h.url}[/]")
+        hits = _search(args.query, k=args.k)
+        if args.sci:
+            hits += _arxiv(args.query, k=max(4, args.k // 2))
+        for i, h in enumerate(hits, 1):
+            tag = f"[{h.source}] " if h.source != "web" else ""
+            console.print(f"  [bold rgb(217,119,87)]{i:>2}[/]  {tag}{h.title}")
+            console.print(f"      [dim]{h.url}[/]")
             if h.snippet:
-                console.print(f"  {h.snippet}")
-            if h.text:
-                console.print(f"  [dim]{h.text[:500]}…[/]\n")
+                console.print(f"      [dim]{h.snippet[:200]}[/]")
+        console.print()
+        return
+
+    if args.cmd == "research":
+        import re as _re
+        from rich.panel import Panel
+        from spiral.banner import Spinner
+        from spiral.research import gather, synthesize
+
+        chans = "web + arXiv + PubMed" if args.sci else "web"
+        console.print(f"  [dim]gathering sources ({chans}){' · deep' if args.deep else ''}[/]")
+        with Spinner("searching") as sp:
+            hits = gather(args.query, k=args.k, sci=args.sci, follow=1 if args.deep else 0,
+                          on=lambda u: sp.update(detail=u[:60]))
+        if not hits:
+            console.print("  [yellow]no usable sources found[/]\n")
+            return
+        console.print(f"  [green]●[/] {len(hits)} sources")
+        with Spinner("synthesizing" + (" · thinking" if args.deep else "")) as sp:
+            answer, used, res = synthesize(args.query, hits, deep=args.deep, on=lambda: sp.tick())
+        console.print(Panel(answer.strip() or "(no answer)", title="[rgb(217,119,87)]⭷ research[/]",
+                            border_style="rgb(217,119,87)", padding=(0, 1)))
+        slug = _re.sub(r"[^a-z0-9]+", "-", args.query.lower())[:40].strip("-") or "answer"
+        out = Path(args.dir) / f"research-{slug}.md"
+        srcs = "\n".join(f"[{i}] {h.title} — {h.url}" for i, h in enumerate(used, 1))
+        out.write_text(f"# {args.query}\n\n{answer}\n\n## Sources\n{srcs}\n")
+        console.print(f"  [dim]{res.prompt_tokens:,} in / {res.completion_tokens:,} out · saved to {out}[/]\n")
         return
 
     if args.cmd == "do":
         from spiral.agent import Atom, TaskSpec
 
-        print_banner(console)
         _info_line(console, args.dir)
         console.print(f"  goal   [bold]{args.goal}[/]")
         console.print(f"  verify [dim]{args.verify}[/]\n")
@@ -232,7 +269,6 @@ def main() -> None:
         from spiral.conductor import Conductor
 
         goal = _load_goal(args)
-        print_banner(console)
         _info_line(console, args.dir)
         cfg = _apply_tier(Config.load(), console,
                           "api" if getattr(args, "api", False) else ("boost" if getattr(args, "boost", False) else None))
@@ -246,7 +282,6 @@ def main() -> None:
                        approve=getattr(args, "approve", False))
         return
 
-    print_banner(console)
     _health(console)
 
 
