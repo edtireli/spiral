@@ -26,7 +26,7 @@ from rich.panel import Panel
 
 from spiral import tools
 from spiral.agent import Atom, TaskSpec
-from spiral.appicon import write_android_icon
+from spiral.appicon import TOKEN_COLORS, write_android_icon, write_android_tokens
 from spiral.banner import Spinner
 from spiral.config import Config
 from spiral.llm import Ollama
@@ -179,11 +179,18 @@ class Conductor:
         """Append the design spec so planner and workers implement decisions,
         not vibes. Sits in the stable prompt prefix → KV-cache friendly."""
         f = self._dir() / "design.md"
-        if f.is_file():
-            # ~1.6k tokens riding every prompt, but it IS the product's taste —
-            # and it sits in the stable prefix, so the KV cache pays for it once
-            return goal + "\n\nDESIGN SPECIFICATION (implement these decisions literally):\n" + f.read_text()[:6000]
-        return goal
+        if not f.is_file():
+            return goal
+        # ~1.6k tokens riding every prompt, but it IS the product's taste — and it
+        # sits in the stable prefix, so the KV cache pays for it once
+        out = goal + "\n\nDESIGN SPECIFICATION (implement these decisions literally):\n" + f.read_text()[:6000]
+        # if the palette was materialized, point every screen at the shared tokens
+        if (self._dir() / "design_tokens.json").is_file() and self._project_kind(goal) == "android":
+            names = ", ".join(f"@color/{n}" for n in TOKEN_COLORS)
+            out += ("\n\nCANONICAL PALETTE — the app's colors are defined once in "
+                    f"res/values/spiral_tokens.xml as {names}. Reference these for accent, "
+                    "background, surface, and primary text; do not invent new color values.")
+        return out
 
     # -- plan -------------------------------------------------------------------
     # pipeline: spec → draft → [lint → critic (different brain) → repair] × rounds
@@ -632,14 +639,15 @@ class Conductor:
         bg = icon.get("background") or tokens.get("background") or "#0A0A0A"
         glyph = icon.get("glyph") or "spiral"
         written = write_android_icon(self.ws, accent, bg, glyph)
+        written += write_android_tokens(self.ws, tokens)   # canonical palette resource
         if not written:
             return  # already wired — nothing to do
         if self.gate and not self._gate_green(dash):
             self._revert(written)
-            dash.print("  [yellow]○ foundation icon reverted — gate went red[/]")
+            dash.print("  [yellow]○ foundation reverted — gate went red[/]")
             return
-        tools.run("git add -A && git commit -q -m 'spiral: foundation — launcher icon'", self.ws)
-        dash.print(f"  [green]■ foundation:[/] launcher icon [bold]{glyph}[/] · {', '.join(written)}")
+        tools.run("git add -A && git commit -q -m 'spiral: foundation — launcher icon + palette'", self.ws)
+        dash.print(f"  [green]■ foundation:[/] launcher icon [bold]{glyph}[/] + palette · {len(written)} files")
 
     def build(self, goal: str, resume: bool = False, approve: bool = False) -> None:
         from spiral.dash import Dash

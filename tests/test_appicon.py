@@ -12,7 +12,9 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from spiral.appicon import GLYPHS, icon_vector, write_android_icon, _norm_hex  # noqa: E402
+from spiral.appicon import (  # noqa: E402
+    GLYPHS, icon_vector, write_android_icon, write_android_tokens, _norm_hex,
+)
 
 _MANIFEST = (
     '<?xml version="1.0" encoding="utf-8"?>\n'
@@ -80,6 +82,26 @@ def test_non_android_dir_is_noop():
     with tempfile.TemporaryDirectory() as d:
         (Path(d) / "main.py").write_text("print('hi')\n")
         assert write_android_icon(d, "#FF1744", "#0A0A0A", "spiral") == []
+        assert write_android_tokens(d, {"accent": "#FF1744"}) == []
+
+
+def test_tokens_are_additive_and_wellformed():
+    with tempfile.TemporaryDirectory() as d:
+        ws = _android_project(d)
+        (ws / "app/src/main/res/values/colors.xml").write_text(
+            '<resources><color name="existing">#123456</color></resources>\n')
+        written = write_android_tokens(ws, {"accent": "#B71C1C", "background": "#0A0A0A",
+                                            "surface": "#141414", "on_dark": "#F2F2F2"})
+        tok = ws / "app/src/main/res/values/spiral_tokens.xml"
+        assert tok.is_file() and str(tok.relative_to(ws)) in written
+        root = ET.fromstring(tok.read_text())
+        names = {c.get("name") for c in root.findall("color")}
+        assert names == {"token_accent", "token_background", "token_surface", "token_on_dark"}, names
+        # existing colors.xml is untouched (additive)
+        assert 'name="existing"' in (ws / "app/src/main/res/values/colors.xml").read_text()
+        # idempotent
+        assert write_android_tokens(ws, {"accent": "#B71C1C", "background": "#0A0A0A",
+                                         "surface": "#141414", "on_dark": "#F2F2F2"}) == []
 
 
 def test_bad_hex_is_normalized():

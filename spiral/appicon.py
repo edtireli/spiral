@@ -160,6 +160,38 @@ def _wire_manifest(manifest: Path) -> bool:
     return changed
 
 
+TOKEN_COLORS = ("token_accent", "token_background", "token_surface", "token_on_dark")
+
+
+def write_android_tokens(ws: str | Path, tokens: dict) -> list[str]:
+    """Materialize the palette as a canonical color resource the harness owns.
+
+    Written to res/values/spiral_tokens.xml — a NEW file, so existing colors.xml
+    and every reference to it are untouched (additive, zero risk). Gives the app
+    one authoritative palette instead of the rival, per-task color sets a model
+    tends to invent. Returns the repo-relative path if it changed, else []."""
+    ws = Path(ws)
+    res = _find_res(ws)
+    if res is None or not isinstance(tokens, dict):
+        return []
+    bg = _norm_hex(tokens.get("background"), "#0A0A0A")
+    pairs = [
+        ("token_accent", _norm_hex(tokens.get("accent"), "#D97757")),
+        ("token_background", bg),
+        ("token_surface", _norm_hex(tokens.get("surface"), "#141414")),
+        ("token_on_dark", _norm_hex(tokens.get("on_dark"), "#F2F2F2")),
+    ]
+    body = "\n".join(f'    <color name="{n}">{v}</color>' for n, v in pairs)
+    content = f'<?xml version="1.0" encoding="utf-8"?>\n<resources>\n{body}\n</resources>\n'
+    vals = res / "values"
+    vals.mkdir(parents=True, exist_ok=True)
+    f = vals / "spiral_tokens.xml"
+    if not f.is_file() or f.read_text() != content:
+        f.write_text(content)
+        return [str(f.relative_to(ws))]
+    return []
+
+
 def write_android_icon(ws: str | Path, accent: str, background: str,
                        glyph: str = "spiral") -> list[str]:
     """Draw an adaptive launcher icon from tokens and wire the manifest.
