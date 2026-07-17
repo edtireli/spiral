@@ -134,6 +134,10 @@ def main() -> None:
     cons.add_argument("question", nargs="?", default="")
     cons.add_argument("--dir", default=".")
 
+    ch = sub.add_parser("chat", help="talk to the local thinking model (reasoning shown dimmed)")
+    ch.add_argument("message", nargs="?", default="", help="optional first message; omit for an empty prompt")
+    ch.add_argument("--model", help="override the model (default: the planner/thinking model)")
+
     sty = sub.add_parser("style", help="set the banner spiral shape: spiral · galaxy · uzumaki")
     sty.add_argument("name", nargs="?", help="omit to preview all three")
 
@@ -172,6 +176,12 @@ def main() -> None:
 
         _info_line(console, args.dir)
         Conductor(workspace=args.dir).consult(args.question)
+        return
+
+    if args.cmd == "chat":
+        from spiral.chat import chat
+
+        chat(args.message, model=args.model)
         return
 
     if args.cmd == "style":
