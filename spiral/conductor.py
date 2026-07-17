@@ -26,12 +26,13 @@ from rich.panel import Panel
 
 from spiral import tools
 from spiral.agent import Atom, TaskSpec
+from spiral.appicon import write_android_icon
 from spiral.banner import Spinner
 from spiral.config import Config
 from spiral.llm import Ollama
 from spiral.planner import (
-    Milestone, Plan, Task, critique_plan, design_brief, extract_spec, lint_plan,
-    make_plan, parse_plan, plan_to_dict, repair_plan, validate_spec,
+    Milestone, Plan, Task, critique_plan, design_brief, design_tokens, extract_spec,
+    lint_plan, make_plan, parse_plan, plan_to_dict, repair_plan, validate_spec,
 )
 from spiral.ledger import Ledger
 from spiral.repomap import build_repomap, list_files
@@ -135,6 +136,45 @@ class Conductor:
         gi.write_text("\n".join(lines) + "\n")
         tools.run("git add -A && git commit -q -m 'spiral: pre-run snapshot' --allow-empty", self.ws)
 
+    def _project_kind(self, goal: str) -> str:
+        """Classify the product so the visual designer runs only when it applies —
+        'invoked if needed'. Repo signals are ground truth; goal keywords are the
+        fallback. Returns: android | ios | web | gui | other."""
+        ws = self.ws
+        g = goal.lower()
+
+        def has(pattern: str) -> bool:
+            try:
+                return next((p for p in ws.rglob(pattern) if "build" not in p.parts), None) is not None
+            except Exception:
+                return False
+
+        if has("AndroidManifest.xml") or ("android" in g and ("app" in g or "kotlin" in g)):
+            return "android"
+        if has("*.xcodeproj") or has("*.xcworkspace") or "swiftui" in g or ("ios" in g and "app" in g):
+            return "ios"
+        web_dep = False
+        pkg = ws / "package.json"
+        if pkg.is_file():
+            try:
+                txt = pkg.read_text().lower()
+                web_dep = any(k in txt for k in ("react", "vue", "svelte", "next", "vite", "angular", "solid-js"))
+            except Exception:
+                pass
+        if web_dep or has("index.html") or any(
+            k in g for k in ("website", "web app", "web-app", "frontend", "landing page", "single-page")
+        ):
+            return "web"
+        if any(k in g for k in ("gui", "desktop app", "tkinter", "pyqt", "qt app", "electron", "gtk", "javafx", "swing", "kivy")):
+            return "gui"
+        if "app" in g and any(k in g for k in ("screen", "button", "dashboard", "interface", "view", "page")):
+            return "gui"
+        return "other"
+
+    @staticmethod
+    def _is_ui(kind: str) -> bool:
+        return kind in ("android", "ios", "web", "gui")
+
     def _goal_with_design(self, goal: str) -> str:
         """Append the design spec so planner and workers implement decisions,
         not vibes. Sits in the stable prompt prefix → KV-cache friendly."""
@@ -163,19 +203,37 @@ class Conductor:
             c.print(f"     [dim]{r['id']} ({r.get('kind', 'feature')}):[/] {r['text'][:90]}")
         (self._dir() / "spec.json").write_text(json.dumps(spec, indent=2))
 
+        kind = self._project_kind(goal)
         design_f = self._dir() / "design.md"
-        if not design_f.is_file():
-            self.ol.evict(self.cfg.planner.name)  # designer runs on the critic
-            with Spinner("designing") as sp:
-                design, dres = design_brief(goal, spec, self.cfg, self.ol,
-                                            progress=lambda k: sp.tick())
-            if design:
-                design_f.write_text(design)
-                self.ledger.log("plan", phase="design", model=self.cfg.critic.name,
-                                ptok=dres.prompt_tokens, ctok=dres.completion_tokens)
-                self.ledger.thinking("design", dres.thinking)
-                c.print(f"  [green]●[/] design brief · {len(design)} chars → .spiral/design.md · [dim]{dres.total_tokens} tok[/]")
-            self.ol.evict(self.cfg.critic.name)  # planner returns
+        tokens_f = self._dir() / "design_tokens.json"
+        if not self._is_ui(kind):
+            c.print(f"  [dim]○ no visual design stage — {kind} project, not a UI[/]")
+        else:
+            design = design_f.read_text() if design_f.is_file() else ""
+            if not design:
+                self.ol.evict(self.cfg.planner.name)  # designer runs on the critic
+                with Spinner("designing") as sp:
+                    design, dres = design_brief(goal, spec, self.cfg, self.ol,
+                                                progress=lambda k: sp.tick())
+                if design:
+                    design_f.write_text(design)
+                    self.ledger.log("plan", phase="design", model=self.cfg.critic.name,
+                                    ptok=dres.prompt_tokens, ctok=dres.completion_tokens)
+                    self.ledger.thinking("design", dres.thinking)
+                    c.print(f"  [green]●[/] design brief · {len(design)} chars → .spiral/design.md · [dim]{dres.total_tokens} tok[/]")
+                self.ol.evict(self.cfg.critic.name)  # planner takes the lane back
+            # distill the brief into concrete tokens the harness can materialize
+            if not tokens_f.is_file():
+                with Spinner("design tokens") as sp:
+                    tokens, tres = design_tokens(goal, spec, design, self.cfg, self.ol,
+                                                 progress=lambda k: sp.tick())
+                if tokens:
+                    tokens_f.write_text(json.dumps(tokens, indent=2))
+                    self.ledger.log("plan", phase="tokens", model=self.cfg.planner.name,
+                                    ptok=tres.prompt_tokens, ctok=tres.completion_tokens)
+                    ic = tokens.get("icon", {}) if isinstance(tokens, dict) else {}
+                    c.print(f"  [green]●[/] tokens · accent [bold]{tokens.get('accent', '?')}[/] · "
+                            f"icon [bold]{ic.get('glyph', '?')}[/] → .spiral/design_tokens.json")
         goal = self._goal_with_design(goal)
 
         with Spinner("planning") as sp:
@@ -544,6 +602,45 @@ class Conductor:
         except Exception:
             pass
 
+    def _revert(self, paths: list[str]) -> None:
+        """Undo harness-written files precisely: restore tracked ones from HEAD,
+        delete newly-created untracked ones. Never touches unrelated files."""
+        import shlex
+        for rel in paths:
+            q = shlex.quote(rel)
+            if tools.run(f"git ls-files --error-unmatch -- {q}", self.ws).ok:
+                tools.run(f"git checkout -- {q}", self.ws)
+            else:
+                (self.ws / rel).unlink(missing_ok=True)
+
+    def _foundation(self, dash, goal: str) -> None:
+        """Deterministic design ground truth before feature work. For an Android
+        app, draw the launcher icon from the design tokens and wire the manifest —
+        the fiddly, always-the-same plumbing a small model reliably gets wrong, so
+        the app never ships the stock robot. Committed only if the gate stays green."""
+        if self._project_kind(goal) != "android":
+            return
+        tf = self._dir() / "design_tokens.json"
+        try:
+            tokens = json.loads(tf.read_text()) if tf.is_file() else {}
+        except Exception:
+            tokens = {}
+        if not isinstance(tokens, dict):
+            tokens = {}
+        icon = tokens.get("icon", {}) if isinstance(tokens.get("icon"), dict) else {}
+        accent = icon.get("foreground") or tokens.get("accent") or "#D97757"
+        bg = icon.get("background") or tokens.get("background") or "#0A0A0A"
+        glyph = icon.get("glyph") or "spiral"
+        written = write_android_icon(self.ws, accent, bg, glyph)
+        if not written:
+            return  # already wired — nothing to do
+        if self.gate and not self._gate_green(dash):
+            self._revert(written)
+            dash.print("  [yellow]○ foundation icon reverted — gate went red[/]")
+            return
+        tools.run("git add -A && git commit -q -m 'spiral: foundation — launcher icon'", self.ws)
+        dash.print(f"  [green]■ foundation:[/] launcher icon [bold]{glyph}[/] · {', '.join(written)}")
+
     def build(self, goal: str, resume: bool = False, approve: bool = False) -> None:
         from spiral.dash import Dash
 
@@ -609,6 +706,9 @@ class Conductor:
                     dash.print(f"  [green]■ gate is green — features begin ({status})[/]")
                 else:
                     dash.task(0, 0, "done")
+
+            # ---- foundation: deterministic design ground truth (icon, etc.) -----
+            self._foundation(dash, goal)
 
             # ---- the grind: every task keeps the gate green ---------------------
             done = 0
