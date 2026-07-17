@@ -185,13 +185,15 @@ def _current_style() -> str:
 
 
 def print_banner(console: Console | None = None, tagline: str = "local autonomous coder · on-device",
-                 style: str | None = None) -> None:
+                 style: str | None = None, hold: float = 1.0) -> None:
     """Compact launch banner. On a TTY the spiral draws itself in once (~1.1s),
-    then settles; piped output gets the static banner only."""
+    settles, then holds `hold` seconds so the finished mark can be enjoyed before
+    work scrolls it away. Piped output gets the static banner only, no delay."""
     console = console or Console()
     style = style or _current_style()
+    tty = sys.stdout.isatty()
     console.print()
-    if sys.stdout.isatty():
+    if tty:
         steps = 26
         with Live(_banner_frame(0.02, tagline, style), console=console,
                   refresh_per_second=30, transient=True) as live:
@@ -201,6 +203,8 @@ def print_banner(console: Console | None = None, tagline: str = "local autonomou
                 time.sleep(1.1 / steps)
     console.print(_banner_frame(1.0, tagline, style))
     console.print()
+    if tty and hold > 0:
+        time.sleep(hold)
 
 
 def play_draw(cycles: int = 3, period: float = 2.6, fps: int = 30) -> None:
