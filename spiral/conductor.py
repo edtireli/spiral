@@ -31,8 +31,8 @@ from spiral.banner import Spinner
 from spiral.config import Config
 from spiral.llm import Ollama
 from spiral.planner import (
-    Milestone, Plan, Task, critique_plan, design_brief, design_tokens, extract_spec,
-    lint_plan, make_plan, parse_plan, plan_to_dict, repair_plan, validate_spec,
+    Milestone, Plan, Task, coverage_gaps, critique_plan, design_brief, design_tokens,
+    extract_spec, lint_plan, make_plan, parse_plan, plan_to_dict, repair_plan, validate_spec,
 )
 from spiral.ledger import Ledger
 from spiral.repomap import build_repomap, list_files
@@ -252,7 +252,7 @@ class Conductor:
 
         reviews = []
         for rnd in range(1, self.cfg.plan_rounds + 1):
-            lint = lint_plan(plan, existing)
+            lint = lint_plan(plan, existing) + coverage_gaps(spec, plan)
             for d in lint:
                 c.print(f"     [yellow]lint:[/] {d}")
             self.ol.evict(self.cfg.planner.name)  # make room for the critic
