@@ -82,6 +82,13 @@ class Config:
     # tests, anything) — set "extra_gate" in ~/.config/spiral/config.json
     extra_gate: str = ""
 
+    # remote OpenAI-compatible providers, keyed by model id. Any role set to one
+    # of these model ids is dispatched to the endpoint instead of Ollama. API keys
+    # live in env vars (api_key_env), never here. e.g.:
+    #   "providers": {"kimi-k3": {"base_url": "https://api.moonshot.ai/v1",
+    #                             "api_key_env": "MOONSHOT_API_KEY", "temperature": 1}}
+    providers: dict = field(default_factory=dict)
+
     # theme — clay brand + a hacker triad mapped to verify-loop states
     clay: str = "#D97757"          # brand / prompt / the mark
     spiral_style: str = "spiral"   # banner shape: spiral · galaxy · uzumaki
@@ -123,6 +130,7 @@ class Config:
             cfg.extra_gate = overlay.get("extra_gate", cfg.extra_gate)
             cfg.spiral_style = os.environ.get("SPIRAL_STYLE", overlay.get("style", cfg.spiral_style))
             cfg.worker_max_tokens = int(overlay.get("worker_max_tokens", cfg.worker_max_tokens))
+            cfg.providers = overlay.get("providers", cfg.providers)
         except Exception:
             pass  # a broken overlay must never break spiral
         return cfg
