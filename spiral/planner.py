@@ -497,6 +497,39 @@ def lint_plan(plan: Plan, existing_files: set[str]) -> list[str]:
     return defects
 
 
+_STOP = {
+    "the", "a", "an", "and", "or", "of", "to", "for", "with", "that", "this", "is",
+    "are", "be", "should", "must", "will", "can", "when", "each", "every", "into",
+    "from", "user", "users", "app", "screen", "page", "view", "button", "which",
+    "their", "them", "they", "have", "has", "show", "shows", "display", "using", "use",
+}
+
+
+def _terms(text: str) -> set[str]:
+    """Distinctive lowercase words (≥4 chars, not stopwords) — the fingerprint of
+    a requirement that a covering task would almost certainly echo."""
+    return {w for w in re.findall(r"[a-zA-Z]{4,}", text.lower()) if w not in _STOP}
+
+
+def coverage_gaps(spec: list[dict], plan: Plan) -> list[str]:
+    """Deterministic coverage: a requirement whose distinctive terms appear in NO
+    task is very likely forgotten. Zero tokens, conservative (flags only when none
+    of the terms match anywhere) — coverage becomes a mechanical diff, not vibes.
+    The most common 'logical gap' is a requirement nobody planned for; this catches
+    it before execution instead of at the final spec audit."""
+    haystack = " ".join(
+        f"{t.title} {t.description}" for m in plan.milestones for t in m.tasks
+    ).lower()
+    gaps: list[str] = []
+    for r in spec:
+        terms = _terms(r.get("text", ""))
+        if terms and not any(term in haystack for term in terms):
+            missed = ", ".join(sorted(terms)[:3])
+            gaps.append(f"requirement {r.get('id', '?')} may be UNCOVERED: "
+                        f"\"{r.get('text', '')[:70]}\" — no task mentions {missed}")
+    return gaps
+
+
 def critique_plan(
     goal: str, spec: list[dict], repomap: str, plan: Plan, lint: list[str],
     gate: str = "", cfg: Config | None = None, ol: Ollama | None = None, progress=None,
