@@ -1,0 +1,96 @@
+"""The launcher-icon generator is deterministic harness ground truth — so it is
+unit-testable without a model. Runs standalone (`python tests/test_appicon.py`)
+or under pytest.
+"""
+from __future__ import annotations
+
+import os
+import sys
+import tempfile
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from spiral.appicon import GLYPHS, icon_vector, write_android_icon, _norm_hex  # noqa: E402
+
+_MANIFEST = (
+    '<?xml version="1.0" encoding="utf-8"?>\n'
+    '<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n'
+    '    <application\n'
+    '        android:label="@string/app_name"\n'
+    '        android:theme="@style/Theme.App">\n'
+    '        <activity android:name=".MainActivity" android:exported="true"/>\n'
+    '    </application>\n'
+    '</manifest>\n'
+)
+
+
+def _android_project(d: str) -> Path:
+    root = Path(d)
+    main = root / "app" / "src" / "main"
+    (main / "res" / "values").mkdir(parents=True)
+    (main / "AndroidManifest.xml").write_text(_MANIFEST)
+    return root
+
+
+def test_every_glyph_is_wellformed_vector():
+    for g in GLYPHS:
+        ET.fromstring(icon_vector("#D97757", "#0A0A0A", g))  # raises if malformed
+
+
+def test_unknown_glyph_falls_back_to_spiral():
+    # an out-of-set glyph must not crash — it degrades to the default mark
+    ET.fromstring(icon_vector("#FFFFFF", "#000000", "definitely-not-a-glyph"))
+
+
+def test_write_creates_icon_and_wires_manifest():
+    with tempfile.TemporaryDirectory() as d:
+        ws = _android_project(d)
+        written = write_android_icon(ws, "#FF1744", "#0A0A0A", "eye")
+        icon = ws / "app/src/main/res/drawable/ic_launcher.xml"
+        assert icon.is_file(), "icon not written"
+        ET.fromstring(icon.read_text())  # valid vector
+        manifest = (ws / "app/src/main/AndroidManifest.xml").read_text()
+        ET.fromstring(manifest)  # still valid after patch
+        assert 'android:icon="@drawable/ic_launcher"' in manifest
+        assert 'android:roundIcon="@drawable/ic_launcher"' in manifest
+        assert str(icon.relative_to(ws)) in written
+
+
+def test_idempotent_second_run_reports_no_change():
+    with tempfile.TemporaryDirectory() as d:
+        ws = _android_project(d)
+        write_android_icon(ws, "#FF1744", "#0A0A0A", "eye")
+        again = write_android_icon(ws, "#FF1744", "#0A0A0A", "eye")
+        assert again == [], f"expected no changes on re-run, got {again}"
+
+
+def test_non_android_dir_is_noop():
+    with tempfile.TemporaryDirectory() as d:
+        (Path(d) / "main.py").write_text("print('hi')\n")
+        assert write_android_icon(d, "#FF1744", "#0A0A0A", "spiral") == []
+
+
+def test_bad_hex_is_normalized():
+    assert _norm_hex("not-a-color", "#0A0A0A") == "#0A0A0A"
+    assert _norm_hex("#abcdef", "#000000") == "#ABCDEF"
+    assert _norm_hex("#FF112233", "#000000") == "#FF112233"  # 8-digit ARGB allowed
+
+
+def _run():
+    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
+    failed = 0
+    for t in tests:
+        try:
+            t()
+            print(f"  \033[32mPASS\033[0m {t.__name__}")
+        except AssertionError as e:
+            failed += 1
+            print(f"  \033[31mFAIL\033[0m {t.__name__}: {e}")
+    print(f"\n{len(tests) - failed}/{len(tests)} passed")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_run())

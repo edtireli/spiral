@@ -15,6 +15,7 @@ import json
 import re
 from dataclasses import dataclass, field
 
+from spiral.appicon import GLYPHS
 from spiral.config import Config
 from spiral.llm import ChatResult, Ollama
 
@@ -59,6 +60,10 @@ PLANNER_SYSTEM = (
     "- Every class, screen, layout, or resource that any task references must be CREATED "
     "by that task or an earlier one. Never reference future or imaginary components.\n"
     "- Order tasks so the project builds after every single task.\n"
+    "- If the product has a user interface and a DESIGN SPECIFICATION is provided, "
+    "milestone 1 establishes the FOUNDATION — the color tokens, type scale, spacing, "
+    "and shared component styles from the spec — before any feature screen, so every "
+    "screen inherits one coherent look.\n"
     "- Account for what already exists in the repo — extend and repair it, don't restart.\n"
     "- A mandatory BUILD GATE runs automatically after every task; do NOT write shallow "
     "file-existence or grep checks into 'verify'. Use 'verify' ONLY for a genuine extra "
@@ -151,9 +156,66 @@ DESIGNER_SYSTEM = (
     "say what they do.\n"
     "7. MOTION: each animation with duration (micro 100-150ms, transitions 200-300ms, "
     "nothing >800ms), easing (out for entrances), and what it teaches the user.\n"
+    "8. ICON: the app's launcher icon — ONE geometric mark (spiral, eye, shield, lock, "
+    "bubble, or bolt) chosen to fit the concept, drawn in the accent over the darkest "
+    "surface. Name the mark and say why it fits in one line.\n"
+    "FOUNDATION FIRST: the visual system (color tokens, type scale, spacing, shared "
+    "component styles) and the icon come BEFORE any feature screen, so every screen "
+    "inherits one coherent look. Enumerate every screen and every shared component by "
+    "name so nothing is left to chance.\n"
     "Restraint law: for every element, if removing it loses no meaning — remove it. "
     "Markdown, under 2000 words."
 )
+
+TOKENS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "accent": {"type": "string", "description": "the single brand color, #RRGGBB"},
+        "background": {"type": "string", "description": "the darkest surface, #RRGGBB"},
+        "surface": {"type": "string", "description": "one step lighter than background"},
+        "on_dark": {"type": "string", "description": "primary text on dark surfaces"},
+        "icon": {
+            "type": "object",
+            "properties": {
+                "glyph": {"type": "string", "enum": list(GLYPHS)},
+                "background": {"type": "string"},
+                "foreground": {"type": "string"},
+            },
+            "required": ["glyph"],
+        },
+    },
+    "required": ["accent", "background", "icon"],
+}
+
+TOKENS_SYSTEM = (
+    "You are spiral's DESIGN DIRECTOR distilling a design brief into machine-usable "
+    "tokens. Output JSON only.\n"
+    "- accent: the ONE brand color as #RRGGBB (match the brief's accent).\n"
+    "- background: the darkest surface #RRGGBB; surface: one step lighter; on_dark: the "
+    "primary text color on dark.\n"
+    "- icon.glyph: pick the SINGLE mark from the allowed set that best fits the product's "
+    "concept (e.g. an eye for surveillance, a lock for privacy, a bubble for chat, a "
+    "spiral by default). icon.foreground is usually the accent; icon.background the "
+    "darkest surface.\n"
+    "Return ONLY JSON matching the schema."
+)
+
+
+def design_tokens(goal: str, spec: list[dict], brief: str = "", cfg: Config | None = None,
+                  ol: Ollama | None = None, progress=None) -> tuple[dict, ChatResult]:
+    """Distill the prose brief into concrete tokens (accent/surfaces + icon choice)
+    that the harness turns into real theme values and a launcher icon. Cheap,
+    schema-constrained, think-off — small reliable output, not another essay."""
+    cfg = cfg or Config.load()
+    ol = ol or Ollama(cfg.base_url)
+    reqs = "\n".join(f"{r['id']}: {r['text']}" for r in spec)
+    user = (
+        f"GOAL:\n{goal}\n\nREQUIREMENTS:\n{reqs}\n\n"
+        f"DESIGN BRIEF:\n{brief[:4000]}\n\nReturn the design tokens as JSON."
+    )
+    res = _plan_chat(TOKENS_SYSTEM, user, cfg, ol, temperature=0.2, schema=TOKENS_SCHEMA,
+                     think=False, progress=progress)
+    return _extract_json(res.text), res
 
 
 def design_brief(goal: str, spec: list[dict], cfg: Config | None = None,
