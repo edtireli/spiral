@@ -361,15 +361,23 @@ class Conductor:
         through the same gated loop as any other work."""
         from spiral.dash import Dash
 
-        tasks = [
-            Task(
-                title=v["fix"].get("title", f"implement {v['id']}"),
-                description=f"[closes requirement {v['id']}] " + v["fix"].get("description", ""),
-                files=v["fix"].get("files", []) or [],
+        tasks = []
+        for v in verdicts:
+            if v.get("status") == "implemented":
+                continue
+            fix = v.get("fix") or {}
+            # carry the validator's evidence AND its fix so the worker knows what
+            # is wrong, not just which requirement to "implement"
+            desc = (
+                f"Requirement {v['id']} is NOT met. "
+                f"Validator evidence: {v.get('evidence', '(none)')}. "
+                f"Required fix: {fix.get('description', 'implement the requirement fully')}"
             )
-            for v in verdicts
-            if v.get("status") != "implemented" and v.get("fix")
-        ]
+            tasks.append(Task(
+                title=fix.get("title", f"implement {v['id']}"),
+                description=desc,
+                files=fix.get("files", []) or [],
+            ))
         if not tasks:
             return
         self.ol.evict(self.cfg.critic.name)  # workers take the lane back
@@ -383,13 +391,19 @@ class Conductor:
                     goal=f"{t.title}\n{t.description}".strip(),
                     verify_cmd=verify, files=t.files or None, context=goal,
                 )
-                status = self._run_task(atom, spec_task, dash)
+                status = self._run_task(atom, spec_task, dash, allow_done=False)
                 dash.task(1, ti, "blocked" if status == "blocked" else "done")
                 if atom.tokens >= self.cfg.run_token_budget:
                     dash.print("[red]■ token budget reached during remediation[/]")
                     return
 
     def _validate_loop(self, goal: str, atom: Atom) -> None:
+        """Validate → remediate, repeating while the gap count keeps dropping.
+        Stop on SPEC-GREEN, on a plateau (a round that closes nothing net), or at
+        the hard round cap. Remediation is whack-a-mole — fixing one gap can
+        expose another — so 'no fixed count' is not the stop signal; 'no net
+        progress' is."""
+        prev_gaps = None
         for rnd in range(1, self.cfg.validate_rounds + 1):
             verdicts = self.validate_only(goal, rnd)
             gaps = [v for v in verdicts if v.get("status") != "implemented"]
@@ -398,10 +412,17 @@ class Conductor:
                 self._write_state(spec_green=True)
                 self._hook("spec_green", goal[:120])
                 return
-            if rnd >= self.cfg.validate_rounds:
-                self.c.print(f"[yellow]■ validation rounds exhausted — {len(gaps)} gap(s) remain (see .spiral/validation.json)[/]")
+            if prev_gaps is not None and len(gaps) >= prev_gaps:
+                self.c.print(f"[yellow]■ no net progress this round — stopping. {len(gaps)} gap(s) remain "
+                             "(see .spiral/validation.json)[/]")
                 self._write_state(spec_green=False, gaps=[v["id"] for v in gaps])
                 return
+            if rnd >= self.cfg.validate_rounds:
+                self.c.print(f"[yellow]■ validation round cap reached — {len(gaps)} gap(s) remain "
+                             "(see .spiral/validation.json)[/]")
+                self._write_state(spec_green=False, gaps=[v["id"] for v in gaps])
+                return
+            prev_gaps = len(gaps)
             self._remediate(goal, atom, verdicts)
 
     # -- step-mode gatekeeper: shift-tab flips auto↔step live ---------------------
@@ -435,20 +456,22 @@ class Conductor:
 
     def _run_task(
         self, atom: Atom, spec: TaskSpec, ui,
-        attempts: int | None = None, esc_attempts: int | None = None, ratchet: bool = False,
+        attempts: int | None = None, esc_attempts: int | None = None,
+        ratchet: bool = False, allow_done: bool = True,
     ) -> str:
         """Run with escalation. Returns 'green' | 'escalated' | 'blocked'.
         With ratchet (bootstrap), partial progress banks as checkpoints and
-        compounds across both model lanes."""
+        compounds across both model lanes. allow_done=False forbids ALREADY_DONE
+        (remediation of validator-proven gaps)."""
         strict = not ratchet
-        if atom.run(spec, attempts=attempts, strict_green=strict, ratchet=ratchet, ui=ui):
+        if atom.run(spec, attempts=attempts, strict_green=strict, ratchet=ratchet, allow_done=allow_done, ui=ui):
             return "green"
         ui.print(f"  [rgb(217,119,87)]⇑ escalating to {self.cfg.escalation.name}[/]")
         atom.run_stats["esc_lanes"] += 1
         if atom.run(
             spec, model=self.cfg.escalation.name,
             attempts=esc_attempts or self.cfg.escalation_attempts,
-            strict_green=strict, ratchet=ratchet, ui=ui,
+            strict_green=strict, ratchet=ratchet, allow_done=allow_done, ui=ui,
         ):
             self._distill(spec.goal)
             return "escalated"

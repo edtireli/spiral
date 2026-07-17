@@ -191,6 +191,7 @@ class Atom:
         attempts: int | None = None,
         strict_green: bool = False,
         ratchet: bool = False,
+        allow_done: bool = True,
         ui=None,
     ) -> bool:
         """Drive one task to green. `model` overrides the worker (escalation);
@@ -198,15 +199,17 @@ class Atom:
         so a failed task can never poison the next one. `ratchet` is bootstrap
         mode — the task STARTS red, so there is no green to protect: instead,
         every attempt that reduces the error count is BANKED as a checkpoint
-        commit, and failure reverts only to the last checkpoint. `ui` is a Dash
-        (shared cockpit) or None → SoloStatus one-liner."""
+        commit, and failure reverts only to the last checkpoint. `allow_done`
+        False forbids ALREADY_DONE / no-op success — used for remediation tasks
+        the validator has already proven incomplete. `ui` is a Dash (shared
+        cockpit) or None → SoloStatus one-liner."""
         from spiral.dash import SoloStatus
 
         owns_ui = ui is None
         if owns_ui:
             ui = SoloStatus().__enter__()
         try:
-            return self._run(task, model, attempts, strict_green, ratchet, ui)
+            return self._run(task, model, attempts, strict_green, ratchet, allow_done, ui)
         finally:
             if owns_ui:
                 ui.__exit__(None, None, None)
@@ -300,7 +303,7 @@ class Atom:
         noise and saves prompt tokens."""
         return out.replace(f"file://{self.ws}/", "").replace(f"{self.ws}/", "")
 
-    def _run(self, task: TaskSpec, model: str | None, attempts: int | None, strict_green: bool, ratchet: bool, ui) -> bool:
+    def _run(self, task: TaskSpec, model: str | None, attempts: int | None, strict_green: bool, ratchet: bool, allow_done: bool, ui) -> bool:
         self._ensure_git()
         model_name = model or self.cfg.worker.name
         files = list(task.files) if task.files else _auto_files(self.ws)
@@ -319,7 +322,16 @@ class Atom:
             )
             missing = _missing()
             audit_mode = verify.ok and not missing
-            if audit_mode:
+            if audit_mode and not allow_done:
+                # the validator has PROVEN this requirement unmet — no audit, no
+                # ALREADY_DONE. The model must emit real edits.
+                verify_out = (
+                    "(the build gate is GREEN. This requirement has been INDEPENDENTLY VERIFIED as "
+                    "NOT met — you may NOT claim it is done. Emit the SEARCH/REPLACE blocks that "
+                    "implement it WITHOUT breaking the build.)"
+                )
+                ui.print("  [dim]○ remediation — gate green but requirement unmet, must edit[/]")
+            elif audit_mode:
                 # green + files exist proves nothing about the BEHAVIOR this task
                 # adds — audit instead of blind-skip (the 12/12 false-completion lesson)
                 verify_out = (
@@ -423,6 +435,11 @@ class Atom:
 
             blocks = parse_edits(res.text)
             if not blocks and "ALREADY_DONE" in res.text[:80]:
+                if not allow_done:
+                    ui.print("  [yellow]○ claimed ALREADY_DONE, but the validator says otherwise — rejected[/]")
+                    apply_errs = ("You replied ALREADY_DONE, but this requirement was independently "
+                                  "verified as NOT met. Emit the SEARCH/REPLACE blocks that implement it.")
+                    continue
                 ui.print("  [green]● audit: already implemented — nothing to do[/]")
                 return True
             if not blocks:
