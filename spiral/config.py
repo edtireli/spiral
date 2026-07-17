@@ -74,7 +74,7 @@ class Config:
     escalation_attempts: int = 4       # extra cycles on the stronger model
     bootstrap_attempts: int = 12       # first-green repair gets a longer leash
     plan_rounds: int = 2               # lint→critic→repair cycles before execution
-    validate_rounds: int = 2           # end-of-run validate→remediate cycles
+    validate_rounds: int = 4           # max validate→remediate cycles; stops early on a plateau
     run_token_budget: int = 4_000_000  # global ceiling for a whole run
     verify_timeout: int = 900          # seconds; real build gates (gradle) are slow
 
