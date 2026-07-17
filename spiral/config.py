@@ -65,7 +65,10 @@ class Config:
     keep_alive: str = "45m"
 
     # budgets — the guardrails that keep an autonomous run bounded
-    worker_max_tokens: int = 4096      # room to write whole source files, thinking off
+    # output cap per reply (num_predict) — NOT the context window (that's num_ctx,
+    # set by `tune`). A ceiling, not a target: a short reply still ends early, so
+    # a higher cap only rescues replies that would otherwise truncate mid-block.
+    worker_max_tokens: int = 8192
     planner_max_tokens: int = 16384    # thinking + a whole-app plan; thinking alone can eat 8k
     task_attempt_budget: int = 6       # edit→verify cycles before escalation
     escalation_attempts: int = 4       # extra cycles on the stronger model
@@ -119,6 +122,7 @@ class Config:
             cfg.base_url = os.environ.get("SPIRAL_BASE_URL", overlay.get("base_url", cfg.base_url))
             cfg.extra_gate = overlay.get("extra_gate", cfg.extra_gate)
             cfg.spiral_style = os.environ.get("SPIRAL_STYLE", overlay.get("style", cfg.spiral_style))
+            cfg.worker_max_tokens = int(overlay.get("worker_max_tokens", cfg.worker_max_tokens))
         except Exception:
             pass  # a broken overlay must never break spiral
         return cfg
