@@ -118,7 +118,7 @@ class Atom:
 
     def _prompt(self, task: TaskSpec, files: list[str], verify_out: str, apply_errs: str,
                 skills_text: str = "", tried: list[str] | None = None,
-                repo_answers: str = "") -> str:
+                repo_answers: str = "", symbols: str = "") -> str:
         """Prompt layout is cache-conscious: stable content (project, task, files)
         FIRST, volatile content (verify output, apply errors) LAST. Ollama reuses
         the KV cache for the unchanged prefix between attempts — on a 10k-token
@@ -135,6 +135,8 @@ class Atom:
         ]
         if skills_text:
             parts += ["CRAFT NOTES (follow these):", skills_text, ""]
+        if symbols:
+            parts += [symbols, ""]
         parts.append("FILES:")
         budget = 60_000  # chars across file bodies; num_ctx is real now (32k tokens)
         for rel in files:
@@ -363,6 +365,13 @@ class Atom:
         if cards:
             ui.print(f"  [dim]skills: {', '.join(c.name for c in cards)}[/]")
 
+        # static symbol map — types, members, and layout-id→binding — so the worker
+        # reads what exists instead of guessing (preempts the hallucinated-symbol class)
+        from spiral.symbols import build_symbol_index
+        symbols = build_symbol_index(self.ws)
+        if symbols:
+            ui.print(f"  [dim]symbols: {symbols.count(chr(10))} lines indexed[/]")
+
         apply_errs = ""
         budget = attempts or self.cfg.task_attempt_budget
         cap = self.cfg.worker_max_tokens
@@ -381,7 +390,7 @@ class Atom:
             attempt += 1
             ui.print(f"  [dim]— attempt {attempt}/{budget} · {model_name} —[/]")
             tried = self._compact_tried(tried)
-            prompt = self._prompt(task, files, verify_out, apply_errs, skills_text, tried, repo_answers)
+            prompt = self._prompt(task, files, verify_out, apply_errs, skills_text, tried, repo_answers, symbols)
             msgs = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": prompt}]
 
             ui.phase("building", model=model_name)
