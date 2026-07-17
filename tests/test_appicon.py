@@ -44,18 +44,28 @@ def test_unknown_glyph_falls_back_to_spiral():
     ET.fromstring(icon_vector("#FFFFFF", "#000000", "definitely-not-a-glyph"))
 
 
-def test_write_creates_icon_and_wires_manifest():
+def test_write_creates_adaptive_icon_and_wires_manifest():
     with tempfile.TemporaryDirectory() as d:
         ws = _android_project(d)
         written = write_android_icon(ws, "#FF1744", "#0A0A0A", "eye")
-        icon = ws / "app/src/main/res/drawable/ic_launcher.xml"
-        assert icon.is_file(), "icon not written"
-        ET.fromstring(icon.read_text())  # valid vector
+        res = ws / "app/src/main/res"
+        expected = [
+            "drawable/ic_launcher_foreground.xml",
+            "drawable/ic_launcher_background.xml",
+            "mipmap-anydpi-v26/ic_launcher.xml",
+            "mipmap-anydpi-v26/ic_launcher_round.xml",
+            "mipmap-anydpi/ic_launcher.xml",
+            "mipmap-anydpi/ic_launcher_round.xml",
+        ]
+        for rel in expected:
+            f = res / rel
+            assert f.is_file(), f"{rel} not written"
+            ET.fromstring(f.read_text())  # every emitted file is well-formed
+            assert str(f.relative_to(ws)) in written
         manifest = (ws / "app/src/main/AndroidManifest.xml").read_text()
         ET.fromstring(manifest)  # still valid after patch
-        assert 'android:icon="@drawable/ic_launcher"' in manifest
-        assert 'android:roundIcon="@drawable/ic_launcher"' in manifest
-        assert str(icon.relative_to(ws)) in written
+        assert 'android:icon="@mipmap/ic_launcher"' in manifest
+        assert 'android:roundIcon="@mipmap/ic_launcher_round"' in manifest
 
 
 def test_idempotent_second_run_reports_no_change():
