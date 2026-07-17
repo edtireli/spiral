@@ -434,7 +434,7 @@ class Atom:
                 if preview:
                     ui.print(f"     [dim]reply starts: {preview!r}[/]")
                 if truncated:
-                    cap = min(8192, cap + 2048)  # give the next attempt room
+                    cap = min(12288, cap + 2048)  # give the next attempt room
                     apply_errs = (
                         "Your reply was CUT OFF at the token limit before any block closed. "
                         "Emit ONE small block: SEARCH of at most 12 lines around the first error only."
