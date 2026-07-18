@@ -149,6 +149,9 @@ def main() -> None:
     st = sub.add_parser("stats", help="run history from the ledger: tokens, tok/s, outcomes")
     st.add_argument("--dir", default=".")
 
+    dst = sub.add_parser("distill", help="mine the ledger: signature routing table + learned fixes")
+    dst.add_argument("--dir", default=".")
+
     rw = sub.add_parser("rewind", help="list task checkpoints; rewind the spiral branch to one")
     rw.add_argument("n", nargs="?", type=int, help="checkpoint number to rewind to")
     rw.add_argument("--dir", default=".")
@@ -218,6 +221,13 @@ def main() -> None:
         from spiral.extras import show_stats
 
         show_stats(console, args.dir)
+        return
+
+    if args.cmd == "distill":
+        from spiral.route import distill as distill_cmd
+
+        _info_line(console, args.dir)
+        distill_cmd(console, args.dir)
         return
 
     if args.cmd == "rewind":
