@@ -159,8 +159,19 @@ class Spinner:
             sys.stdout.flush()
 
 
+def _type_in(text: str, p: float, start: float, end: float) -> str:
+    """Slice `text` by eased progress within [start, end] — the wordmark and
+    tagline type themselves in alongside the spiral's draw instead of popping."""
+    if p >= end:
+        return text
+    if p <= start:
+        return ""
+    return text[: round(len(text) * (p - start) / (end - start))]
+
+
 def _banner_frame(progress: float, tagline: str, style: str = "spiral"):
-    """Compact banner: 4-row spiral beside tracked wordmark + tagline."""
+    """Compact banner: 4-row spiral beside tracked wordmark + tagline. Every
+    element cascades with `progress` — nothing arrives all at once."""
     from rich.console import Group
 
     sp = spiral_braille(cols=9, rows=4, turns=2.2, progress=progress, style=style)
@@ -168,9 +179,10 @@ def _banner_frame(progress: float, tagline: str, style: str = "spiral"):
     for i, ln in enumerate(sp):
         t = Text("  " + ln, style=_rgb(CLAY))
         if i == 1:
-            t.append("   s p i r a l", style=f"bold {_rgb(CLAY)}")
+            t.append("   " + _type_in("s p i r a l", progress, 0.20, 0.85),
+                     style=f"bold {_rgb(CLAY)}")
         elif i == 2:
-            t.append("   " + tagline, style="dim")
+            t.append("   " + _type_in(tagline, progress, 0.55, 1.0), style="dim")
         lines.append(t)
     return Group(*lines)
 
