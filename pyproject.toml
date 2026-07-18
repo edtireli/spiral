@@ -1,6 +1,6 @@
 [project]
 name = "spiral-coder"
-version = "0.1.0"
+version = "0.1.1"
 description = "Local-first autonomous coding CLI — plans, builds, verifies, and validates against a spec, entirely on your own hardware."
 readme = "README.md"
 requires-python = ">=3.11"

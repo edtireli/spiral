@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.1 — 2026-07-18
+
+Docs release, no code changes. Condensed README; absolute image URLs so the
+PyPI project page renders the demo and the mark (requires the repository to be
+public).
+
 ## 0.1.0 — 2026-07-18
 
 First public release.
