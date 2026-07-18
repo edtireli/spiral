@@ -32,7 +32,8 @@ from spiral.config import Config
 from spiral.llm import Ollama
 from spiral.planner import (
     Milestone, Plan, Task, coverage_gaps, critique_plan, design_brief, design_tokens,
-    extract_spec, lint_plan, make_plan, parse_plan, plan_to_dict, repair_plan, validate_spec,
+    extract_spec, lint_plan, make_plan, parse_plan, plan_to_dict, repair_plan,
+    sanitize_checks, validate_spec,
 )
 from spiral.ledger import Ledger
 from spiral.repomap import build_repomap, list_files
@@ -205,9 +206,15 @@ class Conductor:
             sp.update(tokens=res.total_tokens)
         self.ledger.log("plan", phase="spec", model=self.cfg.planner.name, ptok=res.prompt_tokens, ctok=res.completion_tokens)
         self.ledger.thinking("spec", res.thinking)
-        c.print(f"  [green]●[/] spec: {len(spec)} requirements · [dim]{res.total_tokens} tok[/]")
+        for note in sanitize_checks(spec):
+            c.print(f"     [yellow]check lint:[/] [dim]{note}[/]")
+        checked = sum(1 for r in spec if r.get("check"))
+        c.print(f"  [green]●[/] spec: {len(spec)} requirements"
+                + (f" · {checked} with executable checks" if checked else "")
+                + f" · [dim]{res.total_tokens} tok[/]")
         for r in spec:
-            c.print(f"     [dim]{r['id']} ({r.get('kind', 'feature')}):[/] {r['text'][:90]}")
+            kind = r.get("kind", "feature") + (", check" if r.get("check") else "")
+            c.print(f"     [dim]{r['id']} ({kind}):[/] {r['text'][:90]}")
         (self._dir() / "spec.json").write_text(json.dumps(spec, indent=2))
 
         kind = self._project_kind(goal)
@@ -418,6 +425,7 @@ class Conductor:
             return json.loads(f.read_text())
         with Spinner("extracting spec") as sp:
             spec, _ = extract_spec(goal, self.cfg, self.ol, progress=lambda k: sp.tick())
+        sanitize_checks(spec)
         f.write_text(json.dumps(spec, indent=2))
         return spec
 
@@ -431,13 +439,42 @@ class Conductor:
         c = self.c
         spec = self._load_spec(goal)
         repomap = build_repomap(self.ws, max_file_bytes=10_000, max_total=120_000)
-        c.print(f"[bold {CLAY}]━━ validation {rnd} · {self.cfg.critic.name} judges code vs {len(spec)} requirements ━━[/]")
-        self.ol.evict(self.cfg.planner.name)
+        det = [r for r in spec if r.get("check")]
+        opined = [r for r in spec if not r.get("check")]
+        judged_by = (f"{len(det)} by execution · {self.cfg.critic.name} judges the rest"
+                     if det else f"{self.cfg.critic.name} judges code")
+        c.print(f"[bold {CLAY}]━━ validation {rnd} · {len(spec)} requirements · {judged_by} ━━[/]")
 
         verdicts: list[dict] = []
         tok_total = 0
-        for i in range(0, len(spec), self.VALIDATE_CHUNK):
-            batch = spec[i:i + self.VALIDATE_CHUNK]
+        # ---- executable acceptance checks first: exit codes, not opinions -------
+        for r in det:
+            with Spinner(f"check {r['id']}") as sp:
+                v = tools.run(r["check"], self.ws, timeout=self.cfg.verify_timeout,
+                              on_line=lambda ln: sp.update(detail=ln))
+            self.ledger.log("check", id=r["id"], cmd=r["check"][:120], exit=v.code)
+            if v.ok:
+                verdicts.append({"id": r["id"], "status": "implemented", "check": r["check"],
+                                 "evidence": f"acceptance check passed: {r['check'][:70]}"})
+            elif v.code in (124, 126, 127):
+                # the CHECK is broken (timeout / denylist / command not found) —
+                # that must indict the check, not the requirement
+                c.print(f"  [yellow]○ {r['id']} check unusable (exit {v.code}) — falling back to the validator[/]")
+                opined.append(r)
+            else:
+                tail = " ".join(" ".join(v.out.splitlines()[-3:]).split())[:160]
+                verdicts.append({
+                    "id": r["id"], "status": "missing", "check": r["check"],
+                    "evidence": f"acceptance check failed (exit {v.code}): {tail}",
+                    "fix": {"title": f"make the acceptance check for {r['id']} pass",
+                            "description": (f"Requirement: {r['text']}. Its executable acceptance check "
+                                            f"`{r['check']}` exits {v.code}. Check output tail: {tail}"),
+                            "files": []},
+                })
+
+        self.ol.evict(self.cfg.planner.name)
+        for i in range(0, len(opined), self.VALIDATE_CHUNK):
+            batch = opined[i:i + self.VALIDATE_CHUNK]
             label = f"validating {batch[0]['id']}–{batch[-1]['id']}"
             try:
                 with Spinner(label) as sp:
@@ -496,6 +533,9 @@ class Conductor:
                 title=fix.get("title", f"implement {v['id']}"),
                 description=desc,
                 files=fix.get("files", []) or [],
+                # a failed acceptance check becomes the task's own gate: the loop
+                # drives the actual criterion to green, not a proxy for it
+                verify=v.get("check", "") or "",
             ))
         if not tasks:
             return
@@ -505,7 +545,9 @@ class Conductor:
             for ti, t in enumerate(tasks, 1):
                 dash.task(1, ti, "run")
                 dash.print(f"[bold]▶ V.{ti} {t.title}[/]")
-                verify = self.gate or ""
+                verify = t.verify.strip()
+                if self.gate:
+                    verify = f"({verify}) && ({self.gate})" if verify else self.gate
                 spec_task = TaskSpec(
                     goal=f"{t.title}\n{t.description}".strip(),
                     verify_cmd=verify, files=t.files or None, context=goal,
