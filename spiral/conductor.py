@@ -591,6 +591,7 @@ class Conductor:
             spec, model=self.cfg.escalation.name,
             attempts=esc_attempts or self.cfg.escalation_attempts,
             strict_green=strict, ratchet=ratchet, allow_done=allow_done, ui=ui,
+            diversity=False,  # the dense lane is the last resort — no second sampler
         ):
             self._distill(spec.goal)
             return "escalated"
