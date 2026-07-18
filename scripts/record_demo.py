@@ -265,7 +265,35 @@ def _squeeze(frames: list[tuple[Grid, int]], max_run: int = 10, fast_ms: int = 1
             out.append((g, ms))
         prev = g
     flush()
-    return out
+    return _deflicker(out)
+
+
+def _deflicker(frames: list[tuple[Grid, int]], passes: int = 3) -> list[tuple[Grid, int]]:
+    """Drop mid-repaint frames. A pinned Live panel repaints by clearing and
+    redrawing; when a snapshot lands between the two, the bottom half of the
+    screen loses content for one frame and immediately recovers — visible as
+    flicker. Detect the dip-and-recover shape and merge the dip away."""
+    def ink(g: Grid) -> int:
+        return sum(1 for row in g[len(g) // 2:] for cell in row if cell[0] != " ")
+
+    for _ in range(passes):
+        out = [frames[0]]
+        changed = False
+        i = 1
+        while i < len(frames):
+            if i + 1 < len(frames):
+                a, b, c = ink(out[-1][0]), ink(frames[i][0]), ink(frames[i + 1][0])
+                if a > 60 and b < 0.90 * a and c >= 0.97 * a:
+                    out[-1] = (out[-1][0], out[-1][1] + frames[i][1])
+                    changed = True
+                    i += 1
+                    continue
+            out.append(frames[i])
+            i += 1
+        frames = out
+        if not changed:
+            break
+    return frames
 
 
 # ---- rasterize ---------------------------------------------------------------
