@@ -143,10 +143,19 @@ requirement. Requirements that are missing or incomplete become new tasks:
 ```
 
 **Verification.** A task is complete only when it passes every check that
-applies: the build or test gate (compiles, tests pass), an artifact check (the
+applies: the build or test gate (compiles, tests pass), a footgun lint welded
+into that gate (deterministic patterns that compile fine but crash at runtime —
+a `Handler()` with no Looper, `parseColor` without `#`), an artifact check (the
 files the task declared exist), a behavior audit (the task actually changed
 something relevant), and the final spec validation (the requirement is
 implemented). You can append your own check with `extra_gate`.
+
+**Containment.** Runs happen on a dedicated `spiral/run-*` branch, and the
+model's shell refuses genuinely destructive operations even in full-auto:
+`rm -rf`, `sudo`, `git push`, `git reset --hard`, and disk or network commands
+(`mkfs`, `dd`, `curl`, `wget`) are blocked by a denylist and fail with exit 126.
+The only door to the network is the research module — GET-only, size-capped,
+and fetched content is treated as reference data, never as instructions.
 
 **Context acquisition.** Local models often reference identifiers or files they
 have not been shown, and do not reliably notice when they are missing something.
@@ -175,11 +184,14 @@ spiral supplies context in stages rather than relying on the model to ask:
 | `spiral build "goal"` | plan, implement, validate, and remediate |
 | `spiral build --resume` | continue a previous run |
 | `spiral build --approve` | print the plan and wait for confirmation before running |
+| `spiral build --boost` | keep the worker local; run the reasoning roles (escalation, critic/validator) on the configured API provider |
+| `spiral build --api` | run the entire crew on the configured API provider |
 | `spiral plan "goal"` | show the decomposition without running it |
 | `spiral validate` | check existing code against the goal's spec (read-only) |
 | `spiral do "task" --verify "cmd"` | run a single task against one verify command |
 | `spiral setup` | detect Ollama and pull a model crew sized to this machine |
 | `spiral tune` | size model context windows to available memory |
+| `spiral tune --wired` | also raise the macOS GPU wired-memory limit so Ollama can use more unified RAM (sudo; reverts on reboot) |
 | `spiral doctor` | check Ollama, models, tuning, gate, git, and disk |
 | `spiral stats` | token counts, per-model throughput, and outcomes from the run log |
 | `spiral note "text"` | add a note that is included in every worker prompt |
@@ -216,6 +228,9 @@ and can be edited directly:
   "models":     { "worker": "qwen3.6:latest", "critic": "qwen3.6:27b" },
   "num_ctx":    { "qwen3.6:latest": 28672, "qwen3.6:27b": 57344 },
   "extra_gate": "ktlint app/src",
+  "providers": {
+    "kimi-k3": { "base_url": "https://api.moonshot.ai/v1", "api_key_env": "MOONSHOT_API_KEY" }
+  },
   "hooks": {
     "run_complete": "osascript -e 'display notification \"$SPIRAL_INFO\" with title \"spiral\"'",
     "spec_green":   "say 'spec green'",
@@ -225,6 +240,13 @@ and can be edited directly:
 ```
 
 - `extra_gate` — a command appended to every task's gate. If it exits non-zero, the task is not complete.
+- `providers` — OpenAI-compatible endpoints, keyed by model id. Any role set to
+  one of these ids is served by that endpoint instead of Ollama. The API key is
+  read from the environment variable named in `api_key_env` and is never written
+  to disk. `spiral build --boost` remaps the reasoning roles (escalation,
+  critic/validator) onto the first provider while the worker stays local;
+  `--api` remaps the whole crew. Without these flags everything runs local —
+  the default never needs a key.
 - `hooks` — commands run on the events `task_green`, `blocked`, `run_complete`, and `spec_green`. `$SPIRAL_EVENT` and `$SPIRAL_INFO` are set in the environment.
 
 ## <img src="assets/mark.svg" width="21" alt=""/> Project knowledge
@@ -249,6 +271,22 @@ task. The brief is distilled into `.spiral/design_tokens.json`, and for an
 Android app spiral draws a **launcher icon** from those tokens and wires the
 manifest before feature work — so the app ships a real icon, not the stock
 robot, without a small model having to hand-write adaptive-icon XML.
+
+## <img src="assets/mark.svg" width="21" alt=""/> Run artifacts
+
+Everything a run learns or decides is written to `.spiral/` in the target repo:
+
+| file | contents |
+|---|---|
+| `plan.json` | the goal and task graph; `--resume` and goal reuse read it |
+| `ledger.jsonl` | the flight recorder — one line per model call and attempt: model, tokens, tok/s, edits, verify exit, verdicts |
+| `scratch/thinking-*.txt` | reasoning transcripts from the plan, critic, and validation calls |
+| `validation.json` | the latest spec verdict for each requirement |
+| `design.md` · `design_tokens.json` | the design brief and its distilled tokens (UI projects) |
+| `skills/learned-fixes.md` | fixes the escalation model found, reused by the worker on later runs |
+
+`spiral stats` summarizes the ledger; reading `ledger.jsonl` directly is the
+fastest way to see exactly what a run did and why.
 
 ## <img src="assets/mark.svg" width="21" alt=""/> Principles
 
