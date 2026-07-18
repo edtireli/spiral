@@ -13,7 +13,7 @@ from pathlib import Path
 from rich.console import Console
 
 from spiral.banner import print_banner
-from spiral.theme import make_console
+from spiral.theme import make_console, reveal
 from spiral.config import Config
 from spiral.llm import Ollama
 
@@ -22,13 +22,14 @@ def _health(console: Console) -> None:
     cfg = Config.load()
     version = Ollama(cfg.base_url).health()
     if version:
-        console.print(f"  [green]●[/green] ollama {version}  ·  worker [bold]{cfg.worker.name}[/bold]\n")
+        reveal(console, f"  [green]●[/green] ollama {version}  ·  worker [bold]{cfg.worker.name}[/bold]\n")
     else:
-        console.print(f"  [red]●[/red] ollama unreachable at {cfg.base_url}\n")
+        reveal(console, f"  [red]●[/red] ollama unreachable at {cfg.base_url}\n")
 
 
-def _info_line(console: Console, workspace: str) -> None:
-    """One useful line instead of echoing `dir .`: workspace · branch · gate."""
+def _info_line(console: Console, workspace: str, *extra: str) -> None:
+    """One useful line instead of echoing `dir .`: workspace · branch · gate.
+    Extra lines cascade in after it (theme.reveal) instead of slamming down."""
     from spiral import tools
     from spiral.conductor import detect_gate
 
@@ -39,7 +40,7 @@ def _info_line(console: Console, workspace: str) -> None:
         if branch:
             parts.append(branch)
     parts.append(f"gate: {detect_gate(ws) or 'none'}")
-    console.print("  [dim]▸[/] " + " [dim]·[/] ".join(parts) + "\n")
+    reveal(console, "  [dim]▸[/] " + " [dim]·[/] ".join(parts) + "\n", *extra)
 
 
 def _apply_tier(cfg, console, tier):
@@ -54,9 +55,9 @@ def _apply_tier(cfg, console, tier):
     targets = (cfg.worker, cfg.planner, cfg.escalation, cfg.critic) if tier == "api" else (cfg.escalation, cfg.critic)
     for spec in targets:
         spec.name = model
-    console.print(f"  [rgb(217,119,87)]◆ {tier}[/] — {model} on: "
-                  + (", ".join(sorted({'worker','planner','escalation','critic/validator'})) if tier == "api"
-                     else "escalation, critic/validator") + "\n")
+    reveal(console, f"  [rgb(217,119,87)]◆ {tier}[/] — {model} on: "
+           + (", ".join(sorted({'worker','planner','escalation','critic/validator'})) if tier == "api"
+              else "escalation, critic/validator") + "\n")
     return cfg
 
 
@@ -269,9 +270,9 @@ def main() -> None:
     if args.cmd == "do":
         from spiral.agent import Atom, TaskSpec
 
-        _info_line(console, args.dir)
-        console.print(f"  goal   [bold]{args.goal}[/]")
-        console.print(f"  verify [dim]{args.verify}[/]\n")
+        _info_line(console, args.dir,
+                   f"  goal   [bold]{args.goal}[/]",
+                   f"  verify [dim]{args.verify}[/]\n")
         ok = Atom(workspace=args.dir).run(TaskSpec(args.goal, args.verify, args.file))
         raise SystemExit(0 if ok else 1)
 
