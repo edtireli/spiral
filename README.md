@@ -87,6 +87,13 @@ cd your-project
 spiral build "make me a pomodoro TUI in python, with tests"
 ```
 
+<p align="center">
+  <img src="assets/demo.gif" alt="the start of a real run: the banner draws in, the gate is detected, a run branch is created, and spec extraction begins" width="680"/>
+</p>
+
+<p align="center"><sub>The start of a real run, recorded from the terminal: gate detection, the
+dedicated run branch, and spec extraction spinning up on a local model.</sub></p>
+
 spiral works on a dedicated git branch (`spiral/run-*`), never on yours. Each
 verified step is a commit; you merge when you're happy. Stop any time with
 Ctrl-C — committed work is kept, and the same command with `--resume` continues
@@ -524,8 +531,9 @@ must start, not just compile); a JSON event stream and a CI action.
 ## <img src="assets/mark.svg" width="21" alt=""/> Extras
 
 ```bash
-python -m spiral.banner --vortex     # animated banner
-python experiments/sinks_test.py     # context-overflow test
+python -m spiral.banner --vortex        # animated banner
+python experiments/sinks_test.py        # context-overflow test
+python scripts/record_demo.py --dir .   # re-record assets/demo.gif from a real run (needs pyte)
 ```
 
 <p align="center"><img src="assets/divider.svg" width="520" alt=""/></p>
