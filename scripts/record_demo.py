@@ -140,7 +140,13 @@ def _dim(c: tuple) -> tuple:
 
 
 # ---- recording ---------------------------------------------------------------
-def record(argv: list[str], cwd: str, cols: int, rows: int, max_s: float) -> list[tuple[float, bytes]]:
+def record(argv: list[str], cwd: str, cols: int, rows: int, max_s: float,
+           watch: str = "", reply: str = "", reply_delay: float = 1.4,
+           tail: float = 7.0) -> list[tuple[float, bytes]]:
+    """Run the command in a real PTY and capture its byte stream with timing.
+    If `watch` text appears in the output, `reply` is typed into the pty after
+    `reply_delay` seconds (the echo shows up in the recording, like a human
+    answering), and capture ends `tail` seconds later."""
     master, slave = os.openpty()
     fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
     env = {**os.environ, "TERM": "xterm-256color", "COLORTERM": "truecolor",
@@ -150,14 +156,19 @@ def record(argv: list[str], cwd: str, cols: int, rows: int, max_s: float) -> lis
     os.close(slave)
     chunks: list[tuple[float, bytes]] = []
     t0 = time.monotonic()
-    interrupted = False
+    seen_tail = b""
+    reply_at: float | None = None
+    replied_at: float | None = None
     try:
         while True:
             t = time.monotonic() - t0
-            if t > max_s and not interrupted:
-                proc.send_signal(signal.SIGINT)
-                interrupted = True
-                break  # everything after the cut is not part of the demo
+            if t > max_s:
+                break
+            if reply_at is not None and replied_at is None and t >= reply_at:
+                os.write(master, reply.encode() + b"\n")
+                replied_at = t
+            if replied_at is not None and t > replied_at + tail:
+                break
             r, _, _ = select.select([master], [], [], 0.03)
             if r:
                 try:
@@ -167,6 +178,10 @@ def record(argv: list[str], cwd: str, cols: int, rows: int, max_s: float) -> lis
                 if not data:
                     break
                 chunks.append((t, data))
+                if watch and reply_at is None:
+                    seen_tail = (seen_tail + data)[-4096:]
+                    if watch.encode() in seen_tail:
+                        reply_at = t + reply_delay
             elif proc.poll() is not None:
                 break
     finally:
@@ -204,7 +219,7 @@ def replay(chunks: list[tuple[float, bytes]], cols: int, rows: int) -> list[tupl
         grid = snap()
         if frames and grid == frames[-1][0]:
             frames[-1] = (grid, frames[-1][1] + gap)
-        elif gap > 8 or not frames:
+        elif gap > 25 or not frames:  # sub-25ms bursts are one repaint, not a frame
             frames.append((grid, gap))
         else:  # burst of writes — replace the barely-shown frame
             frames[-1] = (frames[-1][0], frames[-1][1] + gap)
@@ -223,7 +238,34 @@ def replay(chunks: list[tuple[float, bytes]], cols: int, rows: int) -> list[tupl
                 thinned[-1] = (g, thinned[-1][1] + ms)
                 continue
         thinned.append((g, ms))
-    return thinned
+    return _squeeze(thinned)
+
+
+def _squeeze(frames: list[tuple[Grid, int]], max_run: int = 10, fast_ms: int = 140) -> list[tuple[Grid, int]]:
+    """Time-lapse the waits: a long run of status-only frames (minutes of model
+    thinking) becomes a short fast-spin flourish instead of dead GIF time."""
+    out: list[tuple[Grid, int]] = []
+    run: list[tuple[Grid, int]] = []
+
+    def flush() -> None:
+        nonlocal run
+        if len(run) > max_run:
+            idx = [round(i * (len(run) - 1) / (max_run - 1)) for i in range(max_run)]
+            run = [(run[i][0], fast_ms) for i in idx]
+        out.extend(run)
+        run = []
+
+    prev: Grid | None = None
+    for g, ms in frames:
+        status_only = prev is not None and sum(1 for a, b in zip(prev, g) if a != b) <= 1
+        if status_only:
+            run.append((g, ms))
+        else:
+            flush()
+            out.append((g, ms))
+        prev = g
+    flush()
+    return out
 
 
 # ---- rasterize ---------------------------------------------------------------
@@ -258,34 +300,72 @@ def render(grid: Grid, cols: int, rows: int, title: str, prompt: str) -> Image.I
     return img
 
 
-def to_transparent_p(img: Image.Image) -> Image.Image:
-    opaque = img.getchannel("A").point(lambda a: 255 if a >= 96 else 0)
-    p = img.convert("RGB").quantize(colors=127, method=Image.Quantize.MEDIANCUT)
-    p.paste(255, mask=opaque.point(lambda v: 255 - v))
-    p.info["transparency"] = 255
-    return p
+def save_gif(imgs: list[Image.Image], durs: list[int], out: Path) -> None:
+    """Delta-encoded GIF: one shared palette, and every frame after the first
+    keeps only its changed pixels (the rest transparent, disposal=keep). On a
+    terminal recording almost everything is static, so this is the difference
+    between a bloated GIF and a small one."""
+    from PIL import ImageChops
+
+    w, h = imgs[0].size
+    step = max(1, len(imgs) // 6)
+    sample = Image.new("RGB", (w, h * min(6, len(imgs))))
+    for i, f in enumerate(imgs[::step][:6]):
+        sample.paste(f.convert("RGB"), (0, i * h))
+    pal = sample.quantize(colors=127, method=Image.Quantize.MEDIANCUT)
+    qs = [f.convert("RGB").quantize(palette=pal, dither=Image.Dither.NONE) for f in imgs]
+
+    first = qs[0].copy()
+    outer = imgs[0].getchannel("A").point(lambda a: 255 if a < 96 else 0)
+    first.paste(255, mask=outer)  # window corners stay transparent
+    frames = [first]
+    prev = qs[0].convert("RGB")
+    for q in qs[1:]:
+        cur = q.convert("RGB")
+        same = ImageChops.difference(cur, prev).convert("L").point(lambda v: 255 if v == 0 else 0)
+        fr = q.copy()
+        fr.paste(255, mask=same)
+        frames.append(fr)
+        prev = cur
+    frames[0].save(out, save_all=True, append_images=frames[1:], duration=durs,
+                   loop=0, transparency=255, disposal=1, optimize=True)
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--cmd", default='build "a pomodoro TUI in python, with tests"',
+    ap.add_argument("--cmd", default='build --approve "a pomodoro TUI in python, with tests"',
                     help="spiral subcommand line to record")
     ap.add_argument("--dir", default=".", help="project directory to run in")
-    ap.add_argument("--cols", type=int, default=84)
-    ap.add_argument("--rows", type=int, default=11)
-    ap.add_argument("--scale", type=float, default=0.72, help="output downscale factor")
-    ap.add_argument("--max", type=float, default=24.0, help="seconds before the cut")
+    ap.add_argument("--cols", type=int, default=96)
+    ap.add_argument("--rows", type=int, default=24)
+    ap.add_argument("--scale", type=float, default=0.70, help="output downscale factor")
+    ap.add_argument("--max", type=float, default=480.0, help="hard cap in seconds")
+    ap.add_argument("--watch", default="execute this plan?",
+                    help="when this text appears, type --reply and finish (empty disables)")
+    ap.add_argument("--reply", default="y")
+    ap.add_argument("--tail", type=float, default=7.0, help="seconds kept after the reply")
     ap.add_argument("--out", default=str(REPO / "assets" / "demo.gif"))
     ap.add_argument("--dump", type=int, default=0, help="also write every Nth frame as PNG")
+    ap.add_argument("--chunks", default="", help="save the raw recording here (pickle)")
+    ap.add_argument("--from-chunks", default="", help="re-render from a saved recording instead of recording")
     a = ap.parse_args()
 
+    import pickle
     import shlex
     argv = [sys.executable, "-m", "spiral.cli", *shlex.split(a.cmd)]
     prompt = f"spiral {a.cmd}"
     title = f"spiral — {Path(a.dir).resolve().name}"
 
-    print(f"recording: {' '.join(argv)}  (cwd={a.dir}, {a.cols}x{a.rows}, cut at {a.max}s)")
-    chunks = record(argv, a.dir, a.cols, a.rows, a.max)
+    if a.from_chunks:
+        chunks = pickle.loads(Path(a.from_chunks).read_bytes())
+        print(f"re-rendering {len(chunks)} chunks from {a.from_chunks}")
+    else:
+        print(f"recording: {' '.join(argv)}  (cwd={a.dir}, {a.cols}x{a.rows}, cap {a.max}s)")
+        chunks = record(argv, a.dir, a.cols, a.rows, a.max,
+                        watch=a.watch, reply=a.reply, tail=a.tail)
+        if a.chunks:
+            Path(a.chunks).write_bytes(pickle.dumps(chunks))
+            print(f"raw recording saved to {a.chunks} (re-render with --from-chunks)")
     # redact the recording machine's interpreter path — cosmetic, and no $HOME leak
     exe = sys.executable.encode()
     chunks = [(t, d.replace(exe, b"python3")) for t, d in chunks]
@@ -317,10 +397,8 @@ def main() -> None:
         for i in range(0, len(imgs), a.dump):
             imgs[i].convert("RGB").save(REPO / "assets" / f"_rec_{i:03d}.png")
     out = Path(a.out)
-    pal = [to_transparent_p(f) for f in imgs]
-    pal[0].save(out, save_all=True, append_images=pal[1:], duration=durs,
-                loop=0, transparency=255, disposal=2, optimize=True)
-    print(f"wrote {out} · {len(pal)} frames · {out.stat().st_size // 1024} KB")
+    save_gif(imgs, durs, out)
+    print(f"wrote {out} · {len(imgs)} frames · {out.stat().st_size // 1024} KB")
 
 
 if __name__ == "__main__":
