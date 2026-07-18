@@ -70,13 +70,16 @@ class Conductor:
         self.ol = Ollama(self.cfg.base_url)
         self.c = make_console()
         self.gate = detect_gate(self.ws)
+        self.gate_disp = self.gate or "none detected"
         if self.gate:
             # runtime-footgun linter rides the gate: compiles-fine-crashes-at-runtime
             # patterns get fixed by the same loop as compile errors
             self.gate = f"({self.gate}) && ({sys.executable} -m spiral.footguns .)"
+            self.gate_disp += " +footguns"
         if self.cfg.extra_gate:
             # user-defined blocking gate (their linter/tests) — veto power on every task
             self.gate = f"({self.gate}) && ({self.cfg.extra_gate})" if self.gate else self.cfg.extra_gate
+            self.gate_disp += " +extra_gate"
         self.state: dict = {}
         self.ledger = Ledger(self.ws)
 
@@ -199,7 +202,7 @@ class Conductor:
         c = self.c
         repomap = build_repomap(self.ws)
         existing = set(list_files(self.ws))
-        c.print(f"  [dim]gate: {self.gate or 'none detected'} · repo map: {len(repomap)} chars · planner {self.cfg.planner.name}[/]")
+        c.print(f"  [dim]gate: {self.gate_disp} · repo map: {len(repomap)} chars · planner {self.cfg.planner.name}[/]")
 
         with Spinner("extracting spec") as sp:
             spec, res = extract_spec(goal, self.cfg, self.ol, progress=lambda k: sp.tick())
@@ -305,7 +308,7 @@ class Conductor:
             for ti, t in enumerate(m.tasks, 1):
                 extra = f" + [green]{t.verify}[/]" if t.verify else ""
                 c.print(f"     [dim]{mi}.{ti}[/] {t.title}{extra}")
-        gate = self.gate or "[yellow]none — unverified run[/]"
+        gate = self.gate_disp if self.gate else "[yellow]none — unverified run[/]"
         c.print(f"\n  [dim]{len(plan.milestones)} milestones · {plan.task_count} tasks · gate on every task:[/] {gate}\n")
 
     # -- distillation: the strong model teaches the fast one, persistently --------
