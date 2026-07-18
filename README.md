@@ -150,6 +150,15 @@ files the task declared exist), a behavior audit (the task actually changed
 something relevant), and the final spec validation (the requirement is
 implemented). You can append your own check with `extra_gate`.
 
+**Acceptance checks.** A requirement can carry an executable acceptance check —
+a shell command authored at spec time that exits 0 exactly when the requirement
+is observably met (run a test, invoke the CLI, execute the program; presence-style
+commands like `grep`/`ls` are rejected by a deterministic lint). Validation runs
+every check first and only asks a model about requirements that have none; a
+failed check becomes a remediation task whose gate includes the check itself.
+"Done" is decided by execution wherever execution can decide, and by a model
+only where it cannot.
+
 **Diversity.** When the worker lane exhausts its attempts, spiral samples N
 fresh candidates (default 3) at spread temperatures from the same prompt and
 lets the gate judge each one — sampling is nearly free on local hardware, and

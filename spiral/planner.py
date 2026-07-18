@@ -84,6 +84,7 @@ SPEC_SCHEMA = {
                     "id": {"type": "string"},
                     "text": {"type": "string"},
                     "kind": {"type": "string", "enum": ["feature", "quality", "constraint"]},
+                    "check": {"type": "string"},
                 },
                 "required": ["id", "text"],
             },
@@ -100,8 +101,40 @@ SPEC_SYSTEM = (
     "constraint (platform/tech).\n"
     "- Do NOT invent requirements the goal doesn't state; do NOT merge distinct features "
     "into one requirement.\n"
+    "- If (and only if) a requirement can be verified by RUNNING something, add 'check': "
+    "one shell command that exits 0 exactly when the requirement is met — run a test "
+    "file, invoke the CLI/binary and inspect its output, execute the program. A check "
+    "must OBSERVE BEHAVIOR: commands that merely assert files or text exist (grep, ls, "
+    "test -f, find, cat) are NOT checks — omit 'check' when only that is possible.\n"
     "Return ONLY JSON matching the schema."
 )
+
+# a check that only asserts presence is not a check — the exact failure class the
+# green-gate/12-of-12 lesson was bought with, reintroduced at spec level
+_PRESENCE_CHECK = re.compile(r"^\s*(grep|ls|find|test|stat|cat|head|tail|\[)\b")
+
+
+def sanitize_checks(spec: list[dict]) -> list[str]:
+    """Deterministic guard over model-authored acceptance checks: drop presence-style
+    commands and anything the denylist refuses. Mutates spec in place; returns one
+    note per dropped check so silence never reads as coverage."""
+    from spiral import tools
+
+    notes: list[str] = []
+    for r in spec:
+        cmd = (r.get("check") or "").strip()
+        if not cmd:
+            r.pop("check", None)
+            continue
+        if _PRESENCE_CHECK.match(cmd):
+            notes.append(f"{r.get('id', '?')}: presence-style check dropped: {cmd[:60]}")
+            r.pop("check", None)
+        elif tools.is_dangerous(cmd):
+            notes.append(f"{r.get('id', '?')}: check hits the denylist, dropped: {cmd[:60]}")
+            r.pop("check", None)
+        else:
+            r["check"] = cmd
+    return notes
 
 CRITIC_SCHEMA = {
     "type": "object",
