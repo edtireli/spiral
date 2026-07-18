@@ -77,6 +77,10 @@ class Config:
     validate_rounds: int = 4           # max validate→remediate cycles; stops early on a plateau
     run_token_budget: int = 4_000_000  # global ceiling for a whole run
     verify_timeout: int = 900          # seconds; real build gates (gradle) are slow
+    # best-of-N at the worker lane's exit: sampled candidates judged by the gate.
+    # Local tokens are free and the gate is a deterministic judge — brute force
+    # is spent exactly where a metered agent would economize. 0 disables.
+    diversity_samples: int = 3
 
     # user-defined extra gate welded into every task's verify (your own linter,
     # tests, anything) — set "extra_gate" in ~/.config/spiral/config.json
@@ -130,6 +134,7 @@ class Config:
             cfg.extra_gate = overlay.get("extra_gate", cfg.extra_gate)
             cfg.spiral_style = os.environ.get("SPIRAL_STYLE", overlay.get("style", cfg.spiral_style))
             cfg.worker_max_tokens = int(overlay.get("worker_max_tokens", cfg.worker_max_tokens))
+            cfg.diversity_samples = int(overlay.get("diversity_samples", cfg.diversity_samples))
             cfg.providers = overlay.get("providers", cfg.providers)
         except Exception:
             pass  # a broken overlay must never break spiral

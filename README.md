@@ -150,6 +150,15 @@ files the task declared exist), a behavior audit (the task actually changed
 something relevant), and the final spec validation (the requirement is
 implemented). You can append your own check with `extra_gate`.
 
+**Diversity.** When the worker lane exhausts its attempts, spiral samples N
+fresh candidates (default 3) at spread temperatures from the same prompt and
+lets the gate judge each one — sampling is nearly free on local hardware, and
+the gate is a deterministic judge that cannot be argued with. A green candidate
+is committed and completes the task; during bootstrap the best red candidate is
+banked as a checkpoint when it resolves errors. This runs only while the gate is
+red, so a no-op candidate can never fake a win. `diversity_samples` in the
+config sizes N (0 disables).
+
 **Containment.** Runs happen on a dedicated `spiral/run-*` branch, and the
 model's shell refuses genuinely destructive operations even in full-auto:
 `rm -rf`, `sudo`, `git push`, `git reset --hard`, and disk or network commands
@@ -240,6 +249,7 @@ and can be edited directly:
 ```
 
 - `extra_gate` — a command appended to every task's gate. If it exits non-zero, the task is not complete.
+- `diversity_samples` — candidates sampled in the best-of-N diversity round at the worker lane's exit (default 3, max 5, 0 disables).
 - `providers` — OpenAI-compatible endpoints, keyed by model id. Any role set to
   one of these ids is served by that endpoint instead of Ollama. The API key is
   read from the environment variable named in `api_key_env` and is never written

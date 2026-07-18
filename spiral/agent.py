@@ -68,6 +68,12 @@ class TaskSpec:
     context: str = ""               # the project vision, pinned into every prompt
 
 
+def _blocks_key(blocks) -> str:
+    """Canonical fingerprint of an edit set — high temperature can still sample
+    the same diff twice, and the gate must never re-judge a duplicate."""
+    return "\x00".join(f"{b.path}\x01{b.search.strip()}\x01{b.replace.strip()}" for b in blocks)
+
+
 def _auto_files(ws: Path, limit: int = 12, max_bytes: int = 20_000) -> list[str]:
     out: list[str] = []
     for p in sorted(ws.rglob("*")):
@@ -195,6 +201,7 @@ class Atom:
         ratchet: bool = False,
         allow_done: bool = True,
         ui=None,
+        diversity: bool = True,
     ) -> bool:
         """Drive one task to green. `model` overrides the worker (escalation);
         `strict_green` reverts the tree to the last commit when the task fails,
@@ -203,15 +210,16 @@ class Atom:
         every attempt that reduces the error count is BANKED as a checkpoint
         commit, and failure reverts only to the last checkpoint. `allow_done`
         False forbids ALREADY_DONE / no-op success — used for remediation tasks
-        the validator has already proven incomplete. `ui` is a Dash (shared
-        cockpit) or None → SoloStatus one-liner."""
+        the validator has already proven incomplete. `diversity` False skips the
+        best-of-N round at the lane's exit (the escalation lane goes straight to
+        blocked). `ui` is a Dash (shared cockpit) or None → SoloStatus one-liner."""
         from spiral.dash import SoloStatus
 
         owns_ui = ui is None
         if owns_ui:
             ui = SoloStatus().__enter__()
         try:
-            return self._run(task, model, attempts, strict_green, ratchet, allow_done, ui)
+            return self._run(task, model, attempts, strict_green, ratchet, allow_done, diversity, ui)
         finally:
             if owns_ui:
                 ui.__exit__(None, None, None)
@@ -305,7 +313,83 @@ class Atom:
         noise and saves prompt tokens."""
         return out.replace(f"file://{self.ws}/", "").replace(f"{self.ws}/", "")
 
-    def _run(self, task: TaskSpec, model: str | None, attempts: int | None, strict_green: bool, ratchet: bool, allow_done: bool, ui) -> bool:
+    # -- diversity: best-of-N sampled candidates, judged by the gate -------------
+    def _restore_staged(self) -> None:
+        """Return the tree to the state frozen by `git add -A`: tracked files come
+        back from the index, candidate-created untracked files are removed."""
+        tools.run("git checkout -q -- . && git clean -qfd", self.ws)
+
+    def _diversity_round(
+        self, task: TaskSpec, files: list[str], verify_out: str, skills_text: str,
+        tried: list[str], repo_answers: str, symbols: str, model_name: str,
+        ratchet: bool, base_sigs: set[str], ui,
+    ) -> bool:
+        """The lane failed serially — now fail in parallel directions. N fresh
+        candidates are sampled at spread temperatures from the SAME prompt (the
+        KV cache pays for it once) and each is judged by the gate: a free,
+        deterministic judge that cannot be argued with. A green candidate commits
+        and completes the task; in ratchet mode the best red candidate is banked
+        as a checkpoint when it beats the baseline. Local sampling costs nothing
+        but time — this is the one place brute force is bought deliberately."""
+        temps = [0.7, 1.0, 1.3, 0.5, 1.5][: max(0, int(self.cfg.diversity_samples))]
+        if not temps:
+            return False
+        ui.print(f"  [rgb(217,119,87)]⚄ diversity round[/] — {len(temps)} candidates, the gate judges")
+        tools.run("git add -A", self.ws)  # freeze the lane's end state into the index
+        prompt = self._prompt(task, files, verify_out, "", skills_text, tried, repo_answers, symbols)
+        msgs = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": prompt}]
+        spec_m = self.cfg.spec_for(model_name)
+        best: tuple[int, list, str] | None = None  # (sig count, blocks, edits desc)
+        seen: set[str] = set()
+        for i, temp in enumerate(temps, 1):
+            ui.phase("sampling", model=model_name)
+            res = self.ol.chat(
+                model_name, msgs, think=False, num_predict=self.cfg.worker_max_tokens,
+                temperature=temp, num_ctx=spec_m.num_ctx, keep_alive=self.cfg.keep_alive,
+                on_delta=lambda kind, piece: ui.tick(),
+            )
+            self.tokens += res.total_tokens
+            blocks = parse_edits(res.text)
+            if not blocks:
+                ui.print(f"  [dim]○ candidate {i} (t={temp}): no edits parsed[/]")
+                continue
+            key = _blocks_key(blocks)
+            if key in seen:
+                ui.print(f"  [dim]○ candidate {i} (t={temp}): duplicate of an earlier candidate[/]")
+                continue
+            seen.add(key)
+            applied = [r for r in apply_edits(self.ws, blocks) if r.ok]
+            if not applied:
+                self._restore_staged()
+                ui.print(f"  [dim]○ candidate {i} (t={temp}): no edits applied[/]")
+                continue
+            desc = ", ".join(f"{r.path}({r.how})" for r in applied)
+            ui.phase("verifying", model="gate")
+            v = tools.run(task.verify_cmd, self.ws, timeout=self.cfg.verify_timeout,
+                          on_line=lambda ln: ui.detail(ln))
+            sigs = set() if v.ok else self._error_sigs(self._clean_paths(v.out))
+            self.ledger.log("diversity", task=task.goal[:80], model=model_name, temp=temp,
+                            applied=len(applied), verify_exit=v.code, sigs=len(sigs))
+            if v.ok:
+                head, moved = self._commit(f"spiral: {task.goal[:48]} (diversity t={temp})")
+                if moved:
+                    ui.print(f"  [green]✔ candidate {i} (t={temp}) is green — committed[/] [dim]{head}[/]")
+                    return True
+                self._restore_staged()  # no-op edits — a flaky gate must not fake a win
+                continue
+            ui.print(f"  [red]●[/] candidate {i} (t={temp}): {desc} · exit {v.code} · {len(sigs)} sig(s)")
+            if best is None or len(sigs) < best[0]:
+                best = (len(sigs), blocks, desc)
+            self._restore_staged()
+        if ratchet and best and best[0] < len(base_sigs):
+            apply_edits(self.ws, best[1])
+            head, _ = self._commit(
+                f"spiral: progress checkpoint (diversity) — {len(base_sigs) - best[0]} error(s) fewer"
+            )
+            ui.print(f"  [rgb(217,119,87)]⚑ best candidate banked[/] [dim]{head} · {best[0]} sig(s) remain[/]")
+        return False
+
+    def _run(self, task: TaskSpec, model: str | None, attempts: int | None, strict_green: bool, ratchet: bool, allow_done: bool, diversity: bool, ui) -> bool:
         self._ensure_git()
         model_name = model or self.cfg.worker.name
         files = list(task.files) if task.files else _auto_files(self.ws)
@@ -588,6 +672,19 @@ class Atom:
                     if stall >= 3:
                         ui.print("  [yellow]⇥ no errors resolved in 3 attempts — stopping this lane[/]")
                         break
+
+        # ---- diversity round: best-of-N sampled candidates, the gate judges ----
+        # Only on a RED gate: on a green-but-incomplete gate every no-op candidate
+        # would "win" — the false-completion class the audit exists to prevent.
+        if (
+            diversity and has_verify and verify is not None and not verify.ok
+            and self.cfg.diversity_samples > 0
+        ):
+            if self._diversity_round(
+                task, files, verify_out, skills_text, tried, repo_answers, symbols,
+                model_name, ratchet, best_sigs if ratchet else self._error_sigs(verify_out), ui,
+            ):
+                return True
 
         ui.print("  [red]✗ budget exhausted[/] — checkpoint saved")
         if verify is not None:
