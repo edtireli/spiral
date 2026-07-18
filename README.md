@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/spiral.gif" alt="spiral" width="680"/>
+  <img src="https://raw.githubusercontent.com/edtireli/spiral/main/assets/spiral.gif" alt="spiral" width="680"/>
 </p>
 
 <p align="center">
@@ -11,43 +11,33 @@
 
 <p align="center">
   An autonomous coding agent that runs on local models. It turns a goal into a
-  requirements checklist, implements each requirement against your project's
-  real build or test command, and verifies the result before reporting done.
+  requirements checklist, implements each requirement against your project's real
+  build or test command, and verifies the result before reporting done.
 </p>
 
 <p align="center">
   <a href="#install">Install</a> ·
   <a href="#quickstart">Quickstart</a> ·
-  <a href="#a-run-from-the-inside">A run, from the inside</a> ·
-  <a href="#what-counts-as-done">What counts as done</a> ·
+  <a href="#example-run">Example run</a> ·
+  <a href="#how-it-works">How it works</a> ·
   <a href="#commands">Commands</a> ·
   <a href="#configuration">Configuration</a> ·
-  <a href="#safety">Safety</a> ·
-  <a href="#limits">Limits</a>
+  <a href="#principles">Principles</a>
 </p>
 
-<p align="center"><img src="assets/divider.svg" width="520" alt=""/></p>
+<p align="center"><img src="https://raw.githubusercontent.com/edtireli/spiral/main/assets/divider.svg" width="520" alt=""/></p>
 
-## <img src="assets/mark.svg" width="21" alt=""/> Why spiral exists
+spiral is a command-line coding agent that runs entirely on local models through
+[Ollama](https://ollama.com). Given a goal, it extracts a list of requirements,
+plans the work, and implements each task against your project's actual build or
+test command. Changes that pass are committed to git; changes that fail are
+reverted. When the plan is finished, the code is checked against each
+requirement — by running the requirement's acceptance check where one exists,
+and by a separate model where none does — and spiral keeps working until all
+are met or it reports which ones remain. No API keys and no network calls to a
+model provider.
 
-A local model will confidently write broken code and then declare itself done.
-That single observation shapes everything here: **spiral never trusts the
-model's opinion of "done."** Ground truth is your compiler, your test suite,
-your program's actual exit codes. The engine is a tight loop —
-
-    edit → run the gate → read the errors → fix → green → git commit → next task
-
-— in which models only *generate*: edits, plans, verdicts. Ordering, verification,
-retries, and git are handled by deterministic code. That division of labor is
-what lets small local models (a ~3B-active MoE doing most of the work) finish
-large projects: the model doesn't need to be right, it needs to be *checkable*.
-
-Everything runs on your machine through [Ollama](https://ollama.com). No API
-keys, no code leaving the room, no metered tokens. For unpublished research
-code and anything you can't legally send to a cloud model, this isn't a
-preference — it's the only kind of agent you're allowed to run.
-
-## <img src="assets/mark.svg" width="21" alt=""/> Install
+## <img src="https://raw.githubusercontent.com/edtireli/spiral/main/assets/mark.svg" width="21" alt=""/> Install
 
 ```bash
 pipx install spiral-coder     # isolated, puts `spiral` on your PATH (recommended)
@@ -58,48 +48,22 @@ pip install spiral-coder
 Either way you get a global `spiral` command. From a clone, `pip install -e .`
 installs it in editable mode.
 
-Requirements:
+Requires Python 3.11+, [Ollama](https://ollama.com), and at least one local
+model. Apple Silicon with 32 GB+ of unified memory is recommended for the
+default model set; smaller machines can run a smaller crew (see
+[`spiral setup`](#commands)).
 
-- macOS on Apple Silicon (32 GB+ unified memory recommended for the default
-  model set) or Linux; smaller machines can run a smaller crew
-- [Ollama](https://ollama.com) and git
-- Python 3.11+
-
-First-run setup, once per machine:
+## <img src="https://raw.githubusercontent.com/edtireli/spiral/main/assets/mark.svg" width="21" alt=""/> Quickstart
 
 ```bash
-spiral setup      # detect Ollama + installed models; offer a crew sized to your RAM
-spiral tune       # size model context windows to your memory (KV-cache math)
-spiral doctor     # health check: ollama, models, tuning, gate, git, disk
-```
-
-`setup` never downloads anything without a yes. `tune` matters more than it
-looks: Ollama's default context window is 4,096 tokens *regardless of the
-model*, which silently truncates long prompts — `tune` computes what your RAM
-can actually hold and writes it to the config. `tune --wired` additionally
-raises the macOS GPU wired-memory limit (sudo; reverts on reboot) so Ollama can
-use more of your unified memory.
-
-## <img src="assets/mark.svg" width="21" alt=""/> Quickstart
-
-```bash
-cd your-project
+spiral setup                      # first run: detect Ollama, pull a RAM-matched model crew
+spiral tune                       # once per machine: size model context windows to your RAM
 spiral build "make me a pomodoro TUI in python, with tests"
 ```
 
-<p align="center">
-  <img src="assets/demo.gif" alt="a real run, recorded: gate detection, the run branch, spec extraction with an executable check, the milestone plan, the approval prompt, and the first task starting under the live cockpit" width="680"/>
-</p>
-
-<p align="center"><sub>A real run, recorded from the terminal (model waits time-lapsed): gate
-detection, the run branch, the spec with an executable check, the milestone
-plan, <code>--approve</code> waiting for a human <code>y</code> — then the first
-task starts under the live plan cockpit.</sub></p>
-
-spiral works on a dedicated git branch (`spiral/run-*`), never on yours. Each
-verified step is a commit; you merge when you're happy. Stop any time with
-Ctrl-C — committed work is kept, and the same command with `--resume` continues
-where it left off. When the run ends you get one card that tells the story:
+spiral runs on a dedicated git branch (`spiral/run-*`), leaving your working
+branch untouched. It commits each verified step and prints a summary when the
+run ends:
 
 ```
 ╭──────────────────────────── ⠷ run summary ────────────────────────────╮
@@ -110,98 +74,18 @@ where it left off. When the run ends you get one card that tells the story:
 ╰────────────────────────────────────────────────────────────────────────╯
 ```
 
-Useful variants:
+## <img src="https://raw.githubusercontent.com/edtireli/spiral/main/assets/mark.svg" width="21" alt=""/> Example run
 
-```bash
-spiral plan "goal"            # show the decomposition without running it
-spiral build --approve        # print the plan, wait for your yes, then run
-spiral build --resume         # continue a previous run (goal is remembered)
-spiral do "add a --json flag" --verify "python -m pytest -q"   # one task, one gate
-```
+<p align="center">
+  <img src="https://raw.githubusercontent.com/edtireli/spiral/main/assets/demo.gif" alt="a recorded run: gate detection, run branch, spec, plan, approval, first task" width="680"/>
+</p>
 
-## <img src="assets/mark.svg" width="21" alt=""/> A run, from the inside
+<p align="center"><sub>A recorded run: gate detection, the run branch, the spec, the milestone
+plan, approval, and the first task under the live plan panel. Model waits are time-lapsed.</sub></p>
 
-This section walks through every phase of `spiral build`, with the output you
-will actually see. The pipeline:
-
-```
- spec extraction ──▶ design brief ──▶ plan ──▶ critic review ──▶ repair
-       │             (UI projects only:         (a separate model
-       │              tokens + a real icon)      reviews the plan)
-       ▼
- bootstrap the gate to green            each resolved error is committed, so
-       │                                repair converges across attempts
-       ▼
- foundation: design system + launcher icon    (deterministic, for UI apps)
-       │
-       ▼
- implement tasks against the gate       matched skills · attempt memory ·
-       │                                ASK protocol · symbol search ·
-       │                                diversity round · escalation
-       ▼
- clean build ──▶ spec validation ──▶ remediation ──▶ SPEC-GREEN
-```
-
-### 1. The goal becomes a checklist
-
-An analyst pass extracts every concrete commitment from your goal into atomic
-requirements — this is what "done" will be measured against. Where a
-requirement can be verified by *running something*, the analyst attaches an
-executable acceptance check: one shell command that exits 0 exactly when the
-requirement is met. A deterministic lint discards checks that merely assert
-files exist (`grep`, `ls`, `test -f` — a file existing proves nothing about
-behavior) and anything the safety denylist refuses:
-
-```
-     check lint: R9: presence-style check dropped: grep -q Timer main.py
-  ● spec: 12 requirements · 4 with executable checks · 1,842 tok
-     R1 (feature): 25-minute work sessions alternate with 5-minute breaks
-     R2 (feature, check): the timer state machine is covered by pytest tests
-     R3 (quality): the TUI redraws without flicker
-     ...
-```
-
-### 2. UI projects get a design brief first
-
-If the product has a user interface (detected from the repo and the goal — a
-CLI or library skips this), a design pass writes a concrete specification:
-color tokens with hex values, a type scale, spacing rules, sample copy, motion
-durations. It is generated once, saved to `.spiral/design.md` (write your own
-there to override), and pinned into every prompt — so screens implement
-*decisions*, not per-task improvisation. The brief is distilled to
-`.spiral/design_tokens.json`, and for Android spiral deterministically draws a
-launcher icon from those tokens and wires the manifest before feature work —
-the app ships a real icon without a small model hand-writing adaptive-icon XML.
-
-### 3. The plan is drafted, linted, and reviewed by a different brain
-
-The planner (thinking mode, constrained to a JSON schema so it must emit a plan
-and stop) decomposes the goal into milestones and small tasks, each touching at
-most ~3 files. Two deterministic passes run before any model critique: a plan
-lint (tasks that touch too many files, thin descriptions, shallow verify
-commands, references to files nothing creates) and a coverage check (a
-requirement whose distinctive terms appear in no task is probably forgotten).
-Then a *different model* — the dense critic — reviews the plan against the
-requirements and the repo, and the planner repairs what it finds. Model
-diversity catches what self-review cannot.
-
-```
-  ● draft plan · 7 tasks · 3,120 tok
-     lint: task 2.1 'Wire timer': edits 'ui/timer.py' which no repo file or earlier task provides.
-  ● critic 1 (qwen3.6:27b): revise · 2 defects · 2,933 tok
-     ✗ [task 2.1] references TimerWidget before any task creates it
-  ● repaired → 8 tasks
-```
-
-### 4. Bootstrap: the gate must be green before features begin
-
-spiral auto-detects your build gate — `./gradlew assembleDebug`, `npm run
-test`, `cargo build`, `go build ./...`, `python -m pytest -q` — and if the
-project starts red, repairs it first. Bootstrap uses **ratchet semantics**:
-there is no green to protect yet, only progress to keep, so every attempt that
-resolves error signatures is banked as a checkpoint commit. A failed attempt
-reverts only to the last checkpoint; progress compounds across attempts, model
-lanes, and even interrupted runs:
+If the project does not build at the start, spiral repairs it first. Each
+attempt that reduces the number of errors is committed, so progress is kept even
+if a later attempt fails or the run is stopped:
 
 ```
 ━━ M0: bootstrap — make the build gate pass ━━
@@ -215,229 +99,150 @@ lanes, and even interrupted runs:
   ■ gate is green — features begin
 ```
 
-### 5. The grind: every task keeps the gate green
-
-Each task runs in the atom loop: the worker sees the project vision, the task,
-the relevant files, and the gate's current output; it replies with
-SEARCH/REPLACE edit blocks; spiral applies them, re-runs the gate, and either
-commits (green) or feeds the errors straight back. A task only commits green —
-so integration debt cannot accumulate silently — and a failed task reverts to
-the last green commit, so it can never poison the next one.
-
-Context reaches the worker in stages, because local models reference things
-they haven't seen and don't notice they're missing something:
-
-1. the planner assigns relevant files to each task;
-2. a static symbol index (types, members, layout-id → viewBinding class) rides
-   the prompt, so the worker reads what exists instead of guessing;
-3. file paths named in build errors are pulled into context automatically;
-4. the worker can ask — `ASK: grep <name>` or `ASK: file <path>` — instead of
-   inventing an identifier (two asks per task, and asks don't cost attempts);
-5. a repeated identical error triggers a repo-wide symbol hunt that feeds the
-   actual definitions back;
-6. an attempt-memory list of what was already tried (compacted by a 1B janitor
-   model when it grows long) prevents the synonym roulette.
-
-### 6. Stuck tasks: diversity first, then escalation
-
-When the worker lane exhausts its attempts on a red gate, spiral does not give
-up serially — it fails in parallel directions. The **diversity round** samples
-N fresh candidates (default 3) at spread temperatures from the same prompt and
-lets the gate judge each one. Sampling is nearly free on local hardware, and
-the gate is a deterministic judge that cannot be argued with:
+After the plan finishes, the code is checked against each requirement.
+Requirements with an executable check are judged by exit code; the rest by a
+separate model. Unmet requirements become new tasks:
 
 ```
-  ⚄ diversity round — 3 candidates, the gate judges
-  ○ candidate 1 (t=0.7): no edits parsed
-  ● candidate 2 (t=1.0): TimerEngine.kt(fuzzy) · exit 1 · 4 sig(s)
-  ✔ candidate 3 (t=1.3) is green — committed 9c41f2a
-```
-
-A green candidate completes the task. During bootstrap, the best red candidate
-is banked as a checkpoint if it resolved errors. The round only runs while the
-gate is red — on a green-but-incomplete gate a do-nothing candidate would
-"win", which is precisely the false completion the audit exists to prevent.
-
-If diversity doesn't land it either, the task **escalates** to the dense model
-for a few attempts. If that fails too, the tree reverts, the task is recorded
-as blocked, and the run continues — one wedge never deadlocks a whole run.
-Blocked tasks are listed in the final report.
-
-### 7. Validation: execution first, opinion second
-
-"Plan complete" is a claim, not a result. After a clean build, spiral audits
-the code against the requirement checklist. Requirements with an executable
-acceptance check are judged **by running the check** — an exit code, not an
-opinion. Only requirements without a usable check are judged by the validator
-model (a different brain from the builder, instructed to trust only code — an
-unreachable screen or an uncalled function does not count):
-
-```
-━━ validation 1 · 12 requirements · 4 by execution · qwen3.6:27b judges the rest ━━
+━━ validation 1 · 27 requirements · 4 by execution · qwen3.6:27b judges the rest ━━
   ✓ R2  acceptance check passed: python -m pytest tests/test_timer.py -q
   ✓ R4  activity_login.xml binds et_name; LoginActivity validates input
   ◐ R10 btnSend calls sendMessage(), but the scan is never triggered
-  ✗ R7  acceptance check failed (exit 1): AssertionError: log file not written
-  spec: 9/12 implemented · 2 partial · 1 missing · 0 unjudged
+  ✗ R14 no siren playback found anywhere in the code
+  spec: 16/27 implemented · 8 partial · 1 missing · 2 unjudged
+▶ V.1 implement R14 …
 ```
 
-Every unmet requirement becomes a remediation task carrying the validator's
-evidence — and if it had a failing acceptance check, **that check joins the
-task's gate**, so the loop drives the actual criterion to green rather than a
-proxy for it. Validate → remediate repeats while the gap count drops; it stops
-at SPEC-GREEN, on a plateau, or at the round cap. A requirement the validator
-returned no verdict for is surfaced as `unjudged` — silence never reads as
-coverage.
+## <img src="https://raw.githubusercontent.com/edtireli/spiral/main/assets/mark.svg" width="21" alt=""/> How it works
 
-### 8. The harness learns across runs
+```
+ spec extraction ──▶ design brief ──▶ plan ──▶ critic review ──▶ repair
+ (+ acceptance     (UI projects only:         (a separate model
+    checks)         tokens + a real icon)      reviews the plan)
+       ▼
+ bootstrap the gate to green            each resolved error is committed, so
+       │                                repair converges across attempts
+       ▼
+ foundation: design system + launcher icon    (deterministic, for UI apps)
+       │
+       ▼
+ implement tasks against the gate       matched skills · attempt memory ·
+       │                                ASK protocol · symbol search ·
+       │                                diversity round · escalation ·
+       │                                signature routing · reused fixes
+       ▼
+ clean build ──▶ spec validation ──▶ remediation ──▶ SPEC-GREEN
+```
 
-Every model call, attempt, and verdict is recorded in `.spiral/ledger.jsonl` —
-the flight recorder. Three mechanisms feed it back:
+**Verification.** A task is complete only when it passes every check that
+applies: the build or test gate (compiles, tests pass), a footgun lint welded
+into that gate (patterns that compile but crash at runtime), an artifact check
+(the files the task declared exist), a behavior audit (the task actually
+changed something relevant), and the final spec validation (the requirement is
+implemented). You can append your own check with `extra_gate`.
 
-- **Learned fixes** — when escalation solves something the worker could not,
-  the error and the winning repair are appended to
-  `.spiral/skills/learned-fixes.md`; the worker sees the recipe on later runs.
-- **Signature routing** — each attempt records the (normalized: line numbers
-  stripped) error signature it faced and whether it cleared it. A signature the
-  worker has failed 3+ times and never beaten, which escalation *has* beaten,
-  is routed straight to escalation on later runs, skipping the doomed attempts:
+**Acceptance checks.** At spec time each requirement can get one shell command
+that exits 0 exactly when the requirement is met — run a test, invoke the CLI,
+execute the program. A lint drops presence-style commands (`grep`, `ls`,
+`test -f`) and anything on the denylist. Validation runs these checks first and
+only asks a model about requirements that have none; a failed check becomes a
+remediation task gated on the check itself.
 
-  ```
-    ⇒ router: 2 known hard signature(s) will skip the worker lane
-    ...
-    ⇒ known hard signature — routing straight to the escalation lane
-       e: MainActivity.kt Unresolved reference 'bindingScan'
-  ```
+**Diversity round.** When the worker exhausts its attempts on a red gate,
+spiral samples N fresh candidates (default 3) at spread temperatures and runs
+the gate on each. A green candidate is committed; during bootstrap the best red
+candidate is banked if it resolved errors. The round never runs on a green
+gate, so a no-op candidate cannot pass as done.
 
-- **`spiral distill`** — mines the ledger on demand: prints the per-signature
-  table, writes `.spiral/route.json`, and appends newly-ruled hard signatures
-  to learned-fixes. No model calls; everything comes from records.
+**Context acquisition.** Local models reference identifiers they have not been
+shown, and do not reliably notice something is missing. spiral supplies context
+in stages rather than relying on the model to ask:
 
-The model weights never change. The system around them gets smarter with use.
+1. the planner assigns relevant files to each task;
+2. a static symbol index (types, members, layout-id → binding class) rides the prompt;
+3. file paths named in build errors are added automatically;
+4. the worker can request more with `ASK: grep <name>` or `ASK: file <path>`;
+5. a repeated identical error triggers a repo search that returns the real definitions;
+6. a task that exhausts its attempts escalates to the stronger model.
 
-## <img src="assets/mark.svg" width="21" alt=""/> What counts as done
+**Learning across runs.** Every attempt is logged to `.spiral/ledger.jsonl`
+with the error signature it faced (normalized, so line numbers don't split
+them) and whether it cleared it. When escalation solves something the worker
+could not, the fix is appended to `learned-fixes.md` for later runs. A
+signature the worker has repeatedly failed and only escalation has solved is
+routed straight to escalation next time. `spiral distill` prints the table and
+writes `.spiral/route.json`.
 
-No single check is the target — a task or requirement is complete only when it
-passes every layer that applies, because each layer catches a failure class the
-others miss:
+**Safety.** Work happens on a `spiral/run-*` branch; you merge. The model's
+shell blocks destructive commands even in full-auto — `rm -rf`, `sudo`,
+`mkfs`, `dd`, `git push`, `git reset --hard` — and blocks `curl`/`wget`, so
+the worker has no network access. The only door to the web is the research
+module: GET-only, size-capped, fetched content treated as data, never as
+instructions. Ctrl-C stops cleanly; committed work is kept and `--resume`
+continues.
 
-| layer | catches |
-|---|---|
-| build / test gate (auto-detected, runs on every task) | code that doesn't compile or fails tests |
-| footgun lint (welded into the gate) | patterns that compile fine and crash at runtime — `Handler()` with no Looper, `parseColor` without `#` |
-| `extra_gate` (yours: a linter, a test suite) | whatever you decide must never regress |
-| declared-artifact existence | "green gate" runs where the feature's files were never created |
-| behavior audit + no-op rejection | edits that change nothing; ALREADY_DONE claims on unmet requirements; empty commits |
-| executable acceptance checks | requirements that *run* — judged by exit code, not by any model |
-| spec validation + remediation | implemented-but-unwired code, forgotten requirements, partial features |
-
-The design premise behind the layering: a gate can be *gamed* even when it
-can't be lied to, and the more optimization pressure the loop applies, the more
-that matters. Layered independent checks make the degenerate pass — stub the
-function, delete the failing caller — much harder than the honest one.
-
-## <img src="assets/mark.svg" width="21" alt=""/> Safety
-
-Unattended autonomy is only safe when the blast radius is bounded by
-construction, not by trust:
-
-- **Your branch is untouched.** Work happens on `spiral/run-*`; you merge.
-  `spiral rewind` refuses to operate on any branch that isn't spiral's.
-- **The shell denylist.** The model's shell refuses destructive operations even
-  in full-auto — `rm -rf`, `sudo`, `mkfs`, `dd`, fork bombs, `shutdown`,
-  `git reset --hard`, redirects into `/dev` or `~` — with exit 126. It also
-  blocks `git push` (spiral can commit, never publish) and `curl`/`wget`: the
-  worker has **no network egress**.
-- **One door to the web.** Only the research module fetches: GET-only,
-  http(s)-only, size-capped, tags stripped. Fetched content is treated as
-  untrusted reference data — summarized into briefs, never executed, never
-  followed as instructions.
-- **Interrupts are safe.** Ctrl-C keeps all committed work and banked
-  checkpoints; `--resume` continues. Budgets (per-task attempts, global tokens,
-  verify timeouts) bound every loop, and lanes stop on *lack of progress*
-  rather than grinding a fixed count of identical failures.
-
-## <img src="assets/mark.svg" width="21" alt=""/> Models
-
-Each role can be any Ollama model; defaults target a 32 GB Apple Silicon Mac:
+**Models.** Each role can be set to any Ollama model:
 
 | role | default | purpose |
 |---|---|---|
-| worker / planner | `qwen3.6:latest` (MoE, ~3B active) | plans (thinking on) and implements (thinking off) — same weights, zero swap cost |
+| worker / planner | `qwen3.6:latest` (MoE, ~3B active) | plans and implements tasks |
 | escalation | `qwen3.6:27b` (dense) | retries a task the worker could not finish |
-| critic / validator / designer | `qwen3.6:27b`, thinking | reviews the plan, judges the spec, writes the design brief — deliberately a different model than the worker |
-| janitor | `llama3.2:1b` | compacts attempt history so prompts stay short |
+| critic / validator / designer | `qwen3.6:27b`, thinking | reviews the plan, validates the spec, writes the design brief; runs on a different model than the worker |
+| janitor | `llama3.2:1b` | summarizes attempt history to keep prompts short |
 
-`spiral setup` offers a crew sized to your RAM (7B-class on small machines up
-to 32B-class on large ones) and pulls it with your consent. Models are kept
-resident (`keep_alive: 45m`) so a mid-run reload never costs you a minute, and
-spiral explicitly evicts one large model before loading another rather than
-letting two thrash under memory pressure.
-
-## <img src="assets/mark.svg" width="21" alt=""/> Commands
+## <img src="https://raw.githubusercontent.com/edtireli/spiral/main/assets/mark.svg" width="21" alt=""/> Commands
 
 | command | description |
 |---|---|
-| `spiral build "goal"` | plan, implement, validate, and remediate — the full run |
-| `spiral build --resume` | continue a previous run (the goal is remembered) |
+| `spiral build "goal"` | plan, implement, validate, and remediate |
+| `spiral build --resume` | continue a previous run |
 | `spiral build --approve` | print the plan and wait for confirmation before running |
-| `spiral build --boost` | keep the worker local; run the reasoning roles (escalation, critic/validator) on the configured API provider |
+| `spiral build --boost` | local worker; escalation and critic/validator on the configured API provider |
 | `spiral build --api` | run the entire crew on the configured API provider |
 | `spiral plan "goal"` | show the decomposition without running it |
-| `spiral validate` | judge the current code against the goal's spec (read-only) |
-| `spiral do "task" --verify "cmd"` | drive a single task against one verify command |
-| `spiral setup` | first run: detect Ollama, offer a RAM-matched model crew |
-| `spiral tune` | size model context windows to this machine's memory |
+| `spiral validate` | check existing code against the goal's spec (read-only) |
+| `spiral do "task" --verify "cmd"` | run a single task against one verify command |
+| `spiral setup` | detect Ollama and pull a model crew sized to this machine |
+| `spiral tune` | size model context windows to available memory |
 | `spiral tune --wired` | also raise the macOS GPU wired-memory limit (sudo; reverts on reboot) |
-| `spiral doctor` | health check: ollama, models, tuning, gate, git, disk |
-| `spiral stats` | tokens, per-model throughput, and outcomes from the ledger |
+| `spiral doctor` | check Ollama, models, tuning, gate, git, and disk |
+| `spiral stats` | token counts, per-model throughput, and outcomes from the run log |
 | `spiral distill` | mine the ledger: signature routing table + new learned-fixes entries |
-| `spiral note "text"` | record project wisdom the workers will always see |
-| `spiral rewind [n]` | list task checkpoints; reset the spiral branch to one |
+| `spiral note "text"` | add a note that is included in every worker prompt |
+| `spiral rewind [n]` | list task checkpoints and reset the run branch to one |
+| `spiral style [name]` | set the banner shape: `spiral`, `galaxy`, or `uzumaki` |
 | `spiral search "query"` | fast ranked web results, no synthesis (`--sci` adds arXiv) |
-| `spiral research "query"` | gather web/arXiv/PubMed sources, synthesize a cited answer (`--deep`, `--sci`) |
+| `spiral research "query"` | gather web/arXiv/PubMed sources and synthesize a cited answer (`--deep`, `--sci`) |
 | `spiral chat ["message"]` | talk to the local thinking model; reasoning shown dimmed |
 | `spiral consult ["question"]` | send the whole project to a big-context API model for review |
-| `spiral style [name]` | set the banner shape: `spiral`, `galaxy`, or `uzumaki` |
 
-## <img src="assets/mark.svg" width="21" alt=""/> Live controls
+## <img src="https://raw.githubusercontent.com/edtireli/spiral/main/assets/mark.svg" width="21" alt=""/> Live controls
 
 During a run:
 
-- **⇧ Tab** — cycle between `auto` and `step` mode, live; the current mode is shown in the status line.
-- **step mode** — pause at every task boundary: `enter` run · `s` skip · `a` back to auto · `q` stop.
-- **Ctrl-C** — stops cleanly; committed work and banked checkpoints are kept; `--resume` continues.
+- **⇧ Tab** — switch between `auto` and `step` mode; the current mode is shown in the status line.
+- **step mode** — pause at each task: `enter` to run it, `s` to skip, `a` to return to auto, `q` to stop.
+- **Ctrl-C** — stops cleanly. Committed work is kept and `--resume` continues from there.
 
-A pinned panel shows the plan and current position while log lines scroll
-above it; the status line carries live tokens/s and an ETA. Piped or
-backgrounded output degrades to timestamped heartbeat lines — a log must never
-look dead.
+## <img src="https://raw.githubusercontent.com/edtireli/spiral/main/assets/mark.svg" width="21" alt=""/> Configuration
 
-## <img src="assets/mark.svg" width="21" alt=""/> Configuration
-
-Environment variables override per shell:
+Models can be set per shell or persistently.
 
 ```bash
-export SPIRAL_WORKER=qwen3.6:latest       # also: SPIRAL_PLANNER, SPIRAL_ESCALATION,
-export SPIRAL_ESCALATION=qwen3.6:27b      #       SPIRAL_CRITIC, SPIRAL_JANITOR
+export SPIRAL_WORKER=qwen3.6:latest
+export SPIRAL_ESCALATION=qwen3.6:27b
 export SPIRAL_BASE_URL=http://localhost:11434
-export SPIRAL_STYLE=galaxy
 ```
 
-`~/.config/spiral/config.json` is written by `spiral setup` / `spiral tune`
-and can be edited directly. Every supported key:
+`~/.config/spiral/config.json` is written by `spiral setup` and `spiral tune`,
+and can be edited directly:
 
 ```json
 {
-  "models":     { "worker": "qwen3.6:latest", "escalation": "qwen3.6:27b",
-                  "critic": "qwen3.6:27b", "planner": "qwen3.6:latest",
-                  "janitor": "llama3.2:1b" },
+  "models":     { "worker": "qwen3.6:latest", "critic": "qwen3.6:27b" },
   "num_ctx":    { "qwen3.6:latest": 28672, "qwen3.6:27b": 57344 },
-  "worker_max_tokens": 8192,
   "extra_gate": "ktlint app/src",
   "diversity_samples": 3,
-  "style": "spiral",
-  "base_url": "http://localhost:11434",
   "providers": {
     "kimi-k3": { "base_url": "https://api.moonshot.ai/v1", "api_key_env": "MOONSHOT_API_KEY" }
   },
@@ -449,88 +254,59 @@ and can be edited directly. Every supported key:
 }
 ```
 
-- `num_ctx` — per-model context windows; write these with `spiral tune`, not by
-  guessing (an unset window silently truncates prompts at 4,096 tokens).
-- `worker_max_tokens` — the per-reply output cap (`num_predict`). A ceiling,
-  not a target; spiral raises it temporarily when a reply truncates mid-block.
-- `extra_gate` — a command appended to every task's gate. Non-zero exit means
-  the task is not complete. This is your veto.
-- `diversity_samples` — candidates in the best-of-N diversity round (default 3,
-  max 5, 0 disables).
-- `providers` — OpenAI-compatible endpoints, keyed by model id. Any role set to
-  one of these ids is served by that endpoint instead of Ollama. The API key is
-  read from the environment variable named in `api_key_env` and is never
-  written to disk. `spiral build --boost` remaps escalation + critic/validator
-  onto the first provider while the worker stays local; `--api` remaps the
-  whole crew. Without these flags everything runs local — the default never
-  needs a key.
-- `hooks` — shell commands fired on `task_green`, `blocked`, `run_complete`,
-  and `spec_green`, with `$SPIRAL_EVENT` and `$SPIRAL_INFO` set. Notifications,
-  says, CI pings — your call; hooks can never break the run.
+- `extra_gate` — a command appended to every task's gate. If it exits non-zero, the task is not complete.
+- `diversity_samples` — candidates in the best-of-N round at the worker lane's exit (default 3, max 5, 0 disables).
+- `providers` — OpenAI-compatible endpoints, keyed by model id. Any role set to one of these ids is served by that endpoint instead of Ollama. The API key is read from the environment variable named in `api_key_env` and never written to disk. `--boost` and `--api` remap roles onto the first provider; without them everything runs local.
+- `hooks` — commands run on the events `task_green`, `blocked`, `run_complete`, and `spec_green`. `$SPIRAL_EVENT` and `$SPIRAL_INFO` are set in the environment.
 
-## <img src="assets/mark.svg" width="21" alt=""/> Project knowledge
+## <img src="https://raw.githubusercontent.com/edtireli/spiral/main/assets/mark.svg" width="21" alt=""/> Project knowledge
 
-Three ways to teach spiral your project, all persistent:
+spiral takes project-specific guidance from four sources:
 
-1. **Skills** — markdown files with a name + trigger description, loaded into
-   the prompt only when a task matches. Four ship built-in (`android-kotlin`,
-   `dark-ui-design`, `design-principles`, `dependency-medic`); add your own
-   under `<project>/.spiral/skills/`. A frontier model can author a skill once;
-   local models apply it forever, free.
-2. **Notes** — `spiral note "we use Result<T>, never exceptions"` appends to a
-   skill that rides *every* worker prompt.
-3. **Learned fixes + routing** — automatic, from the ledger (see
-   [the learning section](#8-the-harness-learns-across-runs)).
+1. **Skills** — markdown files loaded per task when they match. Included:
+   `android-kotlin`, `dark-ui-design`, `design-principles`, `dependency-medic`.
+   Add your own in `<project>/.spiral/skills/`.
+2. **Notes** — `spiral note "text"` appends to a file that is included in every
+   worker prompt.
+3. **Reused fixes** — when the escalation model solves something the worker
+   could not, the error and the fix are appended to
+   `.spiral/skills/learned-fixes.md` so the worker can reuse it on later runs.
+4. **Signature routing** — error signatures the worker has never beaten skip
+   its lane on later runs (see `spiral distill`).
 
-For UI projects, `.spiral/design.md` is the taste file: write it yourself and
-spiral will implement your design decisions instead of generating a brief.
+For UI work (Android, iOS, web, desktop — detected from the repo and goal), a
+**design brief** with concrete values (color tokens, type sizes, spacing,
+motion, sample copy) is generated once per project, or written by hand at
+`.spiral/design.md`, and included in every prompt. The brief is distilled into
+`.spiral/design_tokens.json`, and for an Android app spiral draws a launcher
+icon from those tokens and wires the manifest before feature work.
 
-## <img src="assets/mark.svg" width="21" alt=""/> Run artifacts
+## <img src="https://raw.githubusercontent.com/edtireli/spiral/main/assets/mark.svg" width="21" alt=""/> Run artifacts
 
-Everything a run decides or learns lives in `.spiral/` in the target repo —
-plain files, made to be read:
+Everything a run decides or learns is written to `.spiral/` in the target repo:
 
 | file | contents |
 |---|---|
-| `plan.json` · `state.json` | the goal + task graph; live run state (`--resume` reads both) |
-| `spec.json` | the requirements checklist, including acceptance checks |
-| `plan_reviews.json` | critic verdicts and defects, per round |
-| `ledger.jsonl` | the flight recorder — one line per model call, attempt, check, verdict: model, tokens, tok/s, edits, verify exit, error signature |
-| `route.json` | per-signature routing verdicts (written by `spiral distill`) |
-| `validation.json` | the latest per-requirement verdicts |
-| `design.md` · `design_tokens.json` | the design brief and its distilled tokens (UI projects) |
-| `skills/learned-fixes.md` · `skills/project-notes.md` | distilled escalation wins · your notes |
-| `scratch/` | reasoning transcripts (`thinking-*.txt`), the last raw reply, the last failure |
-| `consult.md` | the last whole-project consult report |
+| `plan.json` · `state.json` · `spec.json` | goal, task graph, run state, requirements + checks |
+| `ledger.jsonl` | every model call and attempt: tokens, tok/s, edits, verify exit, error signature |
+| `validation.json` · `route.json` | latest per-requirement verdicts · signature routing table |
+| `design.md` · `design_tokens.json` | the design brief and its tokens (UI projects) |
+| `skills/learned-fixes.md` | fixes distilled from escalation wins |
+| `scratch/` | reasoning transcripts, last raw reply, last failure |
 
-`spiral stats` summarizes the ledger; reading `ledger.jsonl` directly is the
-fastest way to see exactly what a run did and why.
+## <img src="https://raw.githubusercontent.com/edtireli/spiral/main/assets/mark.svg" width="21" alt=""/> Principles
 
-## <img src="assets/mark.svg" width="21" alt=""/> Limits
+<img src="https://raw.githubusercontent.com/edtireli/spiral/main/assets/dot.svg" width="13" alt=""/> **Completion is verified, not claimed.** It is decided by exit codes, file existence, and the spec check. A passing build is not the same as an implemented feature.
 
-Honesty about the boundary is part of the design. spiral shines at grinding a
-clearly-specified, verifiable implementation: scaffolding, CRUD, refactors,
-ports, filling in a defined API, test-backed features. It is weak at
-architecture-heavy or genuinely creative design work — keep yourself in the
-scoping loop (`--approve` exists for exactly this). And the system is only as
-honest as its acceptance criteria: where no check or test can exist, the final
-verdict is still a model's judgment of code, which is an opinion. The plan
-approval prompt is the one gate a human operates — it is the check on *intent*,
-and no amount of machinery below it can substitute.
+<img src="https://raw.githubusercontent.com/edtireli/spiral/main/assets/dot.svg" width="13" alt=""/> **Progress is committed incrementally.** During repair, each reduction in error count is a commit, so an interrupted or failed run resumes from the last improvement.
 
-Wall-clock is the real cost of local autonomy. Tokens are free; an hour is an
-hour. spiral spends attempts generously because they cost nothing but time —
-schedule long runs accordingly (overnight is this tool's natural habitat).
+<img src="https://raw.githubusercontent.com/edtireli/spiral/main/assets/dot.svg" width="13" alt=""/> **Lanes stop on lack of progress.** A task stops after three attempts that resolve no new error, rather than repeating the same failure to a fixed limit.
 
-## <img src="assets/mark.svg" width="21" alt=""/> Roadmap
+<img src="https://raw.githubusercontent.com/edtireli/spiral/main/assets/dot.svg" width="13" alt=""/> **The control loop is deterministic.** Models generate edits and plans; ordering, verification, retries, and git are handled in code. This is what lets small models complete large tasks.
 
-Language-server diagnostics as a fast gate between builds; spec-time
-falsifiability runs for acceptance checks (a check that passes before the work
-exists proves nothing); interrupting a single attempt without stopping the run;
-parallel tasks via git worktrees; an emulator launch gate for Android (the app
-must start, not just compile); a JSON event stream and a CI action.
+<img src="https://raw.githubusercontent.com/edtireli/spiral/main/assets/dot.svg" width="13" alt=""/> **Missing output is surfaced.** Unjudged requirements are marked, truncated JSON is repaired, and empty commits are rejected.
 
-## <img src="assets/mark.svg" width="21" alt=""/> Extras
+## <img src="https://raw.githubusercontent.com/edtireli/spiral/main/assets/mark.svg" width="21" alt=""/> Extras
 
 ```bash
 python -m spiral.banner --vortex        # animated banner
@@ -538,7 +314,21 @@ python experiments/sinks_test.py        # context-overflow test
 python scripts/record_demo.py --dir .   # re-record assets/demo.gif from a real run (needs pyte)
 ```
 
-<p align="center"><img src="assets/divider.svg" width="520" alt=""/></p>
+## <img src="https://raw.githubusercontent.com/edtireli/spiral/main/assets/mark.svg" width="21" alt=""/> Requirements
+
+- macOS on Apple Silicon (32 GB+ unified memory recommended) or Linux
+- [Ollama](https://ollama.com) with at least one local model
+- Python 3.11+ and git
+
+## <img src="https://raw.githubusercontent.com/edtireli/spiral/main/assets/mark.svg" width="21" alt=""/> Roadmap
+
+Language-server diagnostics as a fast gate between builds; spec-time dry runs
+for acceptance checks (a check that passes before the work exists proves
+nothing); interrupting a single attempt without stopping the run; parallel
+tasks via git worktrees; an emulator launch gate for Android; a JSON event
+stream and a CI action.
+
+<p align="center"><img src="https://raw.githubusercontent.com/edtireli/spiral/main/assets/divider.svg" width="520" alt=""/></p>
 
 <p align="center">
   MIT · Built by <b>Edis Devin Tireli</b> · Ph.D. Fellow, University of Copenhagen
