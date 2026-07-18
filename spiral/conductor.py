@@ -21,7 +21,7 @@ from pathlib import Path
 
 from rich.console import Console
 
-from spiral.theme import CLAY as _CLAY, make_console
+from spiral.theme import CLAY as _CLAY, make_console, reveal
 from rich.panel import Panel
 
 from spiral import tools
@@ -209,15 +209,15 @@ class Conductor:
             sp.update(tokens=res.total_tokens)
         self.ledger.log("plan", phase="spec", model=self.cfg.planner.name, ptok=res.prompt_tokens, ctok=res.completion_tokens)
         self.ledger.thinking("spec", res.thinking)
-        for note in sanitize_checks(spec):
-            c.print(f"     [yellow]check lint:[/] [dim]{note}[/]")
         checked = sum(1 for r in spec if r.get("check"))
-        c.print(f"  [green]●[/] spec: {len(spec)} requirements"
-                + (f" · {checked} with executable checks" if checked else "")
-                + f" · [dim]{res.total_tokens} tok[/]")
-        for r in spec:
-            kind = r.get("kind", "feature") + (", check" if r.get("check") else "")
-            c.print(f"     [dim]{r['id']} ({kind}):[/] {r['text'][:90]}")
+        reveal(c,
+               *(f"     [yellow]check lint:[/] [dim]{note}[/]" for note in sanitize_checks(spec)),
+               f"  [green]●[/] spec: {len(spec)} requirements"
+               + (f" · {checked} with executable checks" if checked else "")
+               + f" · [dim]{res.total_tokens} tok[/]",
+               *(f"     [dim]{r['id']} ({r.get('kind', 'feature') + (', check' if r.get('check') else '')}):[/] {r['text'][:90]}"
+                 for r in spec),
+               delay=0.06)
         (self._dir() / "spec.json").write_text(json.dumps(spec, indent=2))
 
         kind = self._project_kind(goal)
@@ -279,9 +279,10 @@ class Conductor:
             self.ledger.log("plan", phase=f"critic{rnd}", model=self.cfg.critic.name, ptok=res.prompt_tokens, ctok=res.completion_tokens, verdict=verdict, defects=len(defects))
             self.ledger.thinking(f"critic{rnd}", res.thinking)
             reviews.append({"round": rnd, "verdict": verdict, "defects": defects})
-            c.print(f"  [green]●[/] critic {rnd} ({self.cfg.critic.name}): [bold]{verdict}[/] · {len(defects)} defects · [dim]{res.total_tokens} tok[/]")
-            for d in defects[:8]:
-                c.print(f"     [red]✗[/] [{d.get('where', '?')}] {d['issue'][:110]}")
+            reveal(c,
+                   f"  [green]●[/] critic {rnd} ({self.cfg.critic.name}): [bold]{verdict}[/] · {len(defects)} defects · [dim]{res.total_tokens} tok[/]",
+                   *(f"     [red]✗[/] [{d.get('where', '?')}] {d['issue'][:110]}" for d in defects[:8]),
+                   delay=0.06)
             if verdict == "pass" or not defects:
                 break
             self.ol.evict(self.cfg.critic.name)  # planner returns
@@ -301,15 +302,16 @@ class Conductor:
     # -- display ------------------------------------------------------------------
     def show_plan(self, plan: Plan) -> None:
         c = self.c
-        c.print(Panel(plan.understanding.strip() or "(no summary)", title="[bold]spiral understands the goal as[/]",
-                      border_style=CLAY, padding=(0, 1)))
+        reveal(c, Panel(plan.understanding.strip() or "(no summary)", title="[bold]spiral understands the goal as[/]",
+                        border_style=CLAY, padding=(0, 1)), delay=0.15)
         for mi, m in enumerate(plan.milestones, 1):
-            c.print(f"\n  [bold {CLAY}]◆ M{mi}[/] [bold]{m.title}[/]")
-            for ti, t in enumerate(m.tasks, 1):
-                extra = f" + [green]{t.verify}[/]" if t.verify else ""
-                c.print(f"     [dim]{mi}.{ti}[/] {t.title}{extra}")
+            reveal(c,
+                   f"\n  [bold {CLAY}]◆ M{mi}[/] [bold]{m.title}[/]",
+                   *(f"     [dim]{mi}.{ti}[/] {t.title}" + (f" + [green]{t.verify}[/]" if t.verify else "")
+                     for ti, t in enumerate(m.tasks, 1)),
+                   delay=0.06)
         gate = self.gate_disp if self.gate else "[yellow]none — unverified run[/]"
-        c.print(f"\n  [dim]{len(plan.milestones)} milestones · {plan.task_count} tasks · gate on every task:[/] {gate}\n")
+        reveal(c, f"\n  [dim]{len(plan.milestones)} milestones · {plan.task_count} tasks · gate on every task:[/] {gate}\n")
 
     # -- distillation: the strong model teaches the fast one, persistently --------
     def _distill(self, goal: str) -> None:
@@ -492,15 +494,16 @@ class Conductor:
                  "missing": ("✗", "red"), "unjudged": ("?", "yellow")}
         counts: dict[str, int] = {}
         order = {"implemented": 0, "partial": 1, "missing": 2, "unjudged": 3}
+        board: list[str] = []
         for v in sorted(verdicts, key=lambda v: order.get(v.get("status"), 4)):
             m, style = marks.get(v.get("status"), ("?", "dim"))
             counts[v.get("status", "unjudged")] = counts.get(v.get("status", "unjudged"), 0) + 1
-            c.print(f"  [{style}]{m} {v['id']}[/] [dim]{v.get('evidence', '')[:90]}[/]")
-        c.print(
-            f"  [bold]spec: {counts.get('implemented', 0)}/{len(spec)} implemented[/] · "
-            f"[yellow]{counts.get('partial', 0)} partial[/] · [red]{counts.get('missing', 0)} missing[/] · "
-            f"[yellow]{counts.get('unjudged', 0)} unjudged[/] · [dim]{tok_total} tok[/]\n"
-        )
+            board.append(f"  [{style}]{m} {v['id']}[/] [dim]{v.get('evidence', '')[:90]}[/]")
+        reveal(c, *board,
+               f"  [bold]spec: {counts.get('implemented', 0)}/{len(spec)} implemented[/] · "
+               f"[yellow]{counts.get('partial', 0)} partial[/] · [red]{counts.get('missing', 0)} missing[/] · "
+               f"[yellow]{counts.get('unjudged', 0)} unjudged[/] · [dim]{tok_total} tok[/]\n",
+               delay=0.06)
         (self._dir() / "validation.json").write_text(json.dumps(verdicts, indent=2))
         self.ledger.log("validate", round=rnd, model=self.cfg.critic.name, tok=tok_total,
                         **{k: counts.get(k, 0) for k in marks})
