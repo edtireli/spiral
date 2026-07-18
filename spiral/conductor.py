@@ -321,18 +321,9 @@ class Conductor:
                          if "error" in ln.lower() or "e: " in ln][:5]
                 errs = "\n".join(f"  {ln.strip()[:140]}" for ln in lines)
             diff = tools.run("git show --stat HEAD | head -12", self.ws).out
-            d = self.ws / ".spiral" / "skills"
-            d.mkdir(parents=True, exist_ok=True)
-            f = d / "learned-fixes.md"
-            if not f.is_file():
-                f.write_text(
-                    "---\n"
-                    "name: learned-fixes\n"
-                    "description: Escalation-model fixes from THIS repo — error signatures the "
-                    "fast lane could not solve and the repairs that worked. Use when build errors "
-                    "or kotlin gradle android failures resemble these.\n"
-                    "---\n# Learned fixes (auto-distilled)\n"
-                )
+            from spiral.route import ensure_learned_fixes
+
+            f = ensure_learned_fixes(self.ws)
             with f.open("a") as fh:
                 fh.write(f"\n## {goal[:80]}\n")
                 if errs:
@@ -625,7 +616,8 @@ class Conductor:
         compounds across both model lanes. allow_done=False forbids ALREADY_DONE
         (remediation of validator-proven gaps)."""
         strict = not ratchet
-        if atom.run(spec, attempts=attempts, strict_green=strict, ratchet=ratchet, allow_done=allow_done, ui=ui):
+        if atom.run(spec, attempts=attempts, strict_green=strict, ratchet=ratchet,
+                    allow_done=allow_done, ui=ui, route=getattr(self, "_route", None)):
             return "green"
         ui.print(f"  [rgb(217,119,87)]⇑ escalating to {self.cfg.escalation.name}[/]")
         atom.run_stats["esc_lanes"] += 1
@@ -714,6 +706,18 @@ class Conductor:
                     return
 
         atom = Atom(self.ws, self.cfg, console=c)
+
+        # the router: fold prior runs' ledger into per-signature verdicts, so
+        # error classes the worker has never beaten skip its lane entirely
+        from spiral import route as _route
+
+        sig_stats = _route.mine(self.ws / ".spiral" / "ledger.jsonl",
+                                self.cfg.worker.name, self.cfg.escalation.name)
+        hard = sum(1 for s in sig_stats if _route.decide(s, sig_stats))
+        if hard:
+            c.print(f"  [dim]⇒ router: {hard} known hard signature(s) will skip the worker lane[/]")
+        self._route = (lambda sig: _route.decide(sig, sig_stats)) if hard else None
+
         blocked: list[str] = []
         total = plan.task_count
         self._write_state(goal=goal[:200], gate=self.gate, tasks_total=total, tasks_done=0, blocked=[])

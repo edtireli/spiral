@@ -23,6 +23,7 @@ from rich.console import Console
 from spiral import tools
 from spiral.config import Config
 from spiral.ledger import Ledger
+from spiral.route import norm_sig
 from spiral.skillpack import load_skills, match_skills, render_for_prompt
 from spiral.theme import make_console
 from spiral.edits import apply_edits, parse_edits
@@ -66,6 +67,15 @@ class TaskSpec:
     verify_cmd: str
     files: list[str] | None = None  # relevant files; None = auto-discover small text files
     context: str = ""               # the project vision, pinned into every prompt
+
+
+_ERR_LINE = re.compile(r"^e: |error:|Unresolved|FAILURE:|Caused by")
+
+
+def _first_error_line(out: str) -> str:
+    """The gate's headline error — the line fed back to the model, hunted in the
+    repo on repeats, and (normalized) recorded as the attempt's signature."""
+    return next((ln.strip() for ln in out.splitlines() if _ERR_LINE.search(ln)), "")
 
 
 def _blocks_key(blocks) -> str:
@@ -202,6 +212,7 @@ class Atom:
         allow_done: bool = True,
         ui=None,
         diversity: bool = True,
+        route=None,
     ) -> bool:
         """Drive one task to green. `model` overrides the worker (escalation);
         `strict_green` reverts the tree to the last commit when the task fails,
@@ -212,14 +223,17 @@ class Atom:
         False forbids ALREADY_DONE / no-op success — used for remediation tasks
         the validator has already proven incomplete. `diversity` False skips the
         best-of-N round at the lane's exit (the escalation lane goes straight to
-        blocked). `ui` is a Dash (shared cockpit) or None → SoloStatus one-liner."""
+        blocked). `route` is the signature router: given the gate's first error
+        signature it answers whether history says only escalation clears it —
+        if so the worker lane is skipped entirely. `ui` is a Dash (shared
+        cockpit) or None → SoloStatus one-liner."""
         from spiral.dash import SoloStatus
 
         owns_ui = ui is None
         if owns_ui:
             ui = SoloStatus().__enter__()
         try:
-            return self._run(task, model, attempts, strict_green, ratchet, allow_done, diversity, ui)
+            return self._run(task, model, attempts, strict_green, ratchet, allow_done, diversity, route, ui)
         finally:
             if owns_ui:
                 ui.__exit__(None, None, None)
@@ -389,7 +403,7 @@ class Atom:
             ui.print(f"  [rgb(217,119,87)]⚑ best candidate banked[/] [dim]{head} · {best[0]} sig(s) remain[/]")
         return False
 
-    def _run(self, task: TaskSpec, model: str | None, attempts: int | None, strict_green: bool, ratchet: bool, allow_done: bool, diversity: bool, ui) -> bool:
+    def _run(self, task: TaskSpec, model: str | None, attempts: int | None, strict_green: bool, ratchet: bool, allow_done: bool, diversity: bool, route, ui) -> bool:
         self._ensure_git()
         model_name = model or self.cfg.worker.name
         files = list(task.files) if task.files else _auto_files(self.ws)
@@ -441,6 +455,18 @@ class Atom:
             verify_out = "(no verify command — edits are applied without a ground-truth gate)"
             ui.print("  [yellow]⚠ no verify gate for this task — applying blind[/]")
 
+        # ---- signature routing: history may already know this error is hard ----
+        # Worker lane only (model is None): the ledger says whether this exact
+        # signature class has ever been cleared by the fast lane. If it only ever
+        # fell to escalation, skip the doomed attempts and go there now.
+        if route is not None and model is None and verify is not None and not verify.ok:
+            first = _first_error_line(verify_out)
+            if first and route(norm_sig(first)):
+                ui.print("  [rgb(217,119,87)]⇒ known hard signature — routing straight to the escalation lane[/]")
+                ui.print(f"     [dim]{norm_sig(first)[:100]}[/]")
+                self.ledger.log("route", sig=norm_sig(first), task=task.goal[:80])
+                return False
+
         cards = match_skills(task.goal, self.skills, files=files)
         notes = next((c_ for c_ in self.skills if c_.name == "project-notes"), None)
         if notes and notes not in cards:
@@ -474,6 +500,7 @@ class Atom:
             attempt += 1
             ui.print(f"  [dim]— attempt {attempt}/{budget} · {model_name} —[/]")
             tried = self._compact_tried(tried)
+            pre_sig = norm_sig(_first_error_line(verify_out))  # what this attempt is up against
             prompt = self._prompt(task, files, verify_out, apply_errs, skills_text, tried, repo_answers, symbols)
             msgs = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": prompt}]
 
@@ -601,6 +628,7 @@ class Atom:
                 ptok=res.prompt_tokens, ctok=res.completion_tokens, gen_s=gen_s,
                 tps=round(res.completion_tokens / gen_s, 1) if gen_s > 0 else None,
                 applied=len(applied), failed=len(failed), verify_exit=verify.code,
+                sig=pre_sig,
             )
             st = self.run_stats
             st["attempts"] += 1
@@ -613,11 +641,7 @@ class Atom:
             if failed:
                 ui.print(f"  [yellow]○[/] {len(failed)} block(s) didn't apply")
             if not verify.ok:
-                err = next(
-                    (ln.strip() for ln in verify_out.splitlines()
-                     if re.search(r"^e: |error:|Unresolved|FAILURE:|Caused by", ln)),
-                    "",
-                )
+                err = _first_error_line(verify_out)
                 if err:
                     ui.print(f"     [dim]gate says: {err[:110]}[/]")
                 # attempt memory: what was tried, what it produced

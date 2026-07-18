@@ -212,6 +212,7 @@ spiral supplies context in stages rather than relying on the model to ask:
 | `spiral tune --wired` | also raise the macOS GPU wired-memory limit so Ollama can use more unified RAM (sudo; reverts on reboot) |
 | `spiral doctor` | check Ollama, models, tuning, gate, git, and disk |
 | `spiral stats` | token counts, per-model throughput, and outcomes from the run log |
+| `spiral distill` | mine the ledger: signature routing table + new learned-fixes entries |
 | `spiral note "text"` | add a note that is included in every worker prompt |
 | `spiral rewind [n]` | list task checkpoints and reset the run branch to one |
 | `spiral style [name]` | set the banner shape: `spiral`, `galaxy`, or `uzumaki` |
@@ -280,6 +281,13 @@ spiral takes project-specific guidance from three sources:
 3. **Reused fixes** — when the escalation model solves something the worker
    could not, the error and the fix are appended to
    `.spiral/skills/learned-fixes.md` so the worker can reuse it on later runs.
+4. **Signature routing** — every attempt records the (normalized) error
+   signature it faced and whether it cleared it. A signature the worker has
+   repeatedly failed and only escalation has solved is routed straight to
+   escalation on later runs, skipping the doomed attempts. `spiral distill`
+   prints the table, writes `.spiral/route.json`, and appends hard signatures
+   to learned-fixes. The weights never change; the harness gets smarter with
+   every run.
 
 For UI work (Android, iOS, web, desktop — detected from the repo and goal; a
 CLI, TUI, or library skips it), a **design brief** with concrete values (color
@@ -303,6 +311,7 @@ Everything a run learns or decides is written to `.spiral/` in the target repo:
 | `validation.json` | the latest spec verdict for each requirement |
 | `design.md` · `design_tokens.json` | the design brief and its distilled tokens (UI projects) |
 | `skills/learned-fixes.md` | fixes the escalation model found, reused by the worker on later runs |
+| `route.json` | per-signature routing verdicts from `spiral distill` |
 
 `spiral stats` summarizes the ledger; reading `ledger.jsonl` directly is the
 fastest way to see exactly what a run did and why.
@@ -334,9 +343,10 @@ python experiments/sinks_test.py     # context-overflow test
 
 ## <img src="assets/mark.svg" width="21" alt=""/> Roadmap
 
-Language-server diagnostics as a fast gate between builds; model routing based on
-the run log; interrupting a single attempt without stopping the run; parallel
-tasks via git worktrees; a JSON event stream and a CI action.
+Language-server diagnostics as a fast gate between builds; interrupting a single
+attempt without stopping the run; parallel tasks via git worktrees; an emulator
+launch gate for Android (the app must start, not just compile); a JSON event
+stream and a CI action.
 
 <p align="center"><img src="assets/divider.svg" width="520" alt=""/></p>
 
