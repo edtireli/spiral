@@ -185,10 +185,11 @@ def _current_style() -> str:
 
 
 def print_banner(console: Console | None = None, tagline: str = "local autonomous coder · on-device",
-                 style: str | None = None, hold: float = 1.0) -> None:
+                 style: str | None = None, hold: float = 0.4) -> None:
     """Compact launch banner. On a TTY the spiral draws itself in once (~1.1s),
-    settles, then holds `hold` seconds so the finished mark can be enjoyed before
-    work scrolls it away. Piped output gets the static banner only, no delay."""
+    settles briefly, and then the CLI's opening lines cascade in beneath it
+    (theme.reveal) — the mark gets its moment without the elements slamming
+    down all at once. Piped output gets the static banner only, no delay."""
     console = console or Console()
     style = style or _current_style()
     tty = sys.stdout.isatty()

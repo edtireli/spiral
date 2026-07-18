@@ -13,6 +13,9 @@ that plus terminal file:// autolinks was most of the visual noise.
 """
 from __future__ import annotations
 
+import sys
+import time
+
 from rich.console import Console
 
 CLAY = "rgb(217,119,87)"
@@ -24,3 +27,14 @@ META = "dim"
 
 def make_console(**kwargs) -> Console:
     return Console(highlight=False, **kwargs)
+
+
+def reveal(console: Console, *renderables, delay: float = 0.07) -> None:
+    """Print lines one at a time with a small stagger, so the UI settles in
+    beneath the banner instead of slamming down all at once. Piped output gets
+    everything immediately — pacing is a TTY courtesy, never a log tax."""
+    tty = sys.stdout.isatty()
+    for r in renderables:
+        console.print(r)
+        if tty and delay > 0:
+            time.sleep(delay)
