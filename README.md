@@ -88,11 +88,13 @@ spiral build "make me a pomodoro TUI in python, with tests"
 ```
 
 <p align="center">
-  <img src="assets/demo.gif" alt="the start of a real run: the banner draws in, the gate is detected, a run branch is created, and spec extraction begins" width="680"/>
+  <img src="assets/demo.gif" alt="a real run, recorded: gate detection, the run branch, spec extraction with an executable check, the milestone plan, the approval prompt, and the first task starting under the live cockpit" width="680"/>
 </p>
 
-<p align="center"><sub>The start of a real run, recorded from the terminal: gate detection, the
-dedicated run branch, and spec extraction spinning up on a local model.</sub></p>
+<p align="center"><sub>A real run, recorded from the terminal (model waits time-lapsed): gate
+detection, the run branch, the spec with an executable check, the milestone
+plan, <code>--approve</code> waiting for a human <code>y</code> — then the first
+task starts under the live plan cockpit.</sub></p>
 
 spiral works on a dedicated git branch (`spiral/run-*`), never on yours. Each
 verified step is a commit; you merge when you're happy. Stop any time with
