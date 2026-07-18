@@ -30,7 +30,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pillow>=10", "pytest>=8"]
+dev = ["pillow>=10", "pytest>=8", "build>=1.2", "twine>=5"]
 
 [project.urls]
 Homepage = "https://github.com/edtireli/spiral"
