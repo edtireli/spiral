@@ -97,9 +97,9 @@ def test_loop_round_verifies_and_decides(monkeypatch):
     from spiral import citations, research_loop
     d = Path(tempfile.mkdtemp())
     loop = research_loop.ResearchLoop("test topic", workdir=d)
-    monkeypatch.setattr(loop.corpus, "build", lambda q, k=8, on=None: [])
+    monkeypatch.setattr(loop.corpus, "build", lambda q, k=8, categories=None, on=None: [])
     monkeypatch.setattr(citations, "prior_art", lambda *a, **k: [])
-    monkeypatch.setattr(loop, "derive_queries", lambda n=3: ["ramanujan series"])   # skip LLM query-gen
+    monkeypatch.setattr(loop, "search_plan", lambda n=3: (["math.NT"], ["ramanujan series"]))  # skip LLM
 
     # a vetted proposal with one TRUE + one FALSE checkable claim (verification is REAL)
     monkeypatch.setattr(loop, "propose", lambda refine_rounds=2: {
@@ -121,23 +121,40 @@ def test_loop_round_verifies_and_decides(monkeypatch):
     assert Path(loop.write()["tex"]).is_file()
 
 
-def test_derive_queries_turns_prompt_into_keywords(monkeypatch):
-    """The loop must NOT dump the whole prompt into arXiv (it returns noise) — it
-    derives focused keyword queries, with a deterministic fallback if the LLM fails."""
+def test_search_plan_picks_category_and_keywords(monkeypatch):
+    """The loop must find the RIGHT arXiv category and short keyword queries — not dump
+    the whole prompt (noise) nor search all of arXiv (a math identity drowns in hep-th)."""
     from spiral import research_loop
     topic = ("Discover a previously-unknown exact Ramanujan-type series identity for a "
              "mathematical constant and formally prove it in Lean")
     loop = research_loop.ResearchLoop(topic, workdir=Path(tempfile.mkdtemp()))
-    # LLM path
-    monkeypatch.setattr(loop, "_think",
-                        lambda s, u, think=True: (json.dumps({"queries": ["ramanujan series identity", "cat:math.NT hypergeometric"]}), 3))
-    qs = loop.derive_queries()
-    assert qs == ["ramanujan series identity", "cat:math.NT hypergeometric"]
-    assert all(len(q) < 60 for q in qs)                         # short, not the sentence
-    # fallback path: LLM returns junk → salient keywords, never the raw prompt
+    monkeypatch.setattr(loop, "_think", lambda s, u, think=True: (
+        json.dumps({"categories": ["math.NT", "math.CO"],
+                    "queries": ["ramanujan series identity", "hypergeometric summation"]}), 3))
+    cats, qs = loop.search_plan()
+    assert cats == ["math.NT", "math.CO"] and qs == ["ramanujan series identity", "hypergeometric summation"]
+    assert all(len(q) < 60 for q in qs)
+    # fallback: junk LLM → salient keywords, never the raw prompt
     monkeypatch.setattr(loop, "_think", lambda s, u, think=True: ("not json", 1))
-    fb = loop.derive_queries()
-    assert fb and fb[0] != topic and "previously" not in fb[0].lower()
+    fcats, fq = loop.search_plan()
+    assert fq and fq[0] != topic and "previously" not in fq[0].lower()
+
+
+def test_arxiv_query_restricts_to_categories():
+    """The category filter must land in the arXiv search_query (cat: AND all:), not be
+    stuffed into the all: field where it matches nothing."""
+    import urllib.parse
+
+    from spiral import research
+    captured = {}
+    orig = research._get
+    research._get = lambda url, timeout=25.0: captured.setdefault("url", url) or ""
+    try:
+        research.arxiv("ramanujan series", categories=["math.NT", "math.CO"])
+    finally:
+        research._get = orig
+    u = urllib.parse.unquote(captured["url"])
+    assert "cat:math.NT" in u and "cat:math.CO" in u and "AND" in u and "all:ramanujan" in u
 
 
 def test_proposal_iterates_against_prior_art(monkeypatch):

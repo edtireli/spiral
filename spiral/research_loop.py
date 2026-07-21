@@ -279,7 +279,7 @@ class ResearchLoop:
 
             per = max(3, 8 // max(1, len(queries)))
             for q in queries:
-                self.gather(q, k=per)
+                self.gather(q, k=per, categories=cats)
             proposal = self.propose()
             if proposal.get("question"):
                 self.state.question = proposal["question"]
@@ -297,7 +297,7 @@ class ResearchLoop:
             if action in ("solved", "new_question"):
                 self.state.status = action; break
             nq = (decision.get("next_query") or "").strip()
-            queries = [nq] if nq else self.derive_queries()   # targeted follow-up, or re-derive
+            queries = [nq] if nq else queries                 # targeted follow-up, else re-use plan
             if not any(f.ok for f in findings) and self.state.round >= 3:
                 # three rounds, nothing survives verification → stop honestly
                 self.state.status = "exhausted"; break
