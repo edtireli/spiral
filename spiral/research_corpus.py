@@ -179,11 +179,12 @@ class Corpus:
         if not paper.text:                                   # last resort: the abstract
             paper.text = paper.abstract
 
-    def build(self, query: str, k: int = 8, *, on=None) -> list[Paper]:
-        """Search arXiv for ``query`` and ingest the top ``k`` into the store."""
+    def build(self, query: str, k: int = 8, *, categories=None, on=None) -> list[Paper]:
+        """Search arXiv (optionally restricted to ``categories``) and ingest the top
+        ``k`` into the store."""
         from spiral.research import arxiv as arxiv_search
         added = []
-        for hit in arxiv_search(query, k=k):
+        for hit in arxiv_search(query, k=k, categories=categories):
             aid = parse_arxiv_id(hit.url)
             if not aid or self.has(aid):
                 continue

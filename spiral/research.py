@@ -91,10 +91,21 @@ def search(query: str, k: int = 8, timeout: float = 20.0) -> list[Hit]:
     return hits
 
 
-def arxiv(query: str, k: int = 6, timeout: float = 25.0) -> list[Hit]:
-    """arXiv Atom API — titles, authors, abstracts, no key."""
-    q = urllib.parse.quote_plus(query)
-    body = _get(f"http://export.arxiv.org/api/query?search_query=all:{q}&start=0&max_results={k}&sortBy=relevance", timeout)
+def arxiv(query: str, k: int = 6, categories: list[str] | None = None,
+          timeout: float = 25.0) -> list[Hit]:
+    """arXiv Atom API — titles, authors, abstracts, no key.
+
+    ``categories`` restricts the search to arXiv subject classes (``["math.NT"]``,
+    ``["hep-th","hep-ph"]``, …). This matters: an unrestricted ``all:`` query for a
+    term like *Ramanujan* returns mostly string-theory papers that merely cite it, so
+    searching the RIGHT category is what keeps the corpus on-topic."""
+    terms = f"all:{urllib.parse.quote_plus(query)}"
+    if categories:
+        cats = "+OR+".join(f"cat:{urllib.parse.quote_plus(c)}" for c in categories)
+        sq = f"%28{cats}%29+AND+{terms}" if len(categories) > 1 else f"{cats}+AND+{terms}"
+    else:
+        sq = terms
+    body = _get(f"http://export.arxiv.org/api/query?search_query={sq}&start=0&max_results={k}&sortBy=relevance", timeout)
     hits: list[Hit] = []
     for m in re.finditer(r"<entry>(.*?)</entry>", body, re.S):
         e = m.group(1)
