@@ -59,7 +59,10 @@ def detect_gate(ws: Path) -> str:
     if (ws / "go.mod").is_file():
         return "go build ./..."
     if (ws / "pyproject.toml").is_file() or (ws / "pytest.ini").is_file() or (ws / "tests").is_dir():
-        return "python -m pytest -q"
+        # exit 5 = "no tests collected" — a project with a pyproject but no tests yet
+        # is not failing, it just has nothing to assert. Treat 5 as green so an early
+        # greenfield project isn't a permanently-red gate; real failures (1) stay red.
+        return "python -m pytest -q || [ $? -eq 5 ]"
     return ""
 
 
@@ -69,19 +72,36 @@ class Conductor:
         self.ws = Path(workspace).resolve()
         self.ol = Ollama(self.cfg.base_url)
         self.c = make_console()
-        self.gate = detect_gate(self.ws)
-        self.gate_disp = self.gate or "none detected"
-        if self.gate:
-            # runtime-footgun linter rides the gate: compiles-fine-crashes-at-runtime
-            # patterns get fixed by the same loop as compile errors
-            self.gate = f"({self.gate}) && ({sys.executable} -m spiral.footguns .)"
-            self.gate_disp += " +footguns"
-        if self.cfg.extra_gate:
-            # user-defined blocking gate (their linter/tests) — veto power on every task
-            self.gate = f"({self.gate}) && ({self.cfg.extra_gate})" if self.gate else self.cfg.extra_gate
-            self.gate_disp += " +extra_gate"
+        self._base_gate = ""
+        self.gate = ""
+        self.gate_disp = "none detected"
+        self._refresh_gate()
         self.state: dict = {}
         self.ledger = Ledger(self.ws)
+
+    def _refresh_gate(self) -> bool:
+        """(Re)detect the build gate against the *current* workspace and rebuild the
+        composed gate command. Spiral often starts on an empty repo and creates the
+        project as it goes (a pyproject.toml / tests dir only appears mid-run), so the
+        gate has to be re-detected as files materialise — detecting once at construction
+        leaves every task unverified. Returns True when the detected gate changed."""
+        base = detect_gate(self.ws)
+        if base == self._base_gate and (self.gate or not base):
+            return False
+        self._base_gate = base
+        gate = base
+        disp = base or "none detected"
+        if gate:
+            # runtime-footgun linter rides the gate: compiles-fine-crashes-at-runtime
+            # patterns get fixed by the same loop as compile errors
+            gate = f"({gate}) && ({sys.executable} -m spiral.footguns .)"
+            disp += " +footguns"
+        if self.cfg.extra_gate:
+            # user-defined blocking gate (their linter/tests) — veto power on every task
+            gate = f"({gate}) && ({self.cfg.extra_gate})" if gate else self.cfg.extra_gate
+            disp += " +extra_gate"
+        self.gate, self.gate_disp = gate, disp
+        return True
 
     # -- hooks: user shell commands fired on lifecycle events -------------------
     # ~/.config/spiral/config.json →  "hooks": {"task_green": "...", "blocked": "...",
@@ -542,6 +562,9 @@ class Conductor:
             for ti, t in enumerate(tasks, 1):
                 dash.task(1, ti, "run")
                 dash.print(f"[bold]▶ V.{ti} {t.title}[/]")
+                if self._refresh_gate():
+                    dash.print(f"  [green]● verify gate now active:[/] [dim]{self.gate_disp}[/]")
+                    dash.gate = self.gate
                 verify = t.verify.strip()
                 if self.gate:
                     verify = f"({verify}) && ({self.gate})" if verify else self.gate
@@ -550,6 +573,8 @@ class Conductor:
                     verify_cmd=verify, files=t.files or None, context=goal,
                 )
                 status = self._run_task(atom, spec_task, dash, allow_done=False)
+                if status != "blocked":
+                    self._verify_new_gate(dash, atom, goal)
                 dash.task(1, ti, "blocked" if status == "blocked" else "done")
                 if atom.tokens >= self.cfg.run_token_budget:
                     dash.print("[red]■ token budget reached during remediation[/]")
@@ -611,6 +636,25 @@ class Conductor:
         r = tools.run(self.gate, self.ws, timeout=self.cfg.verify_timeout,
                       on_line=lambda ln: ui.detail(ln))
         return r.ok
+
+    def _verify_new_gate(self, dash, atom, goal: str) -> None:
+        """After a task's edits land, a build gate may have come into existence for
+        the first time (the task that creates ``pyproject.toml`` / ``tests/`` is
+        otherwise the one task never held to it). If so, run it now, and repair once
+        if it's red — so the *creating* task meets the same bar as every later one.
+        A no-op when no gate newly appeared."""
+        if not self._refresh_gate() or not self.gate:
+            return
+        dash.gate = self.gate
+        dash.print(f"  [green]● verify gate now active:[/] [dim]{self.gate_disp}[/]")
+        if self._gate_green(dash):
+            return
+        dash.print("  [yellow]⚠ new gate is red — repairing the task that introduced it[/]")
+        self._run_task(atom, TaskSpec(
+            goal=("A build gate just became active and is failing. Repair whatever it "
+                  "reports until it passes, with the smallest changes that keep the "
+                  "project's intent and style."),
+            verify_cmd=self.gate, files=None, context=goal), dash)
 
     def _run_task(
         self, atom: Atom, spec: TaskSpec, ui,
@@ -790,6 +834,9 @@ class Conductor:
                         return
                     dash.task(mi, ti, "run")
                     dash.print(f"[bold]▶ {mi}.{ti} {t.title}[/]  [dim]({done}/{total} · {atom.tokens} tok · {(time.time() - t0) / 60:.0f}m)[/]")
+                    if self._refresh_gate():   # project may have materialised a gate since the last task
+                        dash.print(f"  [green]● verify gate now active:[/] [dim]{self.gate_disp}[/]")
+                        dash.gate = self.gate
                     verify = t.verify.strip()
                     if self.gate:
                         verify = f"({verify}) && ({self.gate})" if verify else self.gate
@@ -800,6 +847,8 @@ class Conductor:
                         context=goal,
                     )
                     status = self._run_task(atom, spec, dash)
+                    if status != "blocked":
+                        self._verify_new_gate(dash, atom, goal)   # this task may have created the gate
                     if status == "blocked":
                         blocked.append(f"{mi}.{ti} {t.title}")
                         dash.task(mi, ti, "blocked")
