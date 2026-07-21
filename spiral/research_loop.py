@@ -111,9 +111,37 @@ class ResearchLoop:
         return res.text, getattr(res, "completion_tokens", 0) or 0
 
     # -- phases --------------------------------------------------------------
-    def gather(self, query: str, k: int = 8) -> int:
-        self._say(f"gather · arXiv: {query[:60]}")
-        added = self.corpus.build(query, k=k, on=lambda a: self._say(f"  + {a}"))
+    def search_plan(self, n: int = 3) -> tuple[list[str], list[str]]:
+        """Decide WHERE on arXiv to look and WHAT to type: the right subject categories
+        plus focused keyword queries. 'Find the right place, then search there' — a
+        number-theory identity belongs in math.NT/math.CO, a gauge anomaly in
+        hep-th/hep-ph; an unrestricted search for a term like 'Ramanujan' drowns in
+        string-theory hits. Returns ``(categories, queries)``."""
+        system = (
+            "Choose where on arXiv to search for the TOPIC and what to type. Reply ONLY "
+            'JSON {"categories":["math.NT","math.CO"],"queries":["hypergeometric identity","..."]}. '
+            "categories: 1-4 real arXiv category codes for the field (math.NT, math.CO, "
+            "math.CA, math.AG, hep-th, hep-ph, gr-qc, quant-ph, cond-mat.stat-mech, cs.LG, …). "
+            "queries: 2-4 short keyword phrases (3-6 words), no punctuation, no cat: prefixes."
+        )
+        data = _extract_json(self._think(system, f"TOPIC: {self.state.topic}", think=False)[0])
+        cats = [c.strip() for c in data.get("categories", []) if isinstance(c, str) and c.strip()][:4]
+        qs = [q.strip() for q in data.get("queries", []) if isinstance(q, str) and q.strip()]
+        if not qs:                                   # deterministic fallback: salient keywords
+            stop = {"discover", "previously", "unknown", "propose", "verify", "confirm",
+                    "write", "against", "literature", "using", "which", "their", "these",
+                    "that", "with", "find", "prove", "exact", "new"}
+            words = re.findall(r"[A-Za-z]{4,}", self.state.topic)   # split hyphens/punct
+            keys = [w for w in words if w.lower() not in stop][:6]
+            qs = [" ".join(keys[:4])] if keys else [self.state.topic[:60]]
+        return cats, qs[:n]
+
+    def gather(self, query: str, k: int = 8, categories=None) -> int:
+        self._say(f"gather · {('/'.join(categories) + ' · ') if categories else ''}{query[:50]}")
+        added = self.corpus.build(query, k=k, categories=categories,
+                                  on=lambda a: self._say(f"  + {a}"))
+        if not added and categories:                 # category too narrow/miscoded → widen
+            added = self.corpus.build(query, k=k, on=lambda a: self._say(f"  + {a} (unrestricted)"))
         for p in added:
             if p.bare_id not in self.state.corpus_ids:
                 self.state.corpus_ids.append(p.bare_id)
@@ -221,7 +249,7 @@ class ResearchLoop:
             "the next action. Reply with ONLY JSON: "
             '{"assessment":"...","novel":true|false,'
             '"action":"continue|solved|new_question|pivot",'
-            '"next_query":"<arxiv search to deepen the corpus, if continuing>",'
+            '"next_query":"<SHORT keyword arXiv search, 3-6 words, to deepen the corpus>",'
             '"reason":"..."}. '
             "'solved' only if the confirmed claims actually answer the question AND prior "
             "art does not already contain it. 'new_question' if the work instead surfaced a "
@@ -238,7 +266,9 @@ class ResearchLoop:
     # -- the loop ------------------------------------------------------------
     def run(self, max_rounds: int | None = None, token_budget: int | None = None) -> ResearchState:
         budget = token_budget or getattr(self.cfg, "run_token_budget", 500_000)
-        query = self.state.topic
+        cats, queries = self.search_plan()           # the right categories + focused queries
+        self._say(f"search plan · {('cat: ' + ', '.join(cats) + ' · ') if cats else ''}"
+                  + " | ".join(queries))
         while True:
             if max_rounds is not None and self.state.round >= max_rounds:
                 self.state.status = "exhausted"; break
@@ -247,7 +277,9 @@ class ResearchLoop:
             self.state.round += 1
             self._say(f"── round {self.state.round} ──")
 
-            self.gather(query, k=8)
+            per = max(3, 8 // max(1, len(queries)))
+            for q in queries:
+                self.gather(q, k=per)
             proposal = self.propose()
             if proposal.get("question"):
                 self.state.question = proposal["question"]
@@ -264,7 +296,8 @@ class ResearchLoop:
             action = decision.get("action", "continue")
             if action in ("solved", "new_question"):
                 self.state.status = action; break
-            query = decision.get("next_query") or self.state.question or self.state.topic
+            nq = (decision.get("next_query") or "").strip()
+            queries = [nq] if nq else self.derive_queries()   # targeted follow-up, or re-derive
             if not any(f.ok for f in findings) and self.state.round >= 3:
                 # three rounds, nothing survives verification → stop honestly
                 self.state.status = "exhausted"; break

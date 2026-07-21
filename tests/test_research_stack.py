@@ -99,6 +99,7 @@ def test_loop_round_verifies_and_decides(monkeypatch):
     loop = research_loop.ResearchLoop("test topic", workdir=d)
     monkeypatch.setattr(loop.corpus, "build", lambda q, k=8, on=None: [])
     monkeypatch.setattr(citations, "prior_art", lambda *a, **k: [])
+    monkeypatch.setattr(loop, "derive_queries", lambda n=3: ["ramanujan series"])   # skip LLM query-gen
 
     # a vetted proposal with one TRUE + one FALSE checkable claim (verification is REAL)
     monkeypatch.setattr(loop, "propose", lambda refine_rounds=2: {
@@ -118,6 +119,25 @@ def test_loop_round_verifies_and_decides(monkeypatch):
     assert oks[0]["backend"] == "sympy" and state.status == "solved"
     assert (d / "state.json").is_file()
     assert Path(loop.write()["tex"]).is_file()
+
+
+def test_derive_queries_turns_prompt_into_keywords(monkeypatch):
+    """The loop must NOT dump the whole prompt into arXiv (it returns noise) — it
+    derives focused keyword queries, with a deterministic fallback if the LLM fails."""
+    from spiral import research_loop
+    topic = ("Discover a previously-unknown exact Ramanujan-type series identity for a "
+             "mathematical constant and formally prove it in Lean")
+    loop = research_loop.ResearchLoop(topic, workdir=Path(tempfile.mkdtemp()))
+    # LLM path
+    monkeypatch.setattr(loop, "_think",
+                        lambda s, u, think=True: (json.dumps({"queries": ["ramanujan series identity", "cat:math.NT hypergeometric"]}), 3))
+    qs = loop.derive_queries()
+    assert qs == ["ramanujan series identity", "cat:math.NT hypergeometric"]
+    assert all(len(q) < 60 for q in qs)                         # short, not the sentence
+    # fallback path: LLM returns junk → salient keywords, never the raw prompt
+    monkeypatch.setattr(loop, "_think", lambda s, u, think=True: ("not json", 1))
+    fb = loop.derive_queries()
+    assert fb and fb[0] != topic and "previously" not in fb[0].lower()
 
 
 def test_proposal_iterates_against_prior_art(monkeypatch):
