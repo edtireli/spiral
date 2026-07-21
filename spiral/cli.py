@@ -121,6 +121,17 @@ def main() -> None:
     res.add_argument("--deep", action="store_true", help="more sources, follow links, longer thinking synthesis")
     res.add_argument("--sci", action="store_true", help="include arXiv + PubMed")
     res.add_argument("--dir", default=".", help="where to save the report")
+    res.add_argument("--solve", action="store_true",
+                     help="iterative loop: gather a source corpus, propose CHECKABLE claims, "
+                          "verify them (sympy/lean/numeric), search prior art, repeat until "
+                          "solved or a new open question is found, then write a cited LaTeX paper")
+    res.add_argument("--rounds", type=int, default=None,
+                     help="max research rounds with --solve (default: until solved/exhausted)")
+    res.add_argument("--api", action="store_true",
+                     help="run the research reasoning (proposals, novelty critique, reflection, "
+                          "write-up) on the API model; verification stays local & deterministic")
+    res.add_argument("--boost", action="store_true",
+                     help="API model for the critic/reflection roles, local planner")
 
     tune = sub.add_parser("tune", help="size context windows to this machine (KV math)")
     tune.add_argument("--apply", action="store_true")
@@ -249,6 +260,24 @@ def main() -> None:
             if h.snippet:
                 console.print(f"      [dim]{h.snippet[:200]}[/]")
         console.print()
+        return
+
+    if args.cmd == "research" and getattr(args, "solve", False):
+        from spiral.config import Config
+        from spiral.research_loop import ResearchLoop
+        console.print(f"  [rgb(217,119,87)]⭷ spiral[/][rgb(217,119,87)]ʳᵉˢᵉᵃʳᶜʰ[/] · [dim]{args.query}[/]")
+        cfg = Config.load()
+        _apply_tier(cfg, console, "api" if getattr(args, "api", False)
+                    else "boost" if getattr(args, "boost", False) else None)
+        loop = ResearchLoop(args.query, workdir=Path(args.dir) / "spiral-research", cfg=cfg,
+                            ui=lambda m: console.print(f"  [dim]{m}[/]"))
+        state = loop.run(max_rounds=args.rounds)
+        n_ok = sum(1 for f in state.findings if f.get("ok"))
+        console.print(f"  [green]●[/] status [bold]{state.status}[/] · {state.round} rounds · "
+                      f"{n_ok} verified findings · {state.tokens:,} tok")
+        art = loop.write()
+        tail = f" · pdf {art['pdf']}" if art.get("pdf") else " (no LaTeX toolchain — .tex written)"
+        console.print(f"  [dim]write-up: {art['tex']}{tail}[/]\n")
         return
 
     if args.cmd == "research":
