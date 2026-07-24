@@ -15,9 +15,8 @@ available if installed; their absence just narrows what an experiment can do.
 
 from __future__ import annotations
 
-import subprocess
-import sys
 import tempfile
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -45,6 +44,16 @@ def _screen(code: str) -> str | None:
     return None
 
 
+def _numeric_evidence_issue(code: str) -> str | None:
+    if re.search(r"print\s*\(\s*(?:True|['\"]True['\"])\s*\)\s*$", code.strip(), re.I):
+        return "constant success output"
+    evidence = ("assert", "abs(", "allclose(", "isclose(", "norm(", "residual",
+                "error", "<", ">", "==")
+    if not any(signal in code.lower() for signal in evidence):
+        return "no falsifiable numeric check"
+    return None
+
+
 def run_python(code: str, *, timeout: float = 20.0) -> RunOutput:
     """Run a Python snippet in an isolated process; return its stdout.
 
@@ -54,24 +63,31 @@ def run_python(code: str, *, timeout: float = 20.0) -> RunOutput:
     banned = _screen(code)
     if banned:
         return RunOutput(False, "", error=f"blocked call in snippet: {banned}")
+    from spiral.research_workbench import run_workbench_claim
+
     with tempfile.TemporaryDirectory() as td:
-        script = Path(td) / "experiment.py"
-        script.write_text(code)
-        try:
-            p = subprocess.run(
-                [sys.executable, str(script)], cwd=td,
-                capture_output=True, text=True, timeout=timeout,
-            )
-        except subprocess.TimeoutExpired:
-            return RunOutput(False, "", error=f"timed out after {timeout:g}s", timed_out=True)
-        out = (p.stdout or "").strip()
-        err = (p.stderr or "").strip()
-        return RunOutput(p.returncode == 0, out, error=err)
+        result = run_workbench_claim({
+            "kind": "workbench",
+            "files": {"experiment.py": code},
+            "cmd": "python experiment.py",
+            "expect": "",
+            "note": "isolated numerical experiment",
+            "evidence_mode": "exploratory",
+        }, Path(td), timeout=timeout)
+        return RunOutput(
+            result.ok,
+            result.stdout,
+            error=result.stderr or ("" if result.ok else result.detail),
+            timed_out=result.timed_out,
+        )
 
 
 def check_numeric_claim(code: str, *, expect: str = "True", timeout: float = 20.0) -> RunOutput:
     """Run ``code`` and require its final printed line to equal ``expect`` (default the
     string ``True``) — the convention for a snippet that prints its own pass/fail."""
+    issue = _numeric_evidence_issue(code)
+    if issue:
+        return RunOutput(False, "", error=f"inconclusive numeric certificate: {issue}")
     r = run_python(code, timeout=timeout)
     if not r.ok:
         return r

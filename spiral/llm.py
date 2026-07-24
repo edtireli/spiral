@@ -122,6 +122,7 @@ class Ollama:
             return self._openai_chat(
                 self.providers[model], model, messages, num_predict=num_predict,
                 temperature=temperature, stop=stop, fmt=fmt, on_delta=on_delta,
+                think=think,
             )
 
         payload = self._payload(
@@ -174,44 +175,123 @@ class Ollama:
     def _openai_chat(
         self, provider: dict, model: str, messages: list[dict], *,
         num_predict: int | None, temperature: float, stop: list[str] | None,
-        fmt: Any | None, on_delta: Any | None,
+        fmt: Any | None, on_delta: Any | None, think: bool,
     ) -> ChatResult:
         import json as _json
         import os
         import time
 
         base = provider["base_url"].rstrip("/")
-        key = os.environ.get(provider.get("api_key_env", "OPENAI_API_KEY"), "")
+        key_env = provider.get("api_key_env", "OPENAI_API_KEY")
+        key = os.environ.get(key_env, "")
+        if not key:
+            return ChatResult(text="", prompt_tokens=0, completion_tokens=0,
+                              raw={"error": f"missing ${key_env}", "status": 401})
         headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
 
         body: dict[str, Any] = {"model": model, "messages": messages}
         # some reasoning models FIX temperature (kimi-k3: only 1) — provider wins
         body["temperature"] = provider["temperature"] if "temperature" in provider else temperature
-        if num_predict:
-            body["max_tokens"] = max(num_predict, 1024)  # reasoning models spend tokens thinking
+        is_kimi = "moonshot" in base.lower() or model.lower().startswith("kimi-")
+        is_kimi_k3 = model.lower().startswith("kimi-k3")
+        if is_kimi_k3:
+            # K3 always reasons. Its API uses max_completion_tokens (max_tokens is
+            # deprecated), and an 8k cap can be consumed entirely before final JSON.
+            # Low effort keeps structured calls concise; free-form research gets room
+            # for the deeper pass. Both remain overridable in provider configuration.
+            body["reasoning_effort"] = provider.get(
+                "reasoning_effort_thinking" if think else "reasoning_effort_structured",
+                "max" if think else "low",
+            )
+            requested = max(int(num_predict or 0), 1024)
+            # A huge provider default is not a sensible unattended default: one blank
+            # reasoning-only reply could consume it before Spiral gets a usable answer.
+            # Give consequential calls a real reasoning window, then recover at low
+            # effort if the provider still reaches the cap without final content.
+            default_floor = 131_072 if think else 32_768
+            floor = int(provider.get(
+                "min_completion_tokens_thinking" if think
+                else "min_completion_tokens_structured",
+                default_floor,
+            ))
+            body[provider.get("completion_token_field", "max_completion_tokens")] = max(
+                requested, floor)
+        elif is_kimi:
+            # Kimi 2.x exposes an explicit thinking switch.
+            body["thinking"] = {"type": "enabled" if think else "disabled"}
+            if num_predict:
+                body[provider.get("completion_token_field", "max_completion_tokens")] = max(
+                    num_predict, 1024)
+        elif num_predict:
+            body[provider.get("completion_token_field", "max_tokens")] = max(
+                num_predict, 1024)
         if stop:
             body["stop"] = stop
         if fmt is not None:
             body["response_format"] = {"type": "json_object"}  # JSON mode; schema enforced by our parser
 
-        retries = int(provider.get("retries", 5))
+        retries = max(1, int(provider.get("retries", 5)))
+        blank_retries = max(0, int(provider.get("blank_retries", 1)))
+        last_error: dict[str, Any] = {}
+        spent_prompt = 0
+        spent_completion = 0
+        blank_count = 0
+        base_messages = [dict(message) for message in messages]
         for attempt in range(1, retries + 1):
+            if attempt > 1 and last_error.get("empty_response"):
+                recovery = (
+                    "The previous provider attempt emitted reasoning but no final answer. "
+                    "Return the final answer now without restarting the analysis. "
+                    + ("Emit one complete JSON object only." if fmt is not None
+                       else "Be concise and directly answer the original request.")
+                )
+                body["messages"] = [
+                    *base_messages,
+                    {"role": "user", "content": recovery},
+                ]
+                if is_kimi_k3:
+                    body["reasoning_effort"] = provider.get(
+                        "reasoning_effort_recovery", "low")
             try:
                 if on_delta is None:
                     r = self._client.post(f"{base}/chat/completions", headers=headers, json=body)
                     if r.status_code == 200:
                         d = r.json()
-                        msg = (d.get("choices") or [{}])[0].get("message", {}) or {}
+                        choice = (d.get("choices") or [{}])[0]
+                        msg = choice.get("message", {}) or {}
                         u = d.get("usage", {}) or {}
+                        spent_prompt += int(u.get("prompt_tokens", 0) or 0)
+                        spent_completion += int(u.get("completion_tokens", 0) or 0)
+                        content = msg.get("content", "") or ""
+                        finish_reason = choice.get("finish_reason")
+                        if content.strip():
+                            return ChatResult(
+                                text=content,
+                                thinking=msg.get("reasoning_content"),
+                                prompt_tokens=spent_prompt,
+                                completion_tokens=spent_completion,
+                                raw={
+                                    **d,
+                                    "finish_reason": finish_reason,
+                                    "provider_attempts": attempt,
+                                },
+                            )
+                        last_error = {
+                            "error": "provider returned no final content",
+                            "status": 200,
+                            "finish_reason": finish_reason,
+                            "empty_response": True,
+                            "provider_attempts": attempt,
+                        }
+                        blank_count += 1
+                        if attempt < retries and blank_count <= blank_retries:
+                            continue
                         return ChatResult(
-                            text=msg.get("content", "") or "",
-                            thinking=msg.get("reasoning_content"),
-                            prompt_tokens=u.get("prompt_tokens", 0),
-                            completion_tokens=u.get("completion_tokens", 0),
-                            raw=d,
-                        )
+                            text="", prompt_tokens=spent_prompt,
+                            completion_tokens=spent_completion, raw=last_error)
                 else:
                     text_parts, think_parts, usage = [], [], {}
+                    finish_reason = None
                     sbody = {**body, "stream": True, "stream_options": {"include_usage": True}}
                     with self._client.stream("POST", f"{base}/chat/completions", headers=headers, json=sbody) as r:
                         if r.status_code != 200:
@@ -226,29 +306,61 @@ class Ollama:
                                 chunk = _json.loads(data)
                                 if chunk.get("usage"):
                                     usage = chunk["usage"]
-                                delta = (chunk.get("choices") or [{}])[0].get("delta", {}) or {}
+                                choice = (chunk.get("choices") or [{}])[0]
+                                if choice.get("finish_reason"):
+                                    finish_reason = choice["finish_reason"]
+                                delta = choice.get("delta", {}) or {}
                                 if delta.get("reasoning_content"):
                                     think_parts.append(delta["reasoning_content"])
                                     on_delta("think", delta["reasoning_content"])
                                 if delta.get("content"):
                                     text_parts.append(delta["content"])
                                     on_delta("text", delta["content"])
+                            spent_prompt += int(usage.get("prompt_tokens", 0) or 0)
+                            spent_completion += int(usage.get("completion_tokens", 0) or 0)
+                            content = "".join(text_parts)
+                            if content.strip():
+                                return ChatResult(
+                                    text=content,
+                                    thinking="".join(think_parts) or None,
+                                    prompt_tokens=spent_prompt,
+                                    completion_tokens=spent_completion,
+                                    raw={
+                                        "finish_reason": finish_reason,
+                                        "provider_attempts": attempt,
+                                    },
+                                )
+                            last_error = {
+                                "error": "provider returned no final content",
+                                "status": 200,
+                                "finish_reason": finish_reason,
+                                "empty_response": True,
+                                "provider_attempts": attempt,
+                            }
+                            blank_count += 1
+                            if attempt < retries and blank_count <= blank_retries:
+                                continue
                             return ChatResult(
-                                text="".join(text_parts),
-                                thinking="".join(think_parts) or None,
-                                prompt_tokens=usage.get("prompt_tokens", 0),
-                                completion_tokens=usage.get("completion_tokens", 0),
-                            )
+                                text="", prompt_tokens=spent_prompt,
+                                completion_tokens=spent_completion,
+                                raw=last_error)
                 # non-200 (both modes fall through here)
-                err = r.json().get("error", {}) if r.headers.get("content-type", "").startswith("application/json") else {}
+                err: dict[str, Any] = {}
+                if r.status_code != 200:
+                    err = r.json().get("error", {}) if r.headers.get("content-type", "").startswith("application/json") else {}
+                    last_error = {"error": err or r.text[:300], "status": r.status_code}
                 if r.status_code == 429 or "overload" in str(err.get("type", "")).lower():
                     time.sleep(min(2 ** attempt, 20))
                     continue
-                return ChatResult(text="", prompt_tokens=0, completion_tokens=0,
-                                  raw={"error": err or r.text[:300], "status": r.status_code})
-            except (httpx.TimeoutException, httpx.TransportError):
+                return ChatResult(text="", prompt_tokens=spent_prompt,
+                                  completion_tokens=spent_completion,
+                                  raw=last_error)
+            except (httpx.TimeoutException, httpx.TransportError) as e:
+                last_error = {"error": f"{type(e).__name__}: {e}", "status": 0}
                 time.sleep(min(2 ** attempt, 20))
-        return ChatResult(text="", prompt_tokens=0, completion_tokens=0, raw={"error": "provider unavailable after retries"})
+        return ChatResult(text="", prompt_tokens=spent_prompt,
+                          completion_tokens=spent_completion,
+                          raw=last_error or {"error": "provider unavailable after retries"})
 
     def chat_stream(
         self,

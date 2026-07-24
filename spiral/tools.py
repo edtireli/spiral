@@ -7,6 +7,7 @@ it physically cannot wipe the repo or reach the network to push.
 from __future__ import annotations
 
 import re
+import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,7 +39,8 @@ def is_dangerous(cmd: str) -> bool:
     return any(bad in c for bad in DENY)
 
 
-def run(cmd: str, cwd: str | Path, timeout: int = 120, on_line=None) -> RunResult:
+def run(cmd: str, cwd: str | Path, timeout: int = 120, on_line=None,
+        env: dict[str, str] | None = None) -> RunResult:
     """Run a shell command. With on_line, output is streamed line-by-line to the
     callback as it happens (build liveness) while still captured in full."""
     if is_dangerous(cmd):
@@ -48,6 +50,7 @@ def run(cmd: str, cwd: str | Path, timeout: int = 120, on_line=None) -> RunResul
             p = subprocess.run(
                 cmd, shell=True, cwd=str(cwd),
                 capture_output=True, text=True, timeout=timeout,
+                env=({**os.environ, **env} if env else None),
             )
             return RunResult(cmd, p.returncode, (p.stdout + p.stderr).strip())
         except subprocess.TimeoutExpired:
@@ -57,6 +60,7 @@ def run(cmd: str, cwd: str | Path, timeout: int = 120, on_line=None) -> RunResul
     proc = subprocess.Popen(
         cmd, shell=True, cwd=str(cwd), text=True,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        env=({**os.environ, **env} if env else None),
     )
     lines: list[str] = []
     deadline = _time.monotonic() + timeout

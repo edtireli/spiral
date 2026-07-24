@@ -16,6 +16,7 @@ def test_true_identities_certified():
     for lhs, rhs in [
         ("sin(x)**2 + cos(x)**2", "1"),
         ("(x+1)**2", "x**2 + 2*x + 1"),
+        ("(x+1)^2", "x^2 + 2x + 1"),
         ("exp(I*x)", "cos(x) + I*sin(x)"),
         ("sin(2*x)", "2*sin(x)*cos(x)"),
         ("diff(sin(x), x)", "cos(x)"),
@@ -49,6 +50,17 @@ def test_numeric_constant_equality():
                    "rhs": "Sum(1/n**2, (n, 1, oo)).doit()"}).ok     # Basel problem
 
 
+def test_groebner_certificate_and_ideal_membership():
+    ideal = {"generators": ["x^2 - y", "x*y - 1"], "variables": ["x", "y"], "order": "lex"}
+    g = verify({"kind": "groebner", **ideal, "basis": ["x - y^2", "y^3 - 1"]})
+    assert g.ok and g.extra["computed"] == ["x - y**2", "(y - 1)*(y**2 + y + 1)"]
+    assert not verify({"kind": "groebner", **ideal, "basis": ["x - y", "y - 1"]}).ok
+
+    assert verify({"kind": "ideal_membership", **ideal, "expr": "x^3 - 1"}).ok
+    missing = verify({"kind": "ideal_membership", **ideal, "expr": "x - 1"})
+    assert not missing.ok and missing.extra["remainder"] == "(y - 1)*(y + 1)"
+
+
 def test_malformed_claim_never_raises():
     assert not verify({"kind": "woozle", "expr": "x"}).ok           # unknown kind
     assert not verify({"kind": "identity", "lhs": "x"}).ok          # missing 'rhs'
@@ -66,8 +78,10 @@ def test_lean_backend_when_available():
     import shutil
     from pathlib import Path
 
-    from spiral.verify_math import prove_lean, verify
+    from spiral.verify_math import lean_available, prove_lean, verify
     if not (shutil.which("lean") or Path(os.path.expanduser("~/.elan/bin/lean")).is_file()):
+        return
+    if not lean_available():
         return
     assert prove_lean(": (2:Nat)+2 = 4", "by decide").ok           # kernel-proven
     assert not prove_lean(": (2:Nat)+2 = 5", "by decide").ok        # kernel-rejected

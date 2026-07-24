@@ -13,9 +13,11 @@ rendered as the one-line spinner.
 from __future__ import annotations
 
 import collections
+import json
 import sys
 import threading
 import time
+from pathlib import Path
 
 from rich.console import Console, Group
 
@@ -32,7 +34,8 @@ CLAY = "rgb(217,119,87)"
 class Dash:
     HEARTBEAT_S = 8.0
 
-    def __init__(self, console: Console | None = None, plan=None, gate: str = ""):
+    def __init__(self, console: Console | None = None, plan=None, gate: str = "",
+                 thought_log: str | Path | None = None):
         self.c = console or make_console()
         self.plan = plan
         self.gate = gate
@@ -40,6 +43,15 @@ class Dash:
         self._phase = "starting"
         self._model = ""
         self._detail = ""
+        self._idea = ""
+        self._ideas: collections.deque[dict[str, str]] = collections.deque(maxlen=200)
+        self.thoughts_expanded = False
+        self._thought_log = Path(thought_log) if thought_log else None
+        if self._thought_log:
+            try:
+                self._thought_log.parent.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                self._thought_log = None
         self._tokens = 0
         self._t0 = time.time()
         self._phase_t0 = time.time()
@@ -92,6 +104,8 @@ class Dash:
             line += f" · {tok} · {time.time() - self._phase_t0:.0f}s · Σ{(time.time() - self._t0) / 60:.0f}m"
             if self._detail:
                 line += f" · {self._detail}"
+            if self._idea:
+                line += f" · idea: {self._idea[:120]}"
             sys.stdout.write(line + "\n")
             sys.stdout.flush()
 
@@ -118,6 +132,64 @@ class Dash:
 
     def detail(self, s: str) -> None:
         self._detail = (s or "").strip()[-70:]
+
+    def idea(self, s: str) -> None:
+        """Pinned high-level working note.
+
+        This is intentionally a short hypothesis/status summary, not a raw chain of
+        thought transcript. The cockpit needs the useful bit: what the model is
+        currently trying or why it changed direction.
+        """
+        text = " ".join((s or "").replace("```", "").split())
+        if not text:
+            return
+        text = text[:700]
+        self._idea = text[:360]
+        if self._ideas and self._ideas[-1].get("text") == text:
+            return
+        entry = {
+            "ts": time.strftime("%H:%M:%S"),
+            "phase": self._phase,
+            "model": self._model,
+            "text": text,
+        }
+        self._ideas.append(entry)
+        if self._thought_log:
+            try:
+                with self._thought_log.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            except Exception:
+                self._thought_log = None
+
+    def toggle_thoughts(self) -> None:
+        self.thoughts_expanded = not self.thoughts_expanded
+
+    def thought(self, piece: str, *, label: str = "thinking") -> None:
+        """Convert a reasoning chunk into a safe, terse topic summary."""
+        low = (piece or "").lower()
+        topics = []
+        for key, name in (
+            ("error", "the current error"),
+            ("import", "imports/symbols"),
+            ("file", "the relevant files"),
+            ("test", "the failing test"),
+            ("gate", "the verification gate"),
+            ("layout", "layout"),
+            ("mobile", "mobile responsiveness"),
+            ("contrast", "contrast"),
+            ("overlap", "overlap/clipping"),
+            ("citation", "citation grounding"),
+            ("proof", "proof structure"),
+            ("notation", "notation consistency"),
+            ("novel", "novelty"),
+            ("corpus", "corpus evidence"),
+        ):
+            if key in low and name not in topics:
+                topics.append(name)
+        if topics:
+            self.idea(f"{label}: considering " + ", ".join(topics[:4]) + ".")
+        else:
+            self.idea(f"{label}: reasoning through the next decision.")
 
     def task(self, mi: int, ti: int, state: str) -> None:
         prev = self.status.get((mi, ti))
@@ -184,6 +256,8 @@ class Dash:
 
     def _render(self, final: bool = False):
         parts = []
+        if self._idea:
+            parts.append(self._thoughts_panel())
         if self.plan is not None:
             rows: list[Text] = []
             if (0, 0) in self.status:
@@ -224,6 +298,25 @@ class Dash:
         parts.append(self._status_text(final))
         return Group(*parts)
 
+    def _thoughts_panel(self) -> Panel:
+        if self.thoughts_expanded:
+            rows = Text()
+            for entry in list(self._ideas)[-8:]:
+                rows.append(f"{entry.get('ts', '')} ", style="dim")
+                phase = entry.get("phase") or "working"
+                rows.append(f"{phase}: ", style=f"bold {CLAY}")
+                rows.append(entry.get("text", ""), style="bold")
+                rows.append("\n")
+            if self._thought_log:
+                rows.append(f"full log: {self._thought_log}", style="dim")
+            title = f"[{CLAY}]thoughts[/] [dim]expanded · press t to collapse[/]"
+            return Panel(rows, title=title, border_style=CLAY, padding=(0, 1))
+
+        idea = Text()
+        idea.append(self._idea, style="bold")
+        title = f"[{CLAY}]thoughts[/] [dim]press t to expand[/]" if self._ideas else f"[{CLAY}]thoughts[/]"
+        return Panel(idea, title=title, border_style=CLAY, padding=(0, 1))
+
 
 class SoloStatus:
     """Same interface as Dash, no plan — renders the one-line Spinner.
@@ -259,6 +352,13 @@ class SoloStatus:
     def detail(self, s: str) -> None:
         if self._sp:
             self._sp.update(detail=s)
+
+    def idea(self, s: str) -> None:
+        if self._sp:
+            self._sp.update(detail=(" ".join((s or "").split()))[:70])
+
+    def thought(self, piece: str, *, label: str = "thinking") -> None:
+        self.idea(f"{label}: reasoning through the next decision.")
 
     def task(self, mi: int, ti: int, state: str) -> None:
         pass

@@ -29,10 +29,12 @@ dependencies = [
     "rich>=13.7",
     "sympy>=1.12",
     "pypdf>=4.0",
+    "pillow>=10",
+    "playwright>=1.45",
 ]
 
 [project.optional-dependencies]
-dev = ["pillow>=10", "pytest>=8", "build>=1.2", "twine>=5", "pyte>=0.8"]
+dev = ["pytest>=8", "build>=1.2", "twine>=5", "pyte>=0.8"]
 
 [project.urls]
 Homepage = "https://github.com/edtireli/spiral"

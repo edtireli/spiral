@@ -12,8 +12,11 @@ material for synthesis, never instructions, never executed.
 from __future__ import annotations
 
 import html as htmllib
+import ipaddress
 import re
+import socket
 import urllib.parse
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 
 import httpx
@@ -30,6 +33,8 @@ class Hit:
     snippet: str = ""
     text: str = ""
     source: str = "web"   # web | arxiv | pubmed
+    published: str = ""
+    categories: list[str] | None = None
 
 
 # ---------------------------------------------------------------- primitives
@@ -40,14 +45,67 @@ def _strip_html(raw: str) -> str:
     return re.sub(r"\s+", " ", raw).strip()
 
 
+def _public_url(url: str) -> bool:
+    try:
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return False
+        if parsed.username or parsed.password:
+            return False
+        if parsed.hostname.lower() in {"localhost", "localhost.localdomain"}:
+            return False
+        addresses = {
+            item[4][0] for item in socket.getaddrinfo(
+                parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80),
+                type=socket.SOCK_STREAM,
+            )
+        }
+        if not addresses:
+            return False
+        return all(
+            not (
+                (ip := ipaddress.ip_address(address)).is_private
+                or ip.is_loopback or ip.is_link_local or ip.is_multicast
+                or ip.is_reserved or ip.is_unspecified
+            )
+            for address in addresses
+        )
+    except Exception:
+        return False
+
+
 def _get(url: str, timeout: float = 20.0) -> str:
-    if not url.startswith(("http://", "https://")):
+    if not _public_url(url):
         return ""
     try:
-        with httpx.Client(timeout=timeout, follow_redirects=True, headers=_UA) as cl:
-            r = cl.get(url)
-            r.raise_for_status()
-            return r.text[:MAX_BYTES]
+        with httpx.Client(
+                timeout=timeout, follow_redirects=False, headers=_UA,
+                trust_env=False) as cl:
+            current = url
+            for _redirect in range(6):
+                if not _public_url(current):
+                    return ""
+                with cl.stream("GET", current) as response:
+                    if response.is_redirect:
+                        location = response.headers.get("location")
+                        if not location:
+                            return ""
+                        current = urllib.parse.urljoin(current, location)
+                        continue
+                    response.raise_for_status()
+                    chunks = []
+                    size = 0
+                    for chunk in response.iter_bytes():
+                        if not chunk:
+                            continue
+                        remaining = MAX_BYTES - size
+                        if remaining <= 0:
+                            break
+                        chunks.append(chunk[:remaining])
+                        size += min(len(chunk), remaining)
+                    encoding = response.encoding or "utf-8"
+                    return b"".join(chunks).decode(encoding, errors="replace")
+            return ""
     except Exception:
         return ""
 
@@ -91,33 +149,79 @@ def search(query: str, k: int = 8, timeout: float = 20.0) -> list[Hit]:
     return hits
 
 
+def arxiv_terms(query: str) -> str:
+    """Build the ``all:`` clause for an arXiv API query.
+
+    A short query stays an exact phrase (``all:"gregory laflamme"`` — precision for
+    names). A longer keyword query becomes an AND of individual terms: arXiv treats
+    ``all:"kodama ishibashi master equations higher dimensional black holes"`` as a
+    verbatim 8-word phrase, which matches essentially nothing — a whole research run
+    once stalled because every multi-word search silently returned zero results."""
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'-]*", query)
+    if len(words) <= 2:
+        return f'all:"{query}"'
+    return " AND ".join(f"all:{w}" for w in words[:8])
+
+
 def arxiv(query: str, k: int = 6, categories: list[str] | None = None,
-          timeout: float = 25.0) -> list[Hit]:
+          timeout: float = 25.0, report: dict | None = None) -> list[Hit]:
     """arXiv Atom API — titles, authors, abstracts, no key.
 
     ``categories`` restricts the search to arXiv subject classes (``["math.NT"]``,
     ``["hep-th","hep-ph"]``, …). This matters: an unrestricted ``all:`` query for a
     term like *Ramanujan* returns mostly string-theory papers that merely cite it, so
     searching the RIGHT category is what keeps the corpus on-topic."""
-    terms = f"all:{urllib.parse.quote_plus(query)}"
+    terms = arxiv_terms(query)
     if categories:
-        cats = "+OR+".join(f"cat:{urllib.parse.quote_plus(c)}" for c in categories)
-        sq = f"%28{cats}%29+AND+{terms}" if len(categories) > 1 else f"{cats}+AND+{terms}"
+        cats = " OR ".join(f"cat:{c}" for c in categories)
+        cats = f"({cats})" if len(categories) > 1 else cats
+        sq = f"{cats} AND ({terms})" if " AND " in terms else f"{cats} AND {terms}"
     else:
         sq = terms
-    body = _get(f"http://export.arxiv.org/api/query?search_query={sq}&start=0&max_results={k}&sortBy=relevance", timeout)
+    params = urllib.parse.urlencode({
+        "search_query": sq,
+        "start": 0,
+        "max_results": k,
+        "sortBy": "relevance",
+    })
+    url = f"https://export.arxiv.org/api/query?{params}"
+    body = _get(url, timeout)
+    if report is not None:
+        report.update({
+            "source": "arxiv",
+            "source_ok": bool(body),
+            "query": query,
+            "categories": list(categories or []),
+            "url": url,
+            "error": "" if body else "arXiv API returned no response",
+        })
     hits: list[Hit] = []
-    for m in re.finditer(r"<entry>(.*?)</entry>", body, re.S):
-        e = m.group(1)
-        tm = re.search(r"<title>(.*?)</title>", e, re.S)
-        sm = re.search(r"<summary>(.*?)</summary>", e, re.S)
-        im = re.search(r"<id>(.*?)</id>", e)
-        authors = re.findall(r"<name>(.*?)</name>", e)
-        title = _strip_html(tm.group(1)) if tm else "(untitled)"
-        hits.append(Hit(
-            title=f"{title}", url=(im.group(1).strip() if im else ""),
-            snippet=", ".join(authors[:5]), text=_strip_html(sm.group(1)) if sm else "", source="arxiv",
-        ))
+    if body:
+        try:
+            root = ET.fromstring(body)
+            atom = {"a": "http://www.w3.org/2005/Atom"}
+            for entry in root.findall("a:entry", atom):
+                title = " ".join((entry.findtext("a:title", default="", namespaces=atom) or "").split())
+                abstract = " ".join((entry.findtext("a:summary", default="", namespaces=atom) or "").split())
+                identifier = (entry.findtext("a:id", default="", namespaces=atom) or "").strip()
+                published = (entry.findtext("a:published", default="", namespaces=atom) or "").strip()
+                authors = [
+                    " ".join((node.findtext("a:name", default="", namespaces=atom) or "").split())
+                    for node in entry.findall("a:author", atom)
+                ]
+                cats = [node.attrib.get("term", "") for node in entry.findall("a:category", atom)]
+                hits.append(Hit(
+                    title=title or "(untitled)", url=identifier,
+                    snippet=", ".join(a for a in authors[:8] if a), text=abstract,
+                    source="arxiv", published=published,
+                    categories=[c for c in cats if c],
+                ))
+        except ET.ParseError as exc:
+            if report is not None:
+                report["source_ok"] = False
+                report["error"] = f"invalid arXiv XML: {exc}"
+    if report is not None:
+        report["result_count"] = len(hits)
     return hits
 
 
@@ -126,7 +230,9 @@ def pubmed(query: str, k: int = 6, timeout: float = 25.0) -> list[Hit]:
     base = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
     q = urllib.parse.quote_plus(query)
     try:
-        with httpx.Client(timeout=timeout, follow_redirects=True, headers=_UA) as cl:
+        with httpx.Client(
+                timeout=timeout, follow_redirects=True, headers=_UA,
+                trust_env=False) as cl:
             ids = cl.get(f"{base}/esearch.fcgi?db=pubmed&term={q}&retmax={k}&retmode=json").json()
             idlist = ids.get("esearchresult", {}).get("idlist", [])
             if not idlist:

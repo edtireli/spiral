@@ -15,8 +15,19 @@ import queue
 import select
 import sys
 import threading
+import atexit
+from collections.abc import Callable
 
 SHIFT_TAB = "\x1b[Z"
+_ACTIVE: set["Watcher"] = set()
+
+
+def _restore_terminals() -> None:
+    for watcher in list(_ACTIVE):
+        watcher.stop()
+
+
+atexit.register(_restore_terminals)
 
 
 class Watcher:
@@ -28,6 +39,7 @@ class Watcher:
         self._old_attrs = None
         self._buf = b""
         self.enabled = sys.stdin.isatty()
+        self._handlers: dict[str, list[Callable[[], None]]] = {}
 
     # -- byte stream → events (separated for testability) ----------------------
     def feed(self, data: bytes) -> None:
@@ -46,7 +58,19 @@ class Watcher:
                 continue
             ch = chr(self._buf[0])
             self._buf = self._buf[1:]
+            if ch in self._handlers:
+                for fn in list(self._handlers[ch]):
+                    try:
+                        fn()
+                    except Exception:
+                        pass
+                continue
             self.keys.put(ch)
+
+    def on_key(self, ch: str, fn: Callable[[], None]) -> None:
+        """Register a live hotkey consumed before prompt handling."""
+        if ch:
+            self._handlers.setdefault(ch[0], []).append(fn)
 
     # -- lifecycle ---------------------------------------------------------------
     def start(self) -> "Watcher":
@@ -61,6 +85,7 @@ class Watcher:
         termios.tcsetattr(fd, termios.TCSANOW, new)
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
+        _ACTIVE.add(self)
         return self
 
     def stop(self) -> None:
@@ -68,8 +93,12 @@ class Watcher:
         if self._old_attrs is not None:
             import termios
 
-            termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, self._old_attrs)
+            try:
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, self._old_attrs)
+            except (OSError, termios.error):
+                pass
             self._old_attrs = None
+        _ACTIVE.discard(self)
 
     def _loop(self) -> None:
         fd = sys.stdin.fileno()
