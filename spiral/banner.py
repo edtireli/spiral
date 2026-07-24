@@ -169,9 +169,10 @@ def _type_in(text: str, p: float, start: float, end: float) -> str:
     return text[: round(len(text) * (p - start) / (end - start))]
 
 
-def _banner_frame(progress: float, tagline: str, style: str = "spiral"):
+def _banner_frame(progress: float, tagline: str, style: str = "spiral", research: bool = False):
     """Compact banner: 4-row spiral beside tracked wordmark + tagline. Every
-    element cascades with `progress` — nothing arrives all at once."""
+    element cascades with `progress` — nothing arrives all at once. In research
+    mode the wordmark carries a superscript — the ONE place the research branding lives."""
     from rich.console import Group
 
     sp = spiral_braille(cols=9, rows=4, turns=2.2, progress=progress, style=style)
@@ -181,6 +182,8 @@ def _banner_frame(progress: float, tagline: str, style: str = "spiral"):
         if i == 1:
             t.append("   " + _type_in("s p i r a l", progress, 0.20, 0.85),
                      style=f"bold {_rgb(CLAY)}")
+            if research and progress > 0.82:
+                t.append("ʳᵉˢᵉᵃʳᶜʰ", style=_rgb(CLAY))
         elif i == 2:
             t.append("   " + _type_in(tagline, progress, 0.55, 1.0), style="dim")
         lines.append(t)
@@ -197,24 +200,27 @@ def _current_style() -> str:
 
 
 def print_banner(console: Console | None = None, tagline: str = "local autonomous coder · on-device",
-                 style: str | None = None, hold: float = 0.4) -> None:
+                 style: str | None = None, hold: float = 0.4, research: bool = False) -> None:
     """Compact launch banner. On a TTY the spiral draws itself in once (~1.1s),
     settles briefly, and then the CLI's opening lines cascade in beneath it
     (theme.reveal) — the mark gets its moment without the elements slamming
-    down all at once. Piped output gets the static banner only, no delay."""
+    down all at once. Piped output gets the static banner only, no delay.
+
+    ``research`` renders the research variant (wordmark superscript + researcher
+    tagline) — the single place research branding appears; everywhere else is 'spiral'."""
     console = console or Console()
     style = style or _current_style()
     tty = sys.stdout.isatty()
     console.print()
     if tty:
         steps = 26
-        with Live(_banner_frame(0.02, tagline, style), console=console,
+        with Live(_banner_frame(0.02, tagline, style, research), console=console,
                   refresh_per_second=30, transient=True) as live:
             for i in range(steps):
                 p = (1 - math.cos(math.pi * (i + 1) / steps)) / 2  # eased 0→1
-                live.update(_banner_frame(max(p, 0.02), tagline, style))
+                live.update(_banner_frame(max(p, 0.02), tagline, style, research))
                 time.sleep(1.1 / steps)
-    console.print(_banner_frame(1.0, tagline, style))
+    console.print(_banner_frame(1.0, tagline, style, research))
     console.print()
     if tty and hold > 0:
         time.sleep(hold)

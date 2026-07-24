@@ -110,7 +110,10 @@ def main() -> int:
 
     wired_now = wired_limit_gb()
     wired_target = ram_gb() - HEADROOM_GB if wired else wired_now
-    models = sorted({cfg.worker.name, cfg.escalation.name, cfg.critic.name, cfg.planner.name})
+    models = sorted({
+        cfg.worker.name, cfg.escalation.name, cfg.critic.name,
+        cfg.planner.name, cfg.research_auditor.name,
+    })
     plans = [calibrate(m, target_ktype, wired_target) for m in models]
     for p in plans:
         c.print(f"  [bold]{p['model']}[/]")

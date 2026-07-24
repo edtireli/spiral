@@ -131,7 +131,9 @@ separate model. Unmet requirements become new tasks:
        │                                diversity round · escalation ·
        │                                signature routing · reused fixes
        ▼
- clean build ──▶ spec validation ──▶ remediation ──▶ SPEC-GREEN
+ product audit ──▶ mobile/desktop/wide browser QA ──▶ clean build
+       ▲                                              │
+       └──── spec validation ◀── remediation ◀────────┘  (fixed point)
 ```
 
 **Verification.** A task is complete only when it passes every check that
@@ -140,6 +142,10 @@ into that gate (patterns that compile but crash at runtime), an artifact check
 (the files the task declared exist), a behavior audit (the task actually
 changed something relevant), and the final spec validation (the requirement is
 implemented). You can append your own check with `extra_gate`.
+For full product requests, Spiral also rejects production TODOs/placeholders,
+ceremonial tests, missing run instructions, unlabeled or non-exportable plots,
+and unreproducible simulations. A clean deterministic audit is evidence against
+these known failure classes, not a proof of subjective product quality.
 
 **Acceptance checks.** At spec time each requirement can get one shell command
 that exits 0 exactly when the requirement is met — run a test, invoke the CLI,
@@ -161,9 +167,10 @@ in stages rather than relying on the model to ask:
 1. the planner assigns relevant files to each task;
 2. a static symbol index (types, members, layout-id → binding class) rides the prompt;
 3. file paths named in build errors are added automatically;
-4. the worker can request more with `ASK: grep <name>` or `ASK: file <path>`;
-5. a repeated identical error triggers a repo search that returns the real definitions;
-6. a task that exhausts its attempts escalates to the stronger model.
+4. the worker can request files, web evidence, or a public GitHub reference repository;
+5. acquired repos are shallow, credential-free, commit/license recorded, and never executed;
+6. a repeated identical error triggers symbol and official-doc research;
+7. a task that exhausts its attempts escalates to the stronger model.
 
 **Learning across runs.** Every attempt is logged to `.spiral/ledger.jsonl`
 with the error signature it faced (normalized, so line numbers don't split
@@ -175,11 +182,115 @@ writes `.spiral/route.json`.
 
 **Safety.** Work happens on a `spiral/run-*` branch; you merge. The model's
 shell blocks destructive commands even in full-auto — `rm -rf`, `sudo`,
-`mkfs`, `dd`, `git push`, `git reset --hard` — and blocks `curl`/`wget`, so
-the worker has no network access. The only door to the web is the research
-module: GET-only, size-capped, fetched content treated as data, never as
-instructions. Ctrl-C stops cleanly; committed work is kept and `--resume`
-continues.
+`mkfs`, `dd`, `git push`, `git reset --hard` — and blocks raw `curl`/`wget`.
+The worker can still research the internet when it needs to: it may ask
+`ASK: web <query>`, and repeated gate failures trigger automatic web research.
+Those lookups go through the research module: GET-only, size-capped, saved under
+`.spiral/research/`, and treated as source material rather than instructions.
+It may also ask `ASK: repo <https://github.com/owner/repo>`; Builder records the
+exact commit, size, tree, README, and license in `.spiral/tools/`, does not run
+the clone, and removes partial/failed acquisitions. JavaScript and declarative
+Python dependencies are synchronized before gates in credential-scrubbed local
+caches. Package lifecycle hooks and Python source builds remain disabled unless
+`--allow-install-scripts` (or the matching config key) is explicitly enabled.
+For UI projects, `spiral build` also runs screenshot-based visual QA before the
+final spec audit: Playwright captures mobile, desktop, and wide views; DOM/runtime,
+keyboard, request, canvas-pixel, overflow, clipping, labeling, and target-size
+checks run before a local vision model reviews domain fit and visual craft. The
+Chromium runtime is installed automatically into a shared Spiral cache. Serious
+defects become ordinary gated remediation tasks. Ctrl-C
+stops cleanly; committed work is kept and `--resume` continues.
+
+The live cockpit includes a pinned `thoughts` panel above the plan. It shows an
+explicit working note: the current error, source lookup, candidate question,
+rejection reason, visual-review focus, or next decision. Press `t` during a TTY
+run to expand/collapse recent notes. The hash-chained decision trail is appended
+to `.spiral/thoughts.jsonl` for builds and `spiral-research/thoughts.jsonl` for
+research; `model-calls.jsonl` records the exact replayable prompts/evidence packets,
+final model outputs, routing, usage, whether deep reasoning was requested, and a
+length/hash (not the contents) of any private reasoning channel returned. These are
+auditable scientific records, not a claim to expose a model's private hidden chain of
+thought. Question discovery, angle selection, proposal critique, supervisor reflection,
+and the first paper referee use the deep-reasoning lane; citation and claim-row
+classification use the concise structured lane.
+
+`spiral research --solve` uses the same principle for papers: the model proposes,
+but SymPy/Lean/numeric/workbench certificates decide. Workbench certificates can
+run Python, Lean/Lake, Sage, Singular, Rust, Go, Julia, R, Java, Swift, and
+multi-step C/C++ compile/run bundles when those local toolchains are installed.
+Public GitHub repos are cloned only when `--auto-repos` or
+`research_repo_auto` is enabled; clones live inside the certificate workspace and
+are removed again when the certificate fails. On macOS, model-authored certificate
+commands run in an offline OS sandbox: user/volume data is unreadable except for the
+exact certificate and installed runtime roots, writes are confined to the certificate
+directory, and network sockets are denied. Dependency and Git acquisition happen
+beforehand as separate recorded operations; Python dependencies are restricted to a
+known research-package set, installed from binary wheels under a scrubbed environment.
+Failed execution output is sent only to a local repair model, even under `--api`. On platforms
+without an available OS sandbox the manifest says so explicitly; command screening
+alone is not presented as isolation.
+
+Data-driven Research uses a separate typed scientific-data broker rather than giving
+generated code a networked shell. It searches OpenNeuro, Allen, the curated neuromaps
+PET/brain-map registry, and Zenodo metadata,
+pins accessions/releases/licences/citations, resolves the complete selected file list
+and byte total, preserves a free-disk reserve, resumes partial downloads, hashes every
+file, and then hard-links immutable cached data into `_data/ALIAS` inside the offline
+certificate. A statistical analysis plan is locked before execution. Spatial nulls,
+multiple-testing policy, held-out validation, causal scope, participant linkage,
+coordinate-space registration and cross-species bridges are explicit gates. Exploratory
+analyses may guide the next round, but cannot earn confirmatory evidence or unlock a
+paper result.
+
+The default research mode is question discovery and bounded novelty, not forcing
+the literal prompt into a paper. A shared obligation graph carries user intent,
+questions, assumptions, falsifiers, claims, evidence, replications, novelty scope,
+and final artifacts through every phase. Its control flow is:
+
+1. Plan several independent search routes and retrieve primary text.
+2. Gate corpus readiness using relevant usable primary text (the same papers must
+   satisfy both tests), topic coverage, distinct healthy query families that
+   retrieved relevant records, and current citation-graph closure. Large graphs are
+   audited in deterministic 30-paper batches and cannot be called saturated until
+   every current seed has appeared in a healthy closed batch. Capture-recapture is
+   reported as a diagnostic, never treated as proof that the literature is complete.
+3. Rank search and reading actions by measured information gain, write
+   source-anchored notes across the corpus, cluster idea families, then deep-read
+   the strongest and nearest-prior papers.
+4. Generate candidate questions plus one-change counterfactuals (boundary cases,
+   singular limits, method transfers, and possible obstructions), search each
+   proposed novelty move, and reject candidates that are known, thin, or untestable.
+5. Use a transparent machine-local taste profile only to order admissible angles;
+   it never overrides source, novelty, or verification gates. Commit one bounded
+   question only after an exact-anchor basis audit and proposal
+   referee. "Our documented search did not locate X" is allowed; an unsupported
+   "X is the first" is not.
+6. Derive self-contained claims with assumptions and falsifiers. After the first
+   certificate passes, give a different local model a blinded brief without the
+   original proof/code/output and require a method-distinct qualifying replication.
+7. Issue a signed novelty-boundary certificate containing the exact claim scope,
+   queries, source health, nearest results, primary-text reads, date, and the explicit
+   warning that a bounded search is not proof of global absence or priority.
+8. Recheck prior art, run supervisor reflection, and either loop, stop on a
+   observable plateau, or enter writing only when the completion gate is green.
+9. Infer a corpus-conditioned paper blueprint, notation table, equation map, and
+   vocabulary guide; draft sections; then gate coherence, exact citation support,
+   claim scope, final semantic review, abstract-last consistency, and a fresh
+   reproducible LaTeX compile.
+10. Release a proof-carrying paper whose sentence-level claims point to evidence,
+    checkpoint the full lineage in a private research Git object database, and write
+    a living-paper manifest that reopens literature/novelty obligations when local
+    evidence changes or the recheck horizon expires.
+
+Reasoning and rendering are separate lanes in the writer. Thinking calls choose the
+outline, adjudicate evidence, and issue referee decisions; bounded non-thinking calls
+apply a specified full-text transformation so hidden deliberation cannot consume the
+entire output allowance. Every late rewrite is transactional: it replaces the last
+green draft only after structure, citation, and claim-scope audits all pass again.
+
+No finite search can prove open-world novelty. The run therefore preserves the
+databases, queries, dates, source hashes, exact anchors, rejected angles, and
+coverage report needed to state exactly what was and was not established.
 
 **Models.** Each role can be set to any Ollama model:
 
@@ -187,7 +298,8 @@ continues.
 |---|---|---|
 | worker / planner | `qwen3.6:latest` (MoE, ~3B active) | plans and implements tasks |
 | escalation | `qwen3.6:27b` (dense) | retries a task the worker could not finish |
-| critic / validator / designer | `qwen3.6:27b`, thinking | reviews the plan, validates the spec, writes the design brief; runs on a different model than the worker |
+| critic / validator / designer | `qwen3.6:latest`, thinking | ordinary reviews without a model swap; difficult semantic audits escalate to the dense model |
+| research auditor | `qwen3.6:27b` (dense) | independent basis, claim-scope, and paper adjudication; remains local under `--boost`/`--api` |
 | janitor | `llama3.2:1b` | summarizes attempt history to keep prompts short |
 
 ## <img src="https://raw.githubusercontent.com/edtireli/spiral/main/assets/mark.svg" width="21" alt=""/> Commands
@@ -199,6 +311,12 @@ continues.
 | `spiral build --approve` | print the plan and wait for confirmation before running |
 | `spiral build --boost` | local worker; escalation and critic/validator on the configured API provider |
 | `spiral build --api` | run the entire crew on the configured API provider |
+| `spiral build --visual-url URL` | screenshot this URL for local vision-model UI review |
+| `spiral build --vision-model MODEL` | use a specific Ollama vision model for UI review |
+| `spiral build --no-visual-review` | disable screenshot + vision UI review for one build |
+| `spiral build --auto-repos` | allow credential-free public GitHub reference acquisition (default) |
+| `spiral build --no-auto-repos` | disable public GitHub reference acquisition |
+| `spiral build --allow-install-scripts` | permit third-party package lifecycle/source-build code for one build |
 | `spiral plan "goal"` | show the decomposition without running it |
 | `spiral validate` | check existing code against the goal's spec (read-only) |
 | `spiral do "task" --verify "cmd"` | run a single task against one verify command |
@@ -213,6 +331,20 @@ continues.
 | `spiral style [name]` | set the banner shape: `spiral`, `galaxy`, or `uzumaki` |
 | `spiral search "query"` | fast ranked web results, no synthesis (`--sci` adds arXiv) |
 | `spiral research "query"` | gather web/arXiv/PubMed sources and synthesize a cited answer (`--deep`, `--sci`) |
+| `spiral research "topic" --solve` | iterative novelty loop: gather corpus, snowball citations, verify claims, write paper |
+| `spiral research --solve --resume` | resume an interrupted research loop |
+| `spiral research --solve --refresh` | reopen a completed living paper for evidence and literature refresh |
+| `spiral research --solve --verification` | force literal verification-note mode instead of novelty mode |
+| `spiral research --solve --auto-repos` | allow public GitHub repos in workbench certificates, with failure cleanup |
+| `spiral research --solve --no-blind-replication` | explicitly disable the default blind-replication gate |
+| `spiral research --solve --no-counterfactuals` | disable neighboring-hypothesis generation |
+| `spiral research --solve --no-research-git` | disable the private research checkpoint store |
+| `spiral research --solve --token-budget N` | set an explicit run token ceiling; local runs otherwise have no implicit token limit |
+| `spiral research --graph` | render an existing `spiral-research/research-map.json` to `research-graph.html` |
+| `spiral research --history` | show the private content-addressed research checkpoint lineage |
+| `spiral research --audit` | verify obligation/event chains, novelty boundary, proof bundle, and living-paper freshness |
+| `spiral research --taste-like "angle"` | teach the machine-local taste profile a research direction you value |
+| `spiral research --taste-dislike "angle"` | teach the machine-local taste profile a direction to de-emphasize |
 | `spiral chat ["message"]` | talk to the local thinking model; reasoning shown dimmed |
 | `spiral consult ["question"]` | send the whole project to a big-context API model for review |
 
@@ -221,6 +353,7 @@ continues.
 During a run:
 
 - **⇧ Tab** — switch between `auto` and `step` mode; the current mode is shown in the status line.
+- **t** — expand/collapse the pinned recent-decisions panel.
 - **step mode** — pause at each task: `enter` to run it, `s` to skip, `a` to return to auto, `q` to stop.
 - **Ctrl-C** — stops cleanly. Committed work is kept and `--resume` continues from there.
 
@@ -239,10 +372,39 @@ and can be edited directly:
 
 ```json
 {
-  "models":     { "worker": "qwen3.6:latest", "critic": "qwen3.6:27b" },
+  "models":     { "worker": "qwen3.6:latest", "critic": "qwen3.6:latest", "escalation": "qwen3.6:27b", "research_auditor": "qwen3.6:27b" },
   "num_ctx":    { "qwen3.6:latest": 28672, "qwen3.6:27b": 57344 },
   "extra_gate": "ktlint app/src",
   "diversity_samples": 3,
+  "visual_review": true,
+  "visual_review_url": "",
+  "vision_model": "qwen3.6:35b-a3b",
+  "builder_repo_auto": true,
+  "builder_repo_budget": 3,
+  "builder_repo_max_mb": 500,
+  "builder_allow_install_scripts": false,
+  "finish_rounds": 4,
+  "research_repo_auto": false,
+  "research_repo_budget": 1,
+  "research_repo_max_mb": 750,
+  "research_data_auto": true,
+  "research_data_catalog_limit": 18,
+  "research_data_max_gb": 20,
+  "research_data_reserve_gb": 8,
+  "research_data_file_limit": 20000,
+  "research_data_sources": ["openneuro", "allen", "neuromaps", "zenodo"],
+  "research_notes_model": "qwen3.6:latest",
+  "research_search_results_per_query": 8,
+  "research_reading_limit": 60,
+  "research_deep_read_limit": 8,
+  "research_blind_replication": true,
+  "research_replication_attempts": 2,
+  "research_counterfactuals": true,
+  "research_information_scheduler": true,
+  "research_plateau_patience": 8,
+  "research_git": true,
+  "research_living_papers": true,
+  "research_living_recheck_days": 30,
   "providers": {
     "kimi-k3": { "base_url": "https://api.moonshot.ai/v1", "api_key_env": "MOONSHOT_API_KEY" }
   },
@@ -257,6 +419,35 @@ and can be edited directly:
 - `extra_gate` — a command appended to every task's gate. If it exits non-zero, the task is not complete.
 - `diversity_samples` — candidates in the best-of-N round at the worker lane's exit (default 3, max 5, 0 disables).
 - `providers` — OpenAI-compatible endpoints, keyed by model id. Any role set to one of these ids is served by that endpoint instead of Ollama. The API key is read from the environment variable named in `api_key_env` and never written to disk. `--boost` and `--api` remap roles onto the first provider; without them everything runs local.
+- `run_token_budget` — safety ceiling used automatically when a main research role is metered. It is not applied to an all-local research run unless `--token-budget` is supplied explicitly; wall time, RAM, and disk remain real costs.
+- `visual_review` — enables screenshot-based UI review for web/static UI targets. Set `visual_review_url`, `.spiral/visual_url`, or `SPIRAL_VISUAL_URL` when the app needs a specific running URL.
+- `builder_repo_*` — controls credential-free, non-executing public GitHub reference acquisition. Failed and oversized clones are removed.
+- `builder_allow_install_scripts` — permits package lifecycle hooks and Python source builds. The default false still installs npm/pnpm/yarn/bun dependencies with hooks disabled and Python dependencies from binary wheels.
+- `finish_rounds` — bounds the final product/visual/runtime/spec fixed-point loop (default 4); exact repeated evidence stops it early.
+- `research_repo_auto` — lets research workbench certificates clone public GitHub repos into their local certificate directory. The default is false; `--auto-repos` enables it for one run.
+- `research_data_*` — controls typed public catalog discovery and scientific-data
+  acquisition. Limits are checked against the resolved selection before transfer;
+  zero-trust model execution remains offline.
+- `research_notes_model` — optional local model for broad per-paper reading notes. If unset, research uses the local worker model even when `--api` routes the main reasoning roles to an API provider.
+- `research_search_results_per_query` — breadth requested from each independent keyword route before citation-graph expansion (default 8).
+- `research_reading_limit` / `research_deep_read_limit` — cap broad paper notes and later zoom-in reads so long corpora stay context-manageable.
+- `research_blind_replication` / `research_replication_attempts` — require a
+  solution-hidden, method-distinct independent certificate for every required
+  original-research claim and bound its regeneration attempts.
+- `research_counterfactuals` — probes source-adjacent boundary cases, changed
+  assumptions, method transfers, and no-go routes before committing an angle.
+- `research_information_*` / `research_plateau_patience` — rank actions and stop
+  only from observed retrieval yield, health, redundancy, coverage, and sustained
+  lack of qualifying evidence.
+- `research_git` — records metadata, notes, decisions, certificates, audits, and
+  papers in `spiral-research/.research-git` without touching an enclosing Git repo.
+- `research_living_papers` / `research_living_recheck_days` — hash the completed
+  evidence envelope and reopen it after local drift or the literature recheck horizon.
+- `research_min_*` coverage settings — deterministic lower bounds for papers,
+  usable text, relevant papers, independent query families, lexical topic
+  coverage, grounded notes/deep reads, and citation-graph health. They are
+  stopping criteria for this documented protocol, not estimates of universal
+  literature completeness.
 - `hooks` — commands run on the events `task_green`, `blocked`, `run_complete`, and `spec_green`. `$SPIRAL_EVENT` and `$SPIRAL_INFO` are set in the environment.
 
 ## <img src="https://raw.githubusercontent.com/edtireli/spiral/main/assets/mark.svg" width="21" alt=""/> Project knowledge
@@ -289,10 +480,39 @@ Everything a run decides or learns is written to `.spiral/` in the target repo:
 |---|---|
 | `plan.json` · `state.json` · `spec.json` | goal, task graph, run state, requirements + checks |
 | `ledger.jsonl` | every model call and attempt: tokens, tok/s, edits, verify exit, error signature |
+| `thoughts.jsonl` | visible decision log behind the pinned `thoughts` panel |
 | `validation.json` · `route.json` | latest per-requirement verdicts · signature routing table |
 | `design.md` · `design_tokens.json` | the design brief and its tokens (UI projects) |
+| `product-audit.json` | deterministic scaffold/test/delivery/plot/simulation finish checks |
+| `visual-review/` | three-viewport screenshots, DOM/runtime audits, manifests, and vision reports |
+| `dependency-cache/` · `tools/` | dependency manifests/caches · inspected public repos with commit/license records |
 | `skills/learned-fixes.md` | fixes distilled from escalation wins |
 | `scratch/` | reasoning transcripts, last raw reply, last failure |
+
+`spiral research --solve` writes its own run directory (`spiral-research/` by
+default): `research-map.json`, `research-map.md`, and `research-graph.html`
+show both the search/citation frontier and a switchable reasoning/obligation layer;
+the HTML graph supports wheel zoom, drag pan, fit reset, search highlighting, and
+double-click focus; `journal.md` records every round;
+`thoughts.jsonl` and `model-calls.jsonl` preserve the explicit decision and model-call records;
+`coverage-latest.json` records every corpus gate and its evidence;
+`notes/papers/` holds cached per-paper reading notes; `notes/deep/` holds
+zoomed-in notes for papers selected by idea families; `notes/idea-families-*.json`
+records the candidate research-question families; `counterfactuals/` records
+one-change neighboring hypotheses; `epistemic/` contains the obligation graph and
+its hash-chained mutation log; `strategy/` contains information-gain and transparent
+taste records; `.research-git/` stores private checkpoints; `certificates/` holds
+environment-locked executable analyses, manifests, and blind replications;
+`data/catalog.json`, `data/plans/`, `data/cache/`, and `data/runs/` hold catalog
+results, preregistered contracts, hashed source data, and provenance manifests;
+`novelty-boundary.json`
+scopes the literature claim; `writeup/style-guide.md`,
+`writeup/writing-blueprint.md`, notation/equation/vocabulary maps,
+`writeup/paper-audit.json`, `body-latest.tex`, and `paper.tex` show how the final
+paper was structured and checked. `writeup/proof-carrying-manifest.json` maps paper
+claims and artifacts to hashes/evidence; `living-paper.json` defines refresh rules.
+Failed writing attempts retain these artifacts
+instead of disappearing behind a generic model error.
 
 ## <img src="https://raw.githubusercontent.com/edtireli/spiral/main/assets/mark.svg" width="21" alt=""/> Principles
 

@@ -6,10 +6,12 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from spiral.agent import _blocks_key  # noqa: E402
+from spiral.agent import SYSTEM, Atom, TaskSpec, _blocks_key  # noqa: E402
 from spiral.edits import EditBlock  # noqa: E402
 
 
@@ -36,6 +38,34 @@ def test_block_order_matters():
     one = EditBlock("m.py", "a", "b")
     two = EditBlock("m.py", "c", "d")
     assert _blocks_key([one, two]) != _blocks_key([two, one])
+
+
+def test_worker_protocol_allows_web_ask():
+    assert "ASK: web <focused search query>" in SYSTEM
+    assert "ASK: repo <public GitHub URL>" in SYSTEM
+
+
+def test_web_research_fetches_and_persists():
+    from spiral import research
+
+    orig_search, orig_fetch = research.search, research.fetch
+    try:
+        research.search = lambda q, k=5: [
+            research.Hit("Library migration guide", "https://example.test/guide", "upgrade snippet")
+        ]
+        research.fetch = lambda url: "Use the new frobnicate(options={}) API and update imports."
+        d = Path(tempfile.mkdtemp())
+        atom = Atom(d)
+        txt = atom._web_research(
+            "frobnicate TypeError official docs",
+            task=TaskSpec("fix frobnicate", "python -m pytest -q"),
+            verify_out="TypeError: frobnicate() got an unexpected keyword",
+        )
+        assert "WEB RESEARCH" in txt and "frobnicate(options={})" in txt
+        saved = list((d / ".spiral" / "research").glob("*.md"))
+        assert saved and "Library migration guide" in saved[0].read_text()
+    finally:
+        research.search, research.fetch = orig_search, orig_fetch
 
 
 def _run() -> int:

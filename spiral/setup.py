@@ -87,9 +87,20 @@ def main() -> int:
         c.print("    [dim]ollama serve[/]\n  then re-run [bold]spiral setup[/].\n")
         return 1
 
-    ram = _ram_gb()
     have = _installed_models()
-    tier, crew = pick_crew(ram)
+    ram = _ram_gb()
+    # A tuned/user-selected crew is authoritative. Re-running setup must never
+    # silently replace a working newer model stack with the generic RAM preset.
+    if CONFIG_PATH.is_file():
+        tier = "configured"
+        crew = {
+            "worker": cfg.worker.name,
+            "escalation": cfg.escalation.name,
+            "critic": cfg.critic.name,
+            "janitor": cfg.janitor.name,
+        }
+    else:
+        tier, crew = pick_crew(ram)
     c.print(f"  detected [bold]{ram:.0f} GB[/] RAM → recommended crew: [bold {CLAY}]{tier}[/]\n")
     for role, model in crew.items():
         present = model in have

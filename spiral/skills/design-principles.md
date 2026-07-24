@@ -1,66 +1,59 @@
 ---
 name: design-principles
-description: Universal product design craft — typography scale, spacing systems, color tokens, hierarchy, component states, motion, empty states, microcopy. Use for any task that creates or styles UI, screens, layouts, themes, or user-facing text.
+description: Domain-adaptive product design craft for complete UI, visualization, and interaction work.
 ---
-# Design principles (implement, don't decorate)
+# Product design craft
 
-## Typography
-- ONE typeface family per voice. Two voices max (e.g. sans for humans, mono for
-  systems). Never three.
-- Build a scale, don't pick sizes ad hoc: base 16, then ×1.25 steps → 12 / 16 /
-  20 / 25 / 31. Round to whole units. Every text element uses a scale step.
-- Two weights only: regular (400) and medium/semibold (500-600). Bold everything
-  = bold nothing.
-- Line height: 1.4-1.6 body, 1.1-1.2 headings. Long text lines max ~70 chars.
+## Start with the work
+- Build the actual usable product as the first screen, not a landing page, feature tour,
+  or decorative dashboard. Identify the repeated primary workflow and make it efficient.
+- Match the domain. Operational tools are quiet, dense, predictable, and easy to scan;
+  consumer and creative products may be more expressive. Do not impose one house style.
+- Complete the surrounding experience: navigation, real data, persistence when relevant,
+  settings that matter, recovery, and loading/empty/error/offline states. No dead controls,
+  fake results, lorem ipsum, or “coming soon” surfaces.
 
-## Spacing — the 4/8 grid
-- Every margin/padding/gap is a multiple of 4 (prefer 8): 4, 8, 12, 16, 24, 32, 48.
-- Related things sit CLOSER than unrelated things — grouping is spacing, not boxes.
-- Generosity reads as quality: when unsure, add 50% more whitespace than feels
-  necessary. Cramped = cheap.
-- Touch targets ≥ 44-48px. Screen gutters 16-24.
+## Composition
+- Use full-width bands or unframed layouts for page structure. Cards are for repeated
+  items, modals, or genuinely framed tools; never put cards inside cards.
+- Give each view one clear primary action. Use grouping, alignment, and space before
+  borders or boxes. Keep headings proportional to their container.
+- Define stable grids, min/max widths, aspect ratios, and control dimensions. Test mobile,
+  desktop, and wide screens; text, plots, canvases, and controls must not overlap or clip.
 
-## Color — tokens, not hexes-in-place
-- Define tokens once (bg / surface / raised / accent / text-primary / text-secondary
-  / success / danger / warning), reference tokens everywhere. A hex in a component
-  is a bug.
-- ONE accent color. Semantic colors (green/red/amber) are reserved for MEANING —
-  never decoration. If everything is colored, nothing is.
-- Dark themes: never pure black (#0A0A0A floor) or pure white text (#F5F5F5 cap);
-  elevation = lighter surface, not shadows.
-- Contrast: body text ≥ 4.5:1 against its surface, large text ≥ 3:1. Check, don't eyeball.
+## Type, color, and space
+- Use one type family per voice, two voices at most, a restrained fixed scale, and normal
+  letter spacing. Body line height 1.4-1.6 and long lines about 55-75 characters.
+- Use a 4/8 spacing system and minimum 44px interaction targets. Related items are closer
+  than unrelated ones; density follows the task rather than a blanket “more whitespace”.
+- Define semantic tokens once. Use a balanced neutral foundation, restrained brand colors,
+  and success/warning/danger only for meaning. Verify 4.5:1 body contrast.
+- Avoid generic purple-blue gradients, beige/brown monotones, one-hue palettes,
+  glassmorphism, decorative blobs, and arbitrary shadows.
 
-## Hierarchy — one king per screen
-- Every screen has exactly ONE primary action, visually loudest. Secondary actions
-  are quieter (outline/ghost). Destructive actions are never the loudest.
-- The eye path should be F- or Z-shaped: title → key content → action.
-- If everything is emphasized, the screen has no design — remove emphasis until
-  only the essentials carry it.
+## Controls and states
+- Use familiar icons from the project’s icon library for compact commands, with tooltips
+  for unfamiliar meanings. Use tabs for views, segmented controls for modes, toggles for
+  binary settings, sliders/steppers for bounded numbers, and menus for option sets.
+- Implement default, hover/focus, pressed, disabled, loading, success, empty, error, and
+  offline states where relevant. Keep loading feedback in place so layout never jumps.
+- Keyboard order, visible focus, labels, reduced motion, and screen-reader names are part
+  of the feature, not cleanup.
 
-## States — every component has five
-Design ALL of them, not just the happy one:
-1. default · 2. hover/focus (visible focus ring) · 3. active/pressed ·
-4. disabled (reduced opacity, no color shift) · 5. loading (skeleton or spinner
-IN PLACE — layout never jumps).
-Plus screen-level: EMPTY state (explain + point to first action, never a blank
-void) and ERROR state (say what happened + what to do, never just "error").
+## Assets and data
+- Use real, inspectable product imagery, maps, media, diagrams, or domain objects. Do not
+  hide the subject behind dark crops, atmospheric stock, or decorative SVG substitutes.
+- Plots need units, uncertainty where applicable, legends or direct labels, distinctions
+  beyond color, inspectable values, responsive framing, empty-data behavior, and export of
+  both figure and data.
 
-## Motion — physics, not decoration
-- Durations: micro-feedback 100-150ms, transitions 200-300ms, attention 400-600ms.
-  Nothing over 800ms, ever.
-- Ease-out for entrances (fast start, gentle stop), ease-in for exits. Linear only
-  for continuous progress.
-- Animate at most 2 properties at once. Every animation must answer "what did
-  this teach the user?" — if nothing, delete it.
-- Loading feels deliberate at 1.5-3s of animated progress; instant feels fake,
-  >6s feels broken (show real progress).
+## Motion and language
+- Motion must explain a state change: 100-150ms for micro feedback, 200-300ms for
+  transitions, reduced-motion fallback, and no animation that blocks work.
+- Buttons say what they do. Errors state what happened and the recovery action. Do not add
+  visible prose that explains the interface itself.
 
-## Microcopy
-- Buttons say what they DO ("Send message", not "OK"/"Submit").
-- The product has ONE voice — pick it (formal, playful, deadpan) and never break it.
-- Errors: what happened + what to do next, in the product's voice, no codes-only.
-
-## The restraint law
-Great design is deletion. For every element ask: does removing it lose meaning?
-If no — remove it. Borders can be spacing. Backgrounds can be nothing. Icons
-next to labels are usually noise. Ship the version with less.
+## Finish gate
+Exercise the real primary workflow at mobile, desktop, and wide sizes. Reject overlap,
+clipping, blank canvases, broken assets, dead routes, placeholder content, inaccessible
+controls, and a visually polished shell around incomplete behavior.

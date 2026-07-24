@@ -52,20 +52,21 @@ _CAS_BINARIES = {
     "maxima": "maxima",
     "pari": "gp",
 }
+_LEAN_HEALTHY: bool | None = None
 
 
 def detect_backends() -> list[str]:
     """Verification backends available on this machine, strongest first. ``sympy`` and
     ``numeric`` are always present (pure Python); the rest appear iff their binary does."""
     have = []
-    if _lean_exe():                                   # PATH or an elan install
+    if lean_available():                              # PATH/elan and a responsive toolchain
         have.append("lean")
     have += [b for b in ("wolfram", "sage", "maxima", "pari") if shutil.which(_CAS_BINARIES[b])]
     return have + ["sympy", "numeric"]
 
 
 # ── sympy helpers ────────────────────────────────────────────────────────────
-def _sympify(expr: str):
+def _sympify(expr: str, local_dict: dict | None = None):
     """Parse a claim expression. Python/`sympy` syntax; LaTeX is accepted when the
     optional parser (antlr) is installed, else the caller gets a clear error."""
     import sympy as sp
@@ -78,7 +79,78 @@ def _sympify(expr: str):
             return parse_latex(s)
         except Exception:
             pass                                     # fall through to sympify
-    return sp.sympify(s)
+    try:
+        from sympy.parsing.sympy_parser import (
+            convert_xor,
+            implicit_multiplication_application,
+            parse_expr,
+            standard_transformations,
+        )
+        transformations = standard_transformations + (convert_xor, implicit_multiplication_application)
+        return parse_expr(s, local_dict=local_dict, transformations=transformations)
+    except Exception:
+        return sp.sympify(s, locals=local_dict)
+
+
+def _poly_context(variables: list[str] | tuple[str, ...]):
+    """Create an ordered exact polynomial context for certificate checks."""
+    import sympy as sp
+    names = [str(v).strip() for v in variables or [] if str(v).strip()]
+    if not names:
+        raise ValueError("polynomial certificate needs explicit variables")
+    syms = tuple(sp.symbols(" ".join(names), seq=True))
+    local = {n: s for n, s in zip(names, syms)}
+    local.update({"I": sp.I, "pi": sp.pi})
+    return syms, local
+
+
+def _expr_list(items: list, local: dict | None = None) -> list:
+    return [_sympify(str(x), local) for x in (items or [])]
+
+
+def _is_zero_expr(expr) -> bool:
+    import sympy as sp
+    return sp.simplify(expr) == 0
+
+
+def _normal_basis(gens: list, variables: list[str], order: str = "lex") -> list:
+    """Reduced Groebner basis expressions, used as a canonical certificate form."""
+    import sympy as sp
+    syms, local = _poly_context(variables)
+    exprs = [sp.expand(e) for e in _expr_list(gens, local) if not _is_zero_expr(e)]
+    if not exprs:
+        return []
+    G = sp.groebner(exprs, *syms, order=order)
+    out = []
+    for p in G.polys:
+        poly = sp.Poly(p.as_expr(), *syms)
+        try:
+            expr = poly.monic().as_expr()
+        except Exception:
+            lc = poly.LC()
+            expr = sp.cancel(poly.as_expr() / lc) if lc else poly.as_expr()
+        out.append(sp.factor(expr))
+    return out
+
+
+def _basis_equal(a: list, b: list) -> bool:
+    return len(a) == len(b) and all(_is_zero_expr(x - y) for x, y in zip(a, b))
+
+
+def _reduce_mod(gens: list, expr, variables: list[str], order: str = "lex"):
+    import sympy as sp
+    syms, local = _poly_context(variables)
+    ideal = [sp.expand(g) for g in _expr_list(gens, local) if not _is_zero_expr(g)]
+    e = sp.expand(expr if hasattr(expr, "free_symbols") else _sympify(str(expr), local))
+    if not ideal:
+        return sp.simplify(e)
+    G = sp.groebner(ideal, *syms, order=order)
+    return sp.factor(G.reduce(e)[1])
+
+
+def _matrix(data: list, local: dict | None = None):
+    import sympy as sp
+    return sp.Matrix([[_sympify(str(x), local) for x in row] for row in data])
 
 
 def _free_symbols(*exprs):
@@ -151,11 +223,11 @@ def verify_identity(lhs: str, rhs: str, *, assume: dict | None = None) -> Verdic
         return Verdict(True, "sympy", "identity", detail="simplify(lhs - rhs) = 0")
     if sp.simplify(sp.nsimplify(d)) == 0:
         return Verdict(True, "sympy", "identity", detail="simplifies to 0 after nsimplify")
-    # symbolic engine couldn't close it, but many random points agree → likely true,
-    # honestly labelled as such rather than overclaimed.
-    return Verdict(True, "numeric", "identity",
-                   detail=f"unproven symbolically; {num.detail}",
-                   extra={"symbolic_residual": str(d)})
+    # Sampling can refute an identity, but surviving samples is never a proof.  Report an
+    # explicit inconclusive failure so the research loop cannot count it as established.
+    return Verdict(False, "numeric", "identity",
+                   detail=f"not refuted, but unproven symbolically; {num.detail}",
+                   extra={"symbolic_residual": str(d), "inconclusive": True})
 
 
 def verify_zero(expr: str) -> Verdict:
@@ -187,10 +259,50 @@ def verify_equal_numeric(lhs: str, rhs: str, *, tol: float = 1e-9) -> Verdict:
                    detail=f"|lhs - rhs| = {abs(d):.2e} {'≤' if ok else '>'} {tol:g}")
 
 
+def verify_groebner(generators: list, variables: list[str], basis: list | None = None,
+                    *, order: str = "lex") -> Verdict:
+    """Check a reduced Gröbner-basis certificate for a polynomial ideal."""
+    import sympy as sp
+
+    got = _normal_basis(generators, variables, order=order)
+    if basis is None:
+        return Verdict(True, "sympy", "groebner",
+                       detail=f"computed reduced Groebner basis with {len(got)} generators",
+                       extra={"basis": [str(g) for g in got], "order": order})
+    syms, local = _poly_context(variables)
+    want = [sp.factor(e) for e in _expr_list(basis, local)]
+    ok = _basis_equal(got, want)
+    return Verdict(ok, "sympy", "groebner",
+                   detail=f"reduced Groebner basis {'matches' if ok else 'does not match'} certificate",
+                   extra={"computed": [str(g) for g in got], "expected": [str(g) for g in want],
+                          "order": order})
+
+
+def verify_ideal_membership(expr: str, generators: list, variables: list[str],
+                            *, order: str = "lex") -> Verdict:
+    """Check whether ``expr`` reduces to zero modulo the ideal generated by ``generators``."""
+    _, local = _poly_context(variables)
+    rem = _reduce_mod(generators, _sympify(expr, local), variables, order=order)
+    ok = _is_zero_expr(rem)
+    return Verdict(ok, "sympy", "ideal_membership",
+                   detail=f"normal-form remainder is {rem}",
+                   extra={"remainder": str(rem), "order": order})
+
+
 # ── Lean formal-proof backend (gold standard, when a claim is a theorem) ──────
 def _lean_exe() -> str | None:
-    """Locate the ``lean`` binary — on PATH, or under an elan install."""
+    """Locate a responsive ``lean`` binary.
+
+    Prefer installed elan toolchain binaries over the elan shim. The shim can hang
+    while resolving ``stable`` or touching the network, even when an installed
+    toolchain works perfectly.
+    """
     import os
+    root = Path(os.path.expanduser("~/.elan/toolchains"))
+    if root.is_dir():
+        for cand in sorted(root.glob("*/bin/lean"), reverse=True):
+            if cand.is_file():
+                return str(cand)
     exe = shutil.which("lean")
     if exe:
         return exe
@@ -198,8 +310,31 @@ def _lean_exe() -> str | None:
     return str(cand) if cand.is_file() else None
 
 
+def lean_available(*, timeout: float = 5.0) -> bool:
+    """True only when Lean is installed *and* responds quickly.
+
+    An elan shim can exist while the toolchain is downloading, wedged, or blocked on
+    setup. In that state Lean must not be advertised as a verifier, otherwise every
+    theorem claim can burn the full proof timeout before falling back.
+    """
+    global _LEAN_HEALTHY
+    if _LEAN_HEALTHY is not None:
+        return _LEAN_HEALTHY
+    exe = _lean_exe()
+    if exe is None:
+        _LEAN_HEALTHY = False
+        return False
+    import subprocess
+    try:
+        p = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=timeout)
+        _LEAN_HEALTHY = p.returncode == 0 and bool((p.stdout + p.stderr).strip())
+    except Exception:
+        _LEAN_HEALTHY = False
+    return _LEAN_HEALTHY
+
+
 def prove_lean(statement: str, proof: str = "", *, imports: str = "",
-               timeout: float = 90.0) -> Verdict:
+               timeout: float = 30.0) -> Verdict:
     """Machine-check a Lean theorem. ``statement`` is the theorem signature (e.g.
     ``(n : Nat) : n + 0 = n``); ``proof`` is the tactic/term body (e.g. ``by simp``).
 
@@ -211,6 +346,8 @@ def prove_lean(statement: str, proof: str = "", *, imports: str = "",
     exe = _lean_exe()
     if exe is None:
         return Verdict(False, "lean", "theorem", detail="lean not installed")
+    if not lean_available():
+        return Verdict(False, "lean", "theorem", detail="lean installed but failed its health check")
     body = (proof or "by rfl").strip()
     if "sorry" in body:
         return Verdict(False, "lean", "theorem", detail="proof contains `sorry` (not a proof)")
@@ -236,6 +373,10 @@ _KINDS = {
     "zero": lambda c: verify_zero(c["expr"]),
     "solution": lambda c: verify_solution(c["equation"], c["var"], c["value"]),
     "numeric_equal": lambda c: verify_equal_numeric(c["lhs"], c["rhs"], tol=c.get("tol", 1e-9)),
+    "groebner": lambda c: verify_groebner(c["generators"], c["variables"],
+                                          c.get("basis"), order=c.get("order", "lex")),
+    "ideal_membership": lambda c: verify_ideal_membership(c["expr"], c["generators"],
+                                                          c["variables"], order=c.get("order", "lex")),
     "theorem": lambda c: prove_lean(c["statement"], c.get("proof", ""),
                                     imports=c.get("imports", "")),
 }
