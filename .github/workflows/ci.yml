@@ -18,11 +18,28 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - name: cache tectonic bundle (macos)
-        if: runner.os == 'macOS'
+      - name: install pinned tectonic (deterministic LaTeX toolchain)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            asset="tectonic-0.15.0-aarch64-apple-darwin.tar.gz"
+          else
+            asset="tectonic-0.15.0-x86_64-unknown-linux-musl.tar.gz"
+          fi
+          curl -fsSL --retry 3 --retry-delay 5 \
+            "https://github.com/tectonic-typesetting/tectonic/releases/download/tectonic%400.15.0/${asset}" \
+            -o tectonic.tar.gz
+          tar -xzf tectonic.tar.gz tectonic
+          sudo mv tectonic /usr/local/bin/tectonic
+          rm tectonic.tar.gz
+          tectonic --version
+      - name: cache tectonic bundle
         uses: actions/cache@v4
         with:
-          path: ~/Library/Caches/Tectonic
-          key: tectonic-bundle-${{ runner.os }}
+          path: |
+            ~/Library/Caches/Tectonic
+            ~/.cache/Tectonic
+          key: tectonic-bundle-${{ runner.os }}-0.15.0
       - run: pip install -e ".[dev]"
       - run: python -m pytest -q
