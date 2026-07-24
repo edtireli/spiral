@@ -290,3 +290,42 @@ def test_compile_pdf_tectonic_argv_shape(tmp_path, monkeypatch):
     assert argv[0] == "tectonic"
     assert argv[-1] == "paper.tex"
     assert "0" not in argv and "--synctex" not in argv
+
+
+def test_compile_pdf_retries_tectonic_on_bundle_flake(tmp_path, monkeypatch):
+    """A cold tectonic cache can flake on the CDN; one retry must recover, while a
+    deterministic TeX error must NOT be retried."""
+    import spiral.research_writer as rw
+
+    calls = {"n": 0}
+
+    def fake_which(name):
+        return "/fake/bin/tectonic" if name == "tectonic" else None
+
+    def flaky_run(argv, cwd=None, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return SimpleNamespace(returncode=1, stdout="",
+                                   stderr="error trying to connect: bundle https fetch failed")
+        (Path(cwd) / "paper.pdf").write_bytes(b"%PDF-1.4 fake")
+        (Path(cwd) / "paper.log").write_text("This is Tectonic")
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(rw.shutil, "which", fake_which)
+    monkeypatch.setattr(rw.subprocess, "run", flaky_run)
+    tex = tmp_path / "paper.tex"
+    tex.write_text("\\documentclass{article}\\begin{document}x\\end{document}")
+    pdf, error = rw.compile_pdf(tex)
+    assert calls["n"] == 2 and pdf is not None and not error
+
+    calls["n"] = 0
+
+    def tex_error_run(argv, cwd=None, **kw):
+        calls["n"] += 1
+        return SimpleNamespace(returncode=1, stdout="! Undefined control sequence.",
+                               stderr="")
+
+    monkeypatch.setattr(rw.subprocess, "run", tex_error_run)
+    (tmp_path / "paper.pdf").unlink(missing_ok=True)
+    pdf, error = rw.compile_pdf(tex)
+    assert calls["n"] == 1 and pdf is None and error
