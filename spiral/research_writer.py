@@ -1873,9 +1873,10 @@ def compile_pdf(tex_path: str | Path) -> tuple[Path | None, str]:
             "-pdflatex=pdflatex -no-shell-escape %O %S", tex_path.name,
         ]]
     elif shutil.which("tectonic"):
+        # --synctex is a bare flag on current tectonic; a "0" argument becomes a
+        # second INPUT and the whole compile dies with a usage error
         seq = [[
-            "tectonic", "--keep-logs", "--keep-intermediates",
-            "--synctex", "0", tex_path.name,
+            "tectonic", "--keep-logs", "--keep-intermediates", tex_path.name,
         ]]
     elif shutil.which("pdflatex"):
         pdflatex = [

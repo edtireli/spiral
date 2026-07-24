@@ -260,3 +260,33 @@ def test_api_flag_requires_and_injects_key(monkeypatch, capsys):
     _apply_tier(cfg, Console(), "api", api_key="sk-refine-test")
     assert os.environ.get("SPIRAL_TEST_KEY_ENV") == "sk-refine-test"
     assert cfg.critic.name == "kimi-k3"
+
+
+def test_compile_pdf_tectonic_argv_shape(tmp_path, monkeypatch):
+    """CI regression: tectonic's --synctex is a bare flag; a stray '0' becomes a
+    second INPUT and every compile dies with a usage error."""
+    import spiral.research_writer as rw
+
+    captured = {}
+
+    def fake_which(name):
+        return "/fake/bin/tectonic" if name == "tectonic" else None
+
+    class R:
+        returncode = 1
+        stdout = ""
+        stderr = "forced stop"
+
+    def fake_run(argv, **kw):
+        captured.setdefault("argv", argv)
+        return R()
+
+    monkeypatch.setattr(rw.shutil, "which", fake_which)
+    monkeypatch.setattr(rw.subprocess, "run", fake_run)
+    tex = tmp_path / "paper.tex"
+    tex.write_text("\\documentclass{article}\\begin{document}x\\end{document}")
+    rw.compile_pdf(tex)
+    argv = captured["argv"]
+    assert argv[0] == "tectonic"
+    assert argv[-1] == "paper.tex"
+    assert "0" not in argv and "--synctex" not in argv

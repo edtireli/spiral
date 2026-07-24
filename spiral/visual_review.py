@@ -742,7 +742,7 @@ def _capture(url: str, out_dir: Path, *, timeout_ms: int = 30_000,
                 except Exception:
                     pass
                 page.wait_for_timeout(700)
-                audit = page.evaluate("""() => {
+                audit = page.evaluate(r"""() => {
                   const visible = (el) => {
                     const s = getComputedStyle(el), r = el.getBoundingClientRect();
                     return s.display !== 'none' && s.visibility !== 'hidden' &&
