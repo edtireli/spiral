@@ -560,7 +560,7 @@ def test_writer_detects_repeated_sections_and_never_accepts_stale_pdf(tmp_path):
     )
     tex = build_document("Compile gate", "A valid abstract.", clean_body, [], tmp_path)
     pdf, error = compile_pdf(tex)
-    assert pdf and not error
+    assert pdf and not error, f"clean document failed to compile: {error[-600:]}"
     tex.write_text("\\documentclass{article}\\begin{document}\\badcommand")
     pdf, error = compile_pdf(tex)
     assert pdf is None and error and not (tmp_path / "paper.pdf").exists()

@@ -1893,20 +1893,34 @@ def compile_pdf(tex_path: str | Path) -> tuple[Path | None, str]:
         return None, ""
     logs = []
     failed = False
-    for cmd in seq:
-        try:
-            r = subprocess.run(
-                cmd, cwd=d, capture_output=True, text=True, timeout=180,
-                stdin=subprocess.DEVNULL,
-            )
-            logs.append(r.stdout + r.stderr)
-            if r.returncode != 0:
-                failed = True
-                break
-        except Exception as e:
-            logs.append(str(e))
-            failed = True
-            break
+
+    def _run_seq() -> bool:
+        for cmd in seq:
+            # tectonic's first-ever run downloads its TeX bundle over the network —
+            # give it room; a compile with a warm cache never needs this long
+            step_timeout = 600 if cmd[0] == "tectonic" else 180
+            try:
+                r = subprocess.run(
+                    cmd, cwd=d, capture_output=True, text=True, timeout=step_timeout,
+                    stdin=subprocess.DEVNULL,
+                )
+                logs.append(r.stdout + r.stderr)
+                if r.returncode != 0:
+                    return True
+            except Exception as e:
+                logs.append(str(e))
+                return True
+        return False
+
+    failed = _run_seq()
+    if failed and seq and seq[0][0] == "tectonic":
+        joined = "\n".join(logs).lower()
+        # cold-start bundle fetches flake (CDN warm-up, transient 5xx); a real TeX
+        # error is deterministic — retry once only on infrastructure signatures
+        if any(sig in joined for sig in ("bundle", "https", "connect", "network",
+                                         "timed out", "cache")):
+            logs.append("[retrying tectonic once: transient bundle/network failure]")
+            failed = _run_seq()
     log = "\n".join(logs)
     pdf = d / f"{stem}.pdf"
     final_log_path = d / f"{stem}.log"

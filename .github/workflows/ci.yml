@@ -18,5 +18,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
+      - name: cache tectonic bundle (macos)
+        if: runner.os == 'macOS'
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/Tectonic
+          key: tectonic-bundle-${{ runner.os }}
       - run: pip install -e ".[dev]"
       - run: python -m pytest -q
