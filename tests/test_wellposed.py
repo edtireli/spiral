@@ -6,6 +6,8 @@ Fourteen of the fifteen cells in its table vanished by dimension alone, two of i
 "distinct" cosets were the same space, and it spent an hour on it — having already
 written the warning down and proceeded anyway.
 """
+import pytest
+
 from spiral.wellposed import (
     Issue, canonical_space, check_cohomology_claims, check_distinct_objects,
     check_method_fit, coset_dim, lie_dim, precheck, report,
@@ -149,3 +151,22 @@ def test_loop_rejects_ill_posed_angles_and_keeps_good_ones():
     assert [a["question"] for a in kept] == [good["question"]]
     assert bad["_wellposed"]["blocked"] is True
     assert "feedback" in bad["_wellposed"]      # the model is told why
+
+
+@pytest.mark.parametrize("spelling", [
+    "SU(3)/SU(2)xU(1)", "su(3)/su(2)+u(1)", "SU(3)/SU(2)⊕U(1)",
+    r"SU(3)/SU(2)\oplus U(1)", "SU(3) / SU(2) x U(1)",
+])
+def test_a_subgroup_written_as_a_sum_is_the_same_subgroup(spelling):
+    """One proposal writes the coset both ways — SU(3)/SU(2)xU(1) in its prose and
+    su(3)/su(2)+u(1) in its check plan. Splitting only on `x` left the sum spelling
+    dimensionless, so its degree check never fired and the two names for CP^2 were
+    remembered as two different spaces."""
+    assert coset_dim(spelling) == 4
+    assert canonical_space(spelling) == "CP^2"
+
+
+def test_the_sum_spelling_gets_the_same_verdict():
+    for text in ("H^5(su(3),su(2)+u(1);R)", "H^5(su(3),su(2)xu(1);R)"):
+        issues = check_cohomology_claims(text)
+        assert issues and issues[0].kind == "vacuous", text
