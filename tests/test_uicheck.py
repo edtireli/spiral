@@ -80,6 +80,38 @@ def _page(root: Path, equals: str) -> Path:
     return root
 
 
+# a modal backdrop nobody tore down. It covers the page without hiding anything,
+# so every control still reports visible and enabled while no click can land.
+VEIL = '<div id="veil" style="position:fixed;inset:0;background:rgba(0,0,0,.4)"></div>'
+
+# nine controls, all of them working, and enough labelled roles that every hazard
+# sequence fires — the shape of page on which the press count has to be honest
+WORKING_CALC = """<!doctype html><meta charset="utf-8">
+<div id="display">0</div>
+<button>7</button><button>8</button><button>9</button><button>0</button>
+<button>+</button><button>/</button><button>.</button>
+<button>=</button><button>C</button>
+<script>
+let buf = '', prev = null, op = null;
+function show(v) { document.getElementById('display').textContent = String(v); }
+function value() { return buf === '' ? '0' : buf; }
+for (const b of document.querySelectorAll('button')) {
+  b.addEventListener('click', () => {
+    const k = b.textContent;
+    if ('0123456789'.includes(k)) { buf += k; show(value()); return; }
+    if (k === '.') { if (!buf.includes('.')) buf = (buf || '0') + '.'; show(value()); return; }
+    if (k === 'C') { buf = ''; prev = null; op = null; show('0'); return; }
+    if (k === '+' || k === '/') { prev = parseFloat(value()); op = k; buf = ''; show('0'); return; }
+    const second = parseFloat(value());
+    if (op === null) { show(value()); return; }
+    if (op === '/' && second === 0) { show('Cannot divide by zero'); return; }
+    const out = op === '+' ? prev + second : prev / second;
+    show(String(out)); buf = String(out); prev = null; op = null;
+  });
+}
+</script>"""
+
+
 def test_forbidden_tokens_are_the_ones_that_are_never_designed():
     assert set(FORBIDDEN) == {"undefined", "null", "NaN", "[object Object]"}
 
@@ -149,6 +181,66 @@ def test_a_clean_page_reports_nothing(tmp_path):
     assert "pressed" in note
 
 
+
+
+def test_a_control_covered_by_an_overlay_is_reported_not_skipped(tmp_path):
+    """Playwright refuses a click for two distinct reasons and raises the same
+    TimeoutError for both. Recording only "outside of the viewport" meant the other
+    one — "<el> intercepts pointer events" — returned False and left no trace in any
+    serialised key: pass 1 skipped the control, pass 2 broke the hazard sequence
+    before "divide by zero" could render null, and the run reported zero issues.
+
+    A control that exists, is visible and enabled, and still cannot be clicked is
+    BROKEN either way. An un-torn-down backdrop is the ordinary way it happens."""
+    if not _playwright():
+        return
+    root = tmp_path / "veiled"
+    root.mkdir(parents=True)
+    (root / "index.html").write_text(CALC.format(equals=BROKEN_EQUALS) + VEIL)
+    issues, note = probe(root)
+    ids = {i["id"] for i in issues}
+    assert "runtime-blocked-controls" in ids, (
+        f"a page nothing can be clicked on passed clean (note: {note}, ids: {ids})")
+    blocked = next(i for i in issues if i["id"] == "runtime-blocked-controls")
+    assert blocked["severity"] == "major"
+    assert "veil" in blocked["evidence"], (
+        f"name the element swallowing the pointer: {blocked['evidence']}")
+
+
+def test_an_off_viewport_control_is_still_reported_as_unreachable(tmp_path):
+    """The two causes stay split. Off-viewport is a layout fault and blocked is a
+    stacking fault, and they get different fixes, so folding them into one bucket
+    would send the remediation task after the wrong thing."""
+    if not _playwright():
+        return
+    root = tmp_path / "offscreen"
+    root.mkdir(parents=True)
+    (root / "index.html").write_text(
+        '<p>ready</p><button style="position:fixed;left:-9999px;top:0">7</button>')
+    issues, _note = probe(root)
+    ids = {i["id"] for i in issues}
+    assert "runtime-unreachable-controls" in ids
+    assert "runtime-blocked-controls" not in ids, (
+        "an off-screen control is not blocked by something stacked over it")
+
+
+def test_the_press_count_covers_the_run_not_the_last_hazard_sequence(tmp_path):
+    """``trail`` was reassigned per hazard, so the serialised count described only
+    the final hazard sequence. A fully working nine-control page reported pressing
+    four. That count is the only human-visible signal this module emits when it
+    finds nothing, so a number that quietly shrinks to the last four clicks makes a
+    probe that never ran look identical to one that swept the whole page."""
+    if not _playwright():
+        return
+    root = tmp_path / "working"
+    root.mkdir(parents=True)
+    (root / "index.html").write_text(WORKING_CALC)
+    issues, note = probe(root)
+    assert issues == [], f"fixture is not clean: {[i['evidence'] for i in issues]}"
+    assert "pressed 9 control(s)" in note, note
+    for label in ("8", "9", "C"):
+        assert label in note, (
+            f"{label!r} was pressed in pass 1 but is missing from {note!r}")
 
 
 def test_a_page_whose_subject_is_data_is_not_punished(tmp_path):

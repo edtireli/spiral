@@ -83,8 +83,13 @@ def _sources(root: Path, suffix: str) -> list[Path]:
 
 # ---- python ------------------------------------------------------------------
 
+# the trailing \s*\( is load-bearing: without it the alternation matched a
+# framework name as a PREFIX, so `router = FastAPIRouter(...)`, the bare class
+# alias `AppClass = FastAPI` and even `defaults = StarletteConfigDefaults`
+# became smoke targets — and the smoke script calling a class as an ASGI app
+# reds the run rung with nothing for the worker to fix
 _ASGI = re.compile(
-    r"^\s*(\w+)\s*=\s*(?:FastAPI|Starlette|Quart|Sanic|FastAPI\s*\()", re.M)
+    r"^\s*(\w+)\s*=\s*(?:FastAPI|Starlette|Quart|Sanic)\s*\(", re.M)
 _WSGI = re.compile(r"^\s*(\w+)\s*=\s*(?:Flask|Bottle)\s*\(", re.M)
 _ENTRY_NAMES = ("main.py", "app.py", "server.py", "api.py", "cli.py", "__main__.py")
 
@@ -129,6 +134,12 @@ def python_app_targets(root: Path) -> list[dict]:
     """ASGI/WSGI application objects, as ``{module, attr, kind}`` records."""
     targets: list[dict] = []
     for path in _sources(root, ".py"):
+        rel = path.relative_to(root)
+        # same exclusion as python_entry_modules: a FastAPI() built as a test
+        # fixture is not the project's app, and the smoke script importing a
+        # test module outside pytest runs its import-time side effects
+        if rel.parts[0] in {"tests", "test"} or path.name.startswith("test_"):
+            continue
         try:
             text = path.read_text(errors="replace")
         except OSError:
@@ -332,6 +343,7 @@ sys.exit(1 if failed else 0)
 # ---- web --------------------------------------------------------------------
 
 JS_PARSE_SCRIPT = r"""// Parse every script the page will run. Written by spiral; do not edit.
+const child_process = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const vm = require("vm");
@@ -352,18 +364,61 @@ function walk(dir) {
   return out;
 }
 
-function check(source, label) {
+// A statement-level `export` or `import` is the only thing that cannot appear
+// in a classic script. `import(` and `import.meta` are legal in one, so neither
+// counts as evidence.
+const MODULE_SYNTAX = /^[ \t]*(?:export\b|import\s+[^(.]|import\s*[{*"'])/m;
+
+function classicError(source, label) {
   try {
     new vm.Script(source, { filename: label });
   } catch (err) {
-    if (err instanceof SyntaxError) bad.push(`${label}: ${err.message}`);
+    if (err instanceof SyntaxError) return err.message;
   }
+  return null;
+}
+
+// vm.Script always compiles a CLASSIC script, so it reports every module as
+// "Unexpected token 'export'" — a syntax error that does not exist, which a
+// worker will then spend its whole budget failing to fix. vm.SourceTextModule
+// needs --experimental-vm-modules; `--input-type=module --check` is stable, so
+// the module grammar comes from a real node parse in a child process.
+function moduleError(source) {
+  const done = child_process.spawnSync(
+    process.execPath, ["--input-type=module", "--check"],
+    { input: source, encoding: "utf8" });
+  if (done.error || done.status === null) {
+    // Never silently pass: an unrunnable check is worse than no check, so the
+    // file is reported rather than let through unexamined.
+    return `module syntax could not be checked (${done.error || "node produced no exit status"})`;
+  }
+  if (done.status === 0) return null;
+  const line = (done.stderr || "").split("\n").find((l) => /^\w*Error: /.test(l));
+  return line ? line.trim() : `module syntax error (node --check exited ${done.status})`;
+}
+
+function check(source, label, isModule) {
+  if (!isModule) {
+    const err = classicError(source, label);
+    if (err === null) return;
+    // Only a file that could BE a module gets the second chance: module code is
+    // not a superset of script code (top-level await is valid in one and broken
+    // in the other), so retrying everything would launder real breaks.
+    if (!MODULE_SYNTAX.test(source)) {
+      bad.push(`${label}: ${err}`);
+      return;
+    }
+  }
+  const err = moduleError(source);
+  if (err !== null) bad.push(`${label}: ${err}`);
 }
 
 for (const file of walk(".")) {
   const lower = file.toLowerCase();
   if (lower.endsWith(".js") || lower.endsWith(".mjs") || lower.endsWith(".cjs")) {
-    check(fs.readFileSync(file, "utf8"), file);
+    // .mjs is a module by definition and .cjs is a script by definition; a
+    // plain .js is whatever it turns out to parse as
+    check(fs.readFileSync(file, "utf8"), file, lower.endsWith(".mjs"));
   } else if (lower.endsWith(".html") || lower.endsWith(".htm")) {
     const html = fs.readFileSync(file, "utf8");
     const pattern = /<script\b([^>]*)>([\s\S]*?)<\/script>/gi;
@@ -374,7 +429,8 @@ for (const file of walk(".")) {
       const attrs = match[1] || "";
       if (/\bsrc\s*=/i.test(attrs)) continue;                 // external, checked above
       if (/type\s*=\s*["']?(application|text)\/(json|template)/i.test(attrs)) continue;
-      check(match[2], `${file} <script> #${index}`);
+      const isModule = /type\s*=\s*["']?module\b/i.test(attrs);
+      check(match[2], `${file} <script> #${index}`, isModule);
     }
   }
 }
@@ -418,6 +474,38 @@ def web_rungs(root: Path) -> list[Rung]:
 
 
 # ---- behaviour, per ecosystem ---------------------------------------------------
+
+# `--help` is supposed to print and exit; a __main__ that ignores argv and starts
+# serving instead used to run until the broker's verify_timeout (900s), so every
+# task on such a project cost fifteen minutes and reported "timeout" rather than
+# a rung name.
+CLI_HELP_TIMEOUT_S = 20.0
+
+CLI_HELP_SCRIPT = '''\
+"""Ask a CLI package for its own help. Written by spiral; do not edit."""
+import subprocess, sys
+
+package = sys.argv[1]
+limit = float(sys.argv[2])
+try:
+    done = subprocess.run(
+        [sys.executable, "-m", package, "--help"],
+        capture_output=True, text=True, timeout=limit)
+except subprocess.TimeoutExpired:
+    print(f"`python -m {package} --help` did not exit within {limit:g}s — it "
+          "ignores --help and keeps running (a server or a loop); --help must "
+          "print and return")
+    sys.exit(1)
+if done.returncode:
+    # the whole point of this rung: the worker only sees gate output, so the
+    # traceback has to BE gate output. Discarding it left a generic label and
+    # nothing to act on.
+    print(f"`python -m {package} --help` exited {done.returncode}")
+    sys.stdout.write(done.stdout)
+    sys.stdout.write(done.stderr)
+    sys.exit(1)
+'''
+
 
 def behave_rungs(root: Path) -> list[Rung]:
     """Rungs that USE the artifact the way a person would, per ecosystem.
@@ -464,16 +552,25 @@ def behave_rungs(root: Path) -> list[Rung]:
 
     # python CLI: a --help that tracebacks is a program that does not start
     mains = [path for path in _sources(root, ".py") if path.name == "__main__.py"]
+    packages = []
     for main in mains[:3]:
         module = _module_path(root, main)
         if not module:
             continue
         # pkg/__main__.py resolves to "pkg.__main__"; `python -m pkg` is the
         # form a person types, and the one the packaging actually promises
-        package = module.removesuffix(".__main__")
+        packages.append(module.removesuffix(".__main__"))
+    if packages:
+        out = root / ".spiral" / "rungs"
+        out.mkdir(parents=True, exist_ok=True)
+        script = out / "clihelp.py"
+        if not script.is_file() or script.read_text() != CLI_HELP_SCRIPT:
+            script.write_text(CLI_HELP_SCRIPT)
+    for package in packages:
         rungs.append(Rung(
             f"behave-cli:{package}",
-            f"python -m {shlex.quote(package)} --help > /dev/null 2>&1",
+            f"python .spiral/rungs/clihelp.py {shlex.quote(package)} "
+            f"{CLI_HELP_TIMEOUT_S:g}",
             f"`python -m {package} --help` must exit 0; a CLI that cannot "
             "print its own help does not run",
         ))

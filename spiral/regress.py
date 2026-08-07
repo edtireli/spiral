@@ -44,7 +44,18 @@ class Healing:
     reverted_as: str = ""
     detail: str = ""
     probed: int = 0
+    unusable_probe: bool = False        # the sweep measured nothing; see ``detail``
     log: list[str] = field(default_factory=list)
+
+
+class _ProbeFailed(RuntimeError):
+    """The probe tree could not be moved to a commit, so no verdict names that sha.
+
+    A failed ``git checkout`` still leaves *a* tree behind — sometimes the previous
+    commit's, sometimes a half-applied one — and the predicate will judge it without
+    complaint. Scoring that as "this commit is bad" attributes a verdict to content
+    that was never materialised, so the search stops instead.
+    """
 
 
 def _commits(root: Path, limit: int) -> list[str]:
@@ -58,6 +69,37 @@ def _dirty(root: Path) -> bool:
     return any(line and ".spiral" not in line for line in out.splitlines())
 
 
+# Dependency roots a build needs and git never tracks. Narrow on purpose, for the
+# reason harness_check._RULES is narrow: a detector that cries "broken instrument"
+# over an ignored .DS_Store would bury the honest "the fault predates this run"
+# answer under a false excuse. Only directories a gate actually needs to run.
+_DEP_ROOTS = {"node_modules", ".venv", "venv", "vendor", "target", ".yarn",
+              "bower_components", "Pods", ".gradle", ".m2", ".bundle",
+              ".pnpm-store", ".tox", ".nox", ".dart_tool", "deps", "_build"}
+
+
+def _unmeasurable(root: Path, probe_dir: Path) -> str:
+    """Why an all-bad sweep from this probe tree is no evidence at all, or "".
+
+    The probe is a ``git worktree add`` checkout, so it holds exactly the tracked
+    files and nothing else. When the workspace's gate needs installed dependencies
+    — and gitignored is precisely how dependencies live — every commit shown to it
+    reads BAD whatever its code says, including commits known to be good. Observed
+    in both ecosystems: the instrument was blind and the report was confident.
+    """
+    listing = _git(root, "status", "--porcelain", "--ignored").stdout
+    ignored = [line[3:].strip().rstrip("/")
+               for line in listing.splitlines() if line.startswith("!! ")]
+    blind = [path for path in ignored
+             if Path(path).name in _DEP_ROOTS
+             and (root / path).is_dir() and not (probe_dir / path).exists()]
+    if not blind:
+        return ""
+    return ("the probe worktree has no " + ", ".join(sorted(blind)[:3])
+            + " — nothing gitignored survives a worktree checkout, so the gate "
+              "reads broken on every commit there whatever its code says")
+
+
 def heal(workspace: str | Path, predicate: Predicate, *,
          max_back: int = 32) -> Healing:
     """Locate the first commit that made ``predicate`` fail and revert it.
@@ -66,6 +108,10 @@ def heal(workspace: str | Path, predicate: Predicate, *,
     deterministic and side-effect free. Returns ``healed=False`` with a reason
     whenever safety would be compromised — a dirty tree, no good commit within
     ``max_back``, a conflicting revert, or a revert that does not actually fix it.
+
+    ``unusable_probe`` separates the two ways a search comes back empty-handed:
+    "every commit really is bad" from "nothing here could be measured". Only the
+    first is a fact about the history.
     """
     root = Path(workspace).resolve()
     outcome = Healing(healed=False)
@@ -87,7 +133,13 @@ def heal(workspace: str | Path, predicate: Predicate, *,
         try:
             def healthy(sha: str) -> bool:
                 outcome.probed += 1
-                _git(probe_dir, "checkout", "--detach", "--force", sha)
+                moved = _git(probe_dir, "checkout", "--detach", "--force", sha)
+                if moved.returncode != 0:
+                    outcome.log.append(f"{sha[:10]} unmeasurable")
+                    first = (moved.stderr.strip().splitlines() or [""])[0]
+                    raise _ProbeFailed(
+                        f"the probe worktree could not check out {sha[:10]}, so no "
+                        f"verdict belongs to it: {first[:120]}")
                 _git(probe_dir, "clean", "-fdq", "-e", ".spiral")
                 verdict = bool(predicate(probe_dir))
                 outcome.log.append(f"{sha[:10]} {'good' if verdict else 'bad'}")
@@ -116,6 +168,17 @@ def heal(workspace: str | Path, predicate: Predicate, *,
                 index += step
                 step *= 2
             if good_index is None:
+                # every probe read bad, which has two very different causes: the
+                # history really is bad throughout, or the instrument cannot see.
+                # Only one of them is a fact about the commits, so check the
+                # instrument before stating one.
+                blind = _unmeasurable(root, probe_dir)
+                if blind:
+                    outcome.unusable_probe = True
+                    outcome.detail = (
+                        f"could not measure any of the last {len(commits)} commits: "
+                        f"{blind}. This is not a verdict on the history")
+                    return outcome
                 outcome.detail = (
                     f"no passing commit within the last {len(commits)} — the fault "
                     "predates this run, so reverting cannot fix it")
@@ -131,6 +194,10 @@ def heal(workspace: str | Path, predicate: Predicate, *,
                     lo = mid
             guilty = commits[lo]
             outcome.guilty = guilty
+        except _ProbeFailed as unmeasured:
+            outcome.unusable_probe = True
+            outcome.detail = str(unmeasured)
+            return outcome
         finally:
             _git(root, "worktree", "remove", "--force", str(probe_dir))
 
@@ -140,7 +207,20 @@ def heal(workspace: str | Path, predicate: Predicate, *,
         outcome.detail = (f"revert of {guilty[:10]} does not apply cleanly; "
                           "leaving it to remediation")
         return outcome
-    if not predicate(root):
+    try:
+        restored = bool(predicate(root))
+    except Exception as exc:
+        # the verification RAISED, and the revert is already committed. Letting this
+        # propagate left the caller printing "healer unavailable" over a workspace
+        # whose HEAD had silently moved to an unverified Revert — worse than any
+        # verdict, because nobody knows the tree changed. Roll it back and decline.
+        undo = _git(root, "reset", "--hard", "HEAD~1")
+        outcome.detail = (
+            f"the verification probe raised after the revert landed ({exc}); "
+            "the revert was rolled back"
+            + ("" if undo.returncode == 0 else "; and rolling it back failed"))
+        return outcome
+    if not restored:
         # the revert landed but the product is still broken — undo it entirely
         undo = _git(root, "reset", "--hard", "HEAD~1")
         outcome.detail = (

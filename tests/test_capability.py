@@ -32,6 +32,31 @@ def test_domain_words_imply_their_obvious_toolchain():
         "an ordinary web page needs nothing special; guessing costs an install")
 
 
+def test_a_fragment_of_a_word_is_not_evidence_of_a_dependency():
+    """Bare `word in text` matching invented dependencies out of ordinary English.
+
+    Every hit here was declared in requirements.txt, committed, and then really
+    installed against the run's install budget — so "gamers" bought pygame and
+    "ratios" bought an Xcode hunt.
+    """
+    assert detect_needs("a chat app for gamers") == []
+    assert detect_needs("report the win ratios") == [], "'ios' inside 'ratios'"
+    assert "python:matplotlib" not in _ids(detect_needs("render a flowchart in svg"))
+    assert "python:scikit-learn" not in _ids(
+        detect_needs("add regression tests for the parser")), (
+        "in a coding agent's goals 'regression' means a test, not a model fit")
+
+
+def test_the_true_positives_survive_the_word_boundary():
+    assert "python:praw" in _ids(detect_needs("a Reddit bot that replies"))
+    assert "python:pygame" in _ids(detect_needs("a snake game in python"))
+    assert "python:matplotlib" in _ids(detect_needs("draw two charts"))
+    assert "python:scikit-learn" in _ids(detect_needs("fit a linear regression"))
+    assert "python:requests" in _ids(detect_needs("a scraper for job ads"))
+    assert "binary:xcodebuild" in _ids(detect_needs("an iOS app"))
+    assert "binary:docker" in _ids(detect_needs("add a Dockerfile"))
+
+
 def test_analyst_tool_families_count_as_evidence_too():
     needs = detect_needs("build the thing", ["flask", "sqlalchemy"])
     assert {"python:flask", "python:sqlalchemy"} <= _ids(needs)

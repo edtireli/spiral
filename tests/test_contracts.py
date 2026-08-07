@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from spiral.contracts import (  # noqa: E402
     declared_routes, lint_contracts, missing_exports, module_symbols, parse_ref,
-    resolve,
+    resolve, satisfy_hint,
 )
 from spiral.planner import Milestone, Plan, Task  # noqa: E402
 
@@ -182,3 +182,59 @@ def test_js_symbols_are_resolved_in_the_file_not_as_python_modules(tmp_path):
     assert missing_exports(tmp_path, ["util.js:handleKey"]) == [], (
         "a basename ref must find the file wherever it lives")
     assert missing_exports(tmp_path, ["src/util.js:fmt"]) == []
+
+
+def test_path_style_and_dotted_refs_are_checked_not_waved_through(tmp_path):
+    """`app/main.py:create_app` and `app.database.create_group` are the two forms a
+    model writes when it means a symbol. Both parsed as `unknown`, and resolve()'s
+    if/elif chain files an unknown ref under neither satisfied nor missing — so
+    `missing_exports` returned [] and the artifact gate passed with the export never
+    written, which is the very drift this module exists to stop. The ordering check
+    had the same hole: unknown imports were skipped outright."""
+    root = _write(tmp_path, {
+        "app/__init__.py": "",
+        "app/main.py": "def other():\n    return 1\n",
+        "app/database.py": "def other():\n    return 1\n",
+    })
+    assert missing_exports(root, ["app/main.py:create_app"]) == [
+        "app/main.py:create_app"]
+    assert missing_exports(root, ["app.database.create_group"]) == [
+        "app.database.create_group"]
+
+    plan = _plan(Task("Routes", "", [], "", ["R1"], exports=[],
+                      imports=["app.database.create_group"]))
+    defects = lint_contracts(plan, root)
+    assert len(defects) == 1 and "no task exports" in defects[0]
+
+    _write(root, {"app/main.py": "def create_app():\n    return 1\n",
+                  "app/database.py": "def create_group():\n    return 1\n"})
+    assert missing_exports(
+        root, ["app/main.py:create_app", "app.database.create_group"]) == []
+
+    _write(root, {"app/services/__init__.py": "",
+                  "app/services/mailer.py": "def send():\n    return 1\n"})
+    assert missing_exports(root, ["app.services.mailer"]) == [], (
+        "a dotted ref that names a MODULE is delivered by that module existing — "
+        "reading it only as module:symbol would make it permanently missing")
+
+
+def test_a_py_file_style_symbol_ref_resolves_inside_that_file(tmp_path):
+    """`main.py:run` matched the module:symbol rule, so `main.py` was probed as a
+    Python module — main/py.py, src/main/py.py, main/py/__init__.py — and never
+    found. The export stayed missing forever and the hint told the worker to define
+    run() in main/py.py, so a single-file project burned its whole budget against a
+    gate nothing could satisfy. The js/ts escape hatch has to cover .py too."""
+    _write(tmp_path, {"main.py": "def run():\n    return 1\n"})
+    assert missing_exports(tmp_path, ["main.py:run"]) == []
+    assert missing_exports(tmp_path, ["main.py:absent"]) == ["main.py:absent"]
+
+    hint = satisfy_hint("main.py:absent")
+    assert "main.py" in hint and "main/py.py" not in hint, (
+        "the hint has to name the file the resolver actually reads")
+
+    _write(tmp_path, {"src/pkg/tools.py": "class Widget:\n    pass\n"})
+    assert missing_exports(tmp_path, ["src/pkg/tools.py:Widget"]) == []
+    assert missing_exports(tmp_path, ["tools.py:Widget"]) == [], (
+        "a basename ref must find the file wherever it lives")
+
+    assert parse_ref("../etc/passwd.py:run").kind == "unknown", "no escaping refs"

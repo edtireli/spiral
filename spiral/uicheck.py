@@ -109,6 +109,14 @@ def role_of(label):
 
 
 unreachable = []
+blocked = []
+clicked = []
+
+
+def obstruction(message):
+    """The element playwright names in its call log as swallowing the pointer."""
+    found = re.search(r"(<[^\\n]*?>) intercepts pointer events", message)
+    return found.group(1) if found else ""
 
 
 def press(control, label, trail):
@@ -119,10 +127,24 @@ def press(control, label, trail):
         # clicked is BROKEN, not skippable — a mobile-layout remediation once
         # pushed the whole keypad outside the viewport and the probe read the
         # page as clean because every click "failed quietly"
-        if "outside of the viewport" in str(exc):
+        message = str(exc)
+        if "outside of the viewport" in message:
             unreachable.append(label or "?")
+        else:
+            # the other half of that same principle, and the half that was
+            # missing: playwright refuses a click for two reasons and raises the
+            # SAME TimeoutError for both. Recording only the viewport one let a
+            # calculator rendering "null" behind an un-torn-down backdrop finish
+            # with zero findings — pass 1 skipped every button and pass 2 broke
+            # the hazard sequence before divide-by-zero could reach the display.
+            over = obstruction(message)
+            blocked.append(f"{label or '?'} ({over})" if over else (label or "?"))
         return False
     trail.append(label or "?")
+    # trail is rebuilt for each hazard sequence, so it can only ever describe the
+    # last one. How much of the page the probe actually pressed — the only signal
+    # a human gets when nothing is found — needs a list that spans the run.
+    clicked.append(label or "?")
     return True
 
 
@@ -188,10 +210,11 @@ with sync_playwright() as p:
         "findings": findings,
         "console_errors": console[:6],
         "crashes": crashes[:6],
-        "clicked": trail,
+        "clicked": clicked,
         "hazards": [name for name, _ in HAZARDS],
         "intentional": intentional,
         "unreachable": unreachable[:12],
+        "blocked": blocked[:12],
     }))
     browser.close()
 '''
@@ -281,6 +304,19 @@ def probe(root: str | Path, *, max_clicks: int = 24,
             "Fix the layout so every control is inside the viewport at the "
             "default window size; check position/overflow/height rules added "
             "recently."))
+    # the same control is retried by pass 1 and again by each hazard sequence, so
+    # the raw list counts attempts; one covered control is one fault
+    blocked = list(dict.fromkeys(report.get("blocked") or []))
+    if blocked:
+        issues.append(_issue(
+            "runtime-blocked-controls", "major",
+            f"{len(blocked)} visible control(s) cannot be clicked — something "
+            f"stacked over them intercepts the pointer (e.g. "
+            f"{', '.join(blocked[:5])}); an overlay is covering the interface",
+            "Remove or dismiss whatever sits over the controls — a modal whose "
+            "close handler was never wired, a splash screen never torn down, a "
+            "full-bleed backdrop, an oversized sticky bar. If the element must "
+            "stay, give it pointer-events: none."))
     for crash in dict.fromkeys(str(c)[:180] for c in report.get("crashes", [])):
         issues.append(_issue(
             "runtime-throws", "major",
@@ -293,7 +329,7 @@ def probe(root: str | Path, *, max_clicks: int = 24,
             f"the console logged an error during use: {error}",
             "Resolve the console error — a missing asset, a failed request, or a "
             "caught-and-logged bug."))
-    clicked = report.get("clicked") or []
+    clicked = list(dict.fromkeys(report.get("clicked") or []))
     note = f"pressed {len(clicked)} control(s): {', '.join(clicked[:12])}"
     intentional = report.get("intentional") or []
     if intentional:

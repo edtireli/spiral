@@ -62,6 +62,10 @@ DOMAIN_PACKAGES: dict[str, tuple[tuple[str, ...], str, str]] = {
     "telegram": (("python-telegram-bot",), "import telegram", "the Telegram API"),
     "scrape": (("requests", "beautifulsoup4"), "import requests, bs4",
                "fetching and parsing pages"),
+    # spelled out because matching is word-bounded and agent nouns are not
+    # tolerated as an inflection: "scraper" is the work, but "gamer" is a person.
+    "scraper": (("requests", "beautifulsoup4"), "import requests, bs4",
+                "fetching and parsing pages"),
     "dataframe": (("pandas",), "import pandas", "tabular data"),
     "csv analysis": (("pandas",), "import pandas", "tabular data"),
     "plot": (("matplotlib",), "import matplotlib", "charts"),
@@ -79,7 +83,15 @@ DOMAIN_PACKAGES: dict[str, tuple[tuple[str, ...], str, str]] = {
                    "fitting and evaluating a model"),
     "scikit": (("scikit-learn", "numpy"), "import sklearn, numpy", "modelling"),
     "random forest": (("scikit-learn",), "import sklearn.ensemble", "the ensemble"),
-    "regression": (("scikit-learn", "numpy"), "import sklearn, numpy", "fitting"),
+    # qualified, never bare: in the goals this CLI is handed "regression" is
+    # overwhelmingly a regression *test*, so the bare word bought scikit-learn
+    # and numpy for "add regression tests for the parser".
+    "linear regression": (("scikit-learn", "numpy"), "import sklearn, numpy",
+                          "fitting"),
+    "logistic regression": (("scikit-learn", "numpy"), "import sklearn, numpy",
+                            "fitting"),
+    "regression model": (("scikit-learn", "numpy"), "import sklearn, numpy",
+                         "fitting"),
     "generate a pdf": (("reportlab",), "import reportlab", "laying out a PDF"),
     "pdf report": (("reportlab",), "import reportlab", "laying out a PDF"),
 }
@@ -91,10 +103,11 @@ DOMAIN_BINARIES: dict[str, tuple[str, str, str]] = {
     "video": ("ffmpeg", "brew install ffmpeg", "encoding and decoding video"),
     "ffmpeg": ("ffmpeg", "brew install ffmpeg", "media processing"),
     "docker": ("docker", "install Docker Desktop", "container builds"),
+    # its own entry because matching is word-bounded and this is how the word
+    # actually shows up in a goal ("add a Dockerfile").
+    "dockerfile": ("docker", "install Docker Desktop", "container builds"),
     "latex": ("pdflatex", "brew install --cask mactex", "typesetting"),
 }
-
-_TEST_ONLY = {"pytest", "httpx", "httpx2"}
 
 
 @dataclass
@@ -142,17 +155,33 @@ class Resolution:
         return "\n".join(lines)
 
 
+# A table word counts only as a whole word, plus the plain inflections it really
+# takes ("charts", "games"). Agent nouns are excluded on purpose — see _mentions.
+_INFLECTIONS = r"(?:s|es|d|ed|ing)?"
+
+
+def _mentions(text: str, word: str) -> bool:
+    """True when the table's word is used, not merely spelled somewhere inside.
+
+    The bare ``word in text`` test read "gamers" as pygame work, "flowchart" as
+    matplotlib work and every "ratios" as an iOS build — and a detected need is
+    not a suggestion: it is written into requirements.txt, committed, and then
+    really installed against the run's install budget.
+    """
+    return re.search(rf"\b{re.escape(word)}{_INFLECTIONS}\b", text) is not None
+
+
 def detect_needs(goal: str, tool_families: list[str] | None = None) -> list[Need]:
     """Capabilities implied by the goal and by the analyst's declared tool families."""
     text = " ".join([goal or "", " ".join(tool_families or [])]).lower()
     needs: dict[str, Need] = {}
     for word, (packages, certificate, why) in DOMAIN_PACKAGES.items():
-        if word in text:
+        if _mentions(text, word):
             needs.setdefault(f"python:{packages[0]}", Need(
                 id=f"python:{packages[0]}", kind="python", packages=packages,
                 certificate=certificate, why=why))
     for word, (binary, hint, why) in DOMAIN_BINARIES.items():
-        if word in text:
+        if _mentions(text, word):
             needs.setdefault(f"binary:{binary}", Need(
                 id=f"binary:{binary}", kind="binary", binary=binary,
                 certificate=f"command -v {binary}", why=why, install_hint=hint))

@@ -42,7 +42,11 @@ UI_KINDS = {"web", "gui", "desktop", "game", "android", "ios"}
 
 _HEX = re.compile(r"#[0-9a-fA-F]{3,8}\b")
 _FUNC_COLOR = re.compile(r"\b(?:rgb|rgba|hsl|hsla)\s*\(", re.I)
-_PROP_DECL = re.compile(r"^\s*(?:--|\$|@)[A-Za-z0-9_-]+\s*:")
+# Deliberately not anchored to the line start: a declaration is recognised by the
+# delimiter in front of it, so a minified stylesheet — every rule on one line —
+# yields the same count as the readable source it was built from.
+_PROP_DECL = re.compile(r"(?:^|[;{}])\s*(?:--|\$|@)[A-Za-z0-9_-]+\s*:")
+_DECL_END = re.compile(r"[;{}]")
 _PROP_VALUE = re.compile(r"(--[A-Za-z0-9_-]+)\s*:\s*([^;}\n]+)")
 _FOCUS = re.compile(r":focus(?:-visible|-within)?\s*[,{)\s]")
 _HOVER = re.compile(r":hover\s*[,{)\s]")
@@ -137,13 +141,26 @@ def best_contrast(text: str) -> tuple[float, str, str]:
     return best, pair[0], pair[1]
 
 
+def _declared_spans(line: str) -> list[tuple[int, int]]:
+    """Character ranges holding the value of a custom-property declaration."""
+    spans = []
+    for match in _PROP_DECL.finditer(line):
+        end = _DECL_END.search(line, match.end())
+        spans.append((match.end(), end.start() if end else len(line)))
+    return spans
+
+
 def loose_colours(paths: list[Path]) -> tuple[int, int, list[str]]:
     """(on token declarations, loose in rules, examples).
 
-    Counted per line rather than per block: a ``:root`` nested inside an
-    ``@media (prefers-color-scheme: dark)`` is the ordinary way to write a dark
-    theme, and any block matcher that stops at the first ``}`` scores every one of
-    those tokens as loose.
+    Not counted per block: a ``:root`` nested inside an ``@media
+    (prefers-color-scheme: dark)`` is the ordinary way to write a dark theme, and
+    any block matcher that stops at the first ``}`` scores every one of those
+    tokens as loose. Not counted per line either — a minified stylesheet is a
+    single line, so a line-anchored ``--name:`` matcher found none of its
+    declarations and the audit demanded reusable custom properties from a file
+    that already declared them, which is a remediation task no worker can
+    satisfy. Each colour is attributed to the declaration whose value it sits in.
     """
     inside = outside = 0
     examples: list[str] = []
@@ -153,15 +170,17 @@ def loose_colours(paths: list[Path]) -> tuple[int, int, list[str]]:
         except OSError:
             continue
         for line in lines:
-            count = len(_HEX.findall(line)) + len(_FUNC_COLOR.findall(line))
-            if not count:
+            at = [m.start() for m in _HEX.finditer(line)]
+            at += [m.start() for m in _FUNC_COLOR.finditer(line)]
+            if not at:
                 continue
-            if _PROP_DECL.match(line):
-                inside += count
-            else:
-                outside += count
-                if len(examples) < 3:
-                    examples.append(f"{path.name}: {line.strip()[:60]}")
+            spans = _declared_spans(line)
+            loose = [p for p in at
+                     if not any(start <= p < stop for start, stop in spans)]
+            inside += len(at) - len(loose)
+            outside += len(loose)
+            if loose and len(examples) < 3:
+                examples.append(f"{path.name}: {line.strip()[:60]}")
     return inside, outside, examples
 
 
