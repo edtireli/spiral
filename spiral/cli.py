@@ -259,6 +259,7 @@ def main() -> None:
                          "numbers, citations or equations)")
     pr.add_argument("--out", help="where to write the rewrite (default: alongside, .human.*)")
     pr.add_argument("--rounds", type=int, default=3, help="rewrite attempts (default 3)")
+    pr.add_argument("--model", default="", help="override the rewriting model")
     pr.add_argument("--api", metavar="API_KEY", default=None,
                     help="use the configured API model for the rewrite")
 
