@@ -276,7 +276,13 @@ class ResearchLoop:
                     setattr(st, name, [])
             for name in (
                     "active_proposal", "coverage", "completion", "novelty_boundary",
-                    "obligation_report", "living_paper", "data_resources"):
+                    "obligation_report", "living_paper", "data_resources",
+                    # every state.json written before the well-posedness memory
+                    # existed lacks this key, and _load copies each key straight onto
+                    # the state — so a null in the file lands as a null on the field
+                    # and the first refusal of the resumed run raises instead of
+                    # recording. dict.get(k, default) does not protect against that.
+                    "ruled_out_angles"):
                 if not isinstance(getattr(st, name, None), dict):
                     setattr(st, name, {})
             for name in ("tokens", "local_tokens", "api_tokens", "round"):
