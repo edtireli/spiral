@@ -2014,6 +2014,48 @@ class ResearchLoop:
         return self._think_json(
             system, user, role="planner", max_chars=10_000, reasoning=True)
 
+    def _precheck_angles(self, angles: list[dict]) -> list[dict]:
+        """Refuse an angle whose own first check is forced to a trivial answer.
+
+        A real run proposed computing H^7 of a 5-manifold — zero before any differential
+        is written — and spent an hour on it. It had even written the warning down
+        ("risks trivial results if H^{D+1} vanishes") and proceeded, because nothing made
+        it act on its own note. This is the arithmetic it skipped: cheap, deterministic,
+        and run before the angle is allowed to consume a round."""
+        from spiral.wellposed import precheck, report
+
+        kept: list[dict] = []
+        for angle in angles or []:
+            text = " ".join(str(angle.get(k) or "") for k in (
+                "question", "target", "why_interesting", "check_plan", "first_check",
+                "novelty_risk"))
+            dims = sorted({int(d) for d in re.findall(r"\bD\s*=\s*([2-9])", text)}
+                          | {int(d) for d in re.findall(r"\bD\s*>\s*([2-9])", text)})
+            try:
+                issues = precheck(text, dims=dims or None)
+            except Exception:
+                issues = []
+            fatal = [i for i in issues if i.fatal]
+            angle["_wellposed"] = {
+                "issues": [i.sentence() for i in issues],
+                "blocked": bool(fatal),
+            }
+            if fatal:
+                self._say(f"  ✗ angle rejected · {fatal[0].sentence()[:90]}")
+                self._log_thought(
+                    "wellposedness",
+                    f"rejected an angle before spending a round on it: {fatal[0].sentence()}",
+                    issues=[i.sentence() for i in issues])
+                # hand the reason back so the next proposal is better posed
+                angle["_wellposed"]["feedback"] = report(issues)
+                continue
+            if issues:
+                self._say(f"  ○ angle warning · {issues[0].sentence()[:90]}")
+            kept.append(angle)
+        if angles and not kept:
+            self._say("  ✗ every candidate angle was ill-posed; re-proposing")
+        return kept
+
     def _discover_angles(self, n: int = 5) -> list[dict]:
         """Mine the corpus for candidate research questions inside the user's topic."""
         notes = self._ensure_reading_notes()
@@ -2073,7 +2115,7 @@ class ResearchLoop:
             if key and key not in seen_questions:
                 seen_questions.add(key)
                 deduped.append(angle)
-        angles = deduped
+        angles = self._precheck_angles(deduped)
         for angle in angles:
             try:
                 aid = self.obligations.ensure(
