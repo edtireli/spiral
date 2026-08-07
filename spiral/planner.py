@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from spiral.appicon import GLYPHS
 from spiral.config import Config
@@ -39,9 +40,26 @@ PLAN_SCHEMA = {
                                 "description": {"type": "string"},
                                 "files": {"type": "array", "items": {"type": "string"}},
                                 "verify": {"type": "string"},
-                                "requirements": {"type": "array", "items": {"type": "string"}},
+                                # minItems matters as much as required: a model
+                                # satisfies a merely-required array with [], and a
+                                # plan whose every task maps zero requirements
+                                # sails through — observed twice, approved by the
+                                # critic both times despite 38 lint lines saying so
+                                "requirements": {"type": "array",
+                                                 "items": {"type": "string"},
+                                                 "minItems": 1},
+                                "exports": {"type": "array", "items": {"type": "string"}},
+                                "imports": {"type": "array", "items": {"type": "string"}},
                             },
-                            "required": ["title", "description"],
+                            # `requirements` and `exports` are REQUIRED, not merely
+                            # offered. When they were optional the planner omitted
+                            # them on every task, so the deterministic coverage
+                            # repair fired for every requirement and appended a
+                            # duplicate task for each one — most of the plan became
+                            # synthetic. A field the model may skip is a field the
+                            # model will skip.
+                            "required": [
+                                "title", "description", "requirements", "exports"],
                         },
                     },
                 },
@@ -89,6 +107,13 @@ PLANNER_SYSTEM = (
     "only the task, not this conversation): name exact files, classes, ids, behaviors.\n"
     "- Each task lists the requirement ids it advances in 'requirements'. Every requirement "
     "must map to at least one implementation or verification task.\n"
+    "- Each task declares the INTERFACE it promises in 'exports', and what it relies on "
+    "in 'imports'. Use 'module.path:symbol' for code (app.database:create_group), "
+    "'METHOD /path' for endpoints (GET /groups/{id}), or a file path for an asset. This "
+    "is checked mechanically: a task is not done until everything it exports exists, and "
+    "a task may only import what an EARLIER task exports or the repo already contains. "
+    "Declaring the seam is how the layer that calls a function and the layer that "
+    "defines it stay in agreement.\n"
     "Return ONLY JSON matching the schema."
 )
 
@@ -740,6 +765,11 @@ class Task:
     files: list[str] = field(default_factory=list)
     verify: str = ""
     requirements: list[str] = field(default_factory=list)
+    # the interface this task promises, and what it may rely on. Checked
+    # deterministically: imports must be exported earlier, exports must exist
+    # before the task counts as done. See spiral/contracts.py.
+    exports: list[str] = field(default_factory=list)
+    imports: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -768,7 +798,8 @@ def plan_to_dict(plan: Plan) -> dict:
                 "goal": m.goal,
                 "tasks": [
                     {"title": t.title, "description": t.description, "files": t.files,
-                     "verify": t.verify, "requirements": t.requirements}
+                     "verify": t.verify, "requirements": t.requirements,
+                     "exports": t.exports, "imports": t.imports}
                     for t in m.tasks
                 ],
             }
@@ -892,7 +923,8 @@ def parse_plan(data: dict) -> Plan:
     for m in data.get("milestones", []):
         tasks = [
             Task(t["title"], t.get("description", ""), t.get("files", []) or [],
-                 t.get("verify", "") or "", t.get("requirements", []) or [])
+                 t.get("verify", "") or "", t.get("requirements", []) or [],
+                 t.get("exports", []) or [], t.get("imports", []) or [])
             for t in m.get("tasks", [])
         ]
         milestones.append(Milestone(m["title"], tasks, m.get("goal", "")))
@@ -923,6 +955,70 @@ def extract_spec(goal: str, cfg: Config | None = None, ol: Ollama | None = None,
                      max_tokens=min(cfg.planner_max_tokens, 8192),
                      progress=progress)
     return _extract_json(res.text).get("requirements", []), res
+
+
+# Words that decide what a deliverable IS, whatever the analyst labelled it. A test
+# suite marked `kind: web, visual: true` is not a hypothetical: it happened, and the
+# consequences compounded — the delivery manifest demanded visual evidence a test
+# runner can never have (so the run could not reach SPEC-GREEN), and the acceptance
+# milestone then built a standalone HTML test page instead of a runnable suite,
+# because that is what "a complete web deliverable" means. An unvalidated kind does
+# not merely mis-gate the result; it steers the work.
+_NOT_VISUAL = re.compile(
+    r"\b(test|tests|testing|test[- ]?suite|unit test|pytest|spec|fixture|"
+    r"depend\w*|requirement|manifest|config\w*|setting|packaging|"
+    r"lint\w*|ci|pipeline|schema|migration|library|module|sdk|api client|"
+    r"helper|util\w*)\b", re.I)
+_SOURCE_GLOB = re.compile(
+    r"(^|/)(src|app|lib|tests?|packages?|components?)(/|$)|"
+    r"\.(py|js|jsx|ts|tsx|kt|java|swift|go|rs|rb|c|cc|cpp|h|hpp|cs|css|scss|"
+    r"toml|cfg|ini|lock)$", re.I)
+
+
+def sanitize_deliverables(rows: list[dict]) -> list[str]:
+    """Reconcile each deliverable's kind and flags with its own description.
+
+    Deterministic, and deliberately conservative: it only ever REMOVES a claim
+    (visual, interactive, a file-deliverable kind, a source-tree output glob),
+    because every one of those claims creates an obligation that something later has
+    to satisfy. Returns human-readable notes for the plan log.
+    """
+    notes: list[str] = []
+    for row in rows:
+        subject = f"{row.get('id', '')} {row.get('description', '')}"[:400]
+        kind = str(row.get("kind") or "other")
+        if _NOT_VISUAL.search(subject):
+            if row.get("visual"):
+                row["visual"] = False
+                notes.append(
+                    f"{row.get('id')}: cleared visual — its description is about "
+                    "tests, dependencies, or configuration, which nobody looks at")
+            if row.get("interactive"):
+                row["interactive"] = False
+            if kind in FILE_DELIVERABLE_KINDS or kind in {"web", "android", "ios"}:
+                row["kind"] = "library"
+                notes.append(
+                    f"{row.get('id')}: kind {kind} -> library; a {kind} deliverable "
+                    "would demand rendered output it cannot have")
+                # the old kind's DEFAULT glob came with the old kind and must leave
+                # with it — `output/*` on a dependency manifest is a file that will
+                # never exist, and delivery readiness would wait for it forever
+                stale = set(default_output_globs(kind))
+                if stale:
+                    row["output_globs"] = [
+                        g for g in (row.get("output_globs") or [])
+                        if str(g) not in stale]
+        globs = [g for g in (row.get("output_globs") or [])]
+        kept = [g for g in globs if not _SOURCE_GLOB.search(str(g))]
+        if len(kept) != len(globs):
+            dropped = [g for g in globs if g not in kept]
+            row["output_globs"] = kept or default_output_globs(
+                str(row.get("kind") or "other"))
+            notes.append(
+                f"{row.get('id')}: dropped source path(s) declared as finished "
+                f"output ({', '.join(map(str, dropped[:3]))}) — source is not an "
+                "artifact")
+    return notes
 
 
 def analyze_deliverables(
@@ -969,6 +1065,7 @@ def analyze_deliverables(
             "output_globs": default_output_globs("other"),
             "acceptance_evidence": [], "tool_families": [],
         }]
+    sanitize_deliverables(rows)
     primary = str(data.get("primary_id") or rows[0]["id"])
     if primary not in {str(row["id"]) for row in rows}:
         primary = str(rows[0]["id"])
@@ -982,8 +1079,24 @@ def lint_plan(plan: Plan, existing_files: set[str]) -> list[str]:
     seen_files: set[str] = set(existing_files)
     seen_titles: set[str] = set()
     creation_verbs = ("create", "add", "new", "write", "implement", "generate")
+    # a task that names no files, carries no extra check, and is titled like an
+    # inspection ritual has NO satisfiable definition of done — the gate is
+    # already green, there is nothing to create, and the worker cannot emit an
+    # edit that "verifies". Two such tasks burned over half a million tokens on
+    # a CLI build ("Verify --help flag and interaction states", "Visual QA &
+    # Output Verification"). Verification is the harness's job; tasks build.
+    ritual = re.compile(
+        r"\b(verify|verification|validate|validation|qa\b|audit|review|"
+        r"double.?check|confirm|ensure)\b", re.I)
     for mi, m in enumerate(plan.milestones, 1):
         for ti, t in enumerate(m.tasks, 1):
+            if (not t.files and not t.verify.strip()
+                    and ritual.search(t.title or "")):
+                defects.append(
+                    f"task {mi}.{ti} '{t.title[:48]}': names no files and no "
+                    "executable check but is titled as verification — the "
+                    "harness gates every task already; replace it with a task "
+                    "that BUILDS something concrete, or delete it")
             tag = f"task {mi}.{ti} '{t.title}'"
             if len(t.files) > 3:
                 defects.append(f"{tag}: touches {len(t.files)} files — split it (≤3).")
@@ -1103,6 +1216,17 @@ def ensure_plan_coverage(spec: list[dict], plan: Plan) -> int:
     for row in spec:
         identifier = str(row.get("id") or "")
         if not identifier or identifier in declared:
+            continue
+        # Only FEATURES get a synthetic build task — an unmapped feature is work
+        # nobody planned, and skipping it ships a hole. Unmapped quality and
+        # constraint rows are AUDITS, and the validate→remediate loop already
+        # judges every requirement with evidence and spawns targeted remediation
+        # for proven gaps; paying a model up-front to re-audit each one doubled
+        # the plan (38 synthetic tasks on a 10-task build, then 19) and those
+        # audit tasks caused real regressions while "completing" finished work.
+        # Rows with an executable check are also left to validation: the check
+        # runs there by exit code, which no model attempt can improve on.
+        if str(row.get("kind") or "feature") != "feature" or row.get("check"):
             continue
         text = str(row.get("text") or f"Complete requirement {identifier}")
         additions.append(Task(

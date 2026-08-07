@@ -1,0 +1,19 @@
+
+  ⠀⠀⠀⠀⢀⣀⠀⠀⠀
+  ⠀⠀⢠⠞⡥⣌⠙⣆⠀   s p i r a l
+  ⠀⠀⠘⢦⣓⡿⠀⣸⠀   local autonomous coder · on-device
+  ⠀⠀⠀⠀⠀⢀⠴⠃⠀
+
+  ▸ python-cli · main · gate: (/Users/edt/Desktop/spiral/.venv/bin/python -m 
+spiral.artifact_gate .)
+
+  working on branch spiral/run-20260727-2123 — your branch is untouched
+  gate: .:artifact-integrity +footguns · repo map: 1343 chars · planner 
+qwen3.6:latest
+  ⠿ [21:23:38] extracting spec · … · 8s
+  ⠿ [21:23:46] extracting spec · … · 16s
+  ⠿ [21:23:54] extracting spec · 0.3k tok · 24s
+  ⠿ [21:24:02] extracting spec · 0.7k tok · 32s
+  ⠿ [21:24:10] extracting spec · 1.0k tok · 40s
+  ⠿ [21:24:18] extracting spec · 1.4k tok · 48s
+  ⠿ [21:24:26] extracting spec · 1.8k tok · 56s

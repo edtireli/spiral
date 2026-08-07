@@ -1,6 +1,6 @@
 [project]
 name = "spiral-coder"
-version = "0.1.6"
+version = "0.1.8"
 description = "Local-first autonomous coding CLI — plans, builds, verifies, and validates against a spec, entirely on your own hardware."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -50,3 +50,10 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["spiral"]
+
+[tool.pytest.ini_options]
+# bench/runs holds BUILT ARTIFACTS whose own test suites must never be
+# collected into spiral's — a half-built probe project once contributed
+# ten failures to what looked like spiral's suite
+testpaths = ["tests"]
+norecursedirs = ["bench", ".spiral", "dist", "experiments"]

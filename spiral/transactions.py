@@ -62,9 +62,16 @@ def _slug(value: str) -> str:
 
 
 def _external_symlinks(root: Path) -> list[str]:
+    """Escaping symlinks the TASK created. ``.spiral/`` is harness-owned and
+    gitignored — its dependency-cache venvs legitimately symlink bin/python at an
+    interpreter outside the workspace, so scanning it refuses every commit on any
+    project that declares dependencies. Excluded for the same reason as in
+    ``_dirty``/``_untracked``."""
     rows = []
     for path in root.rglob("*"):
         if not path.is_symlink():
+            continue
+        if path.relative_to(root).parts[:1] == (".spiral",):
             continue
         try:
             path.resolve(strict=False).relative_to(root)

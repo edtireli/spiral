@@ -94,3 +94,59 @@ def _run():
 
 if __name__ == "__main__":
     raise SystemExit(_run())
+
+
+def test_an_edit_that_breaks_a_parsing_file_is_rejected_atomically(tmp_path):
+    """A fuzzy application landing in the wrong region beheaded a working
+    app/database.py; the damage surfaced a full gate run later and the repair
+    model flip-flopped between ')' and '}' because it could not see the imbalance.
+    The parser can, at application time, before anything lands."""
+    from spiral.edits import EditBlock, apply_edits
+
+    target = tmp_path / "logic.py"
+    target.write_text("def add(a, b):\n    return a + b\n")
+    result = apply_edits(tmp_path, [EditBlock(
+        "logic.py", "    return a + b", "    return (a + b\n")])[0]
+    assert result.ok is False
+    assert "REJECTED" in result.reason and "stop parsing" in result.reason
+    assert target.read_text() == "def add(a, b):\n    return a + b\n", (
+        "the file on disk must be untouched")
+
+    good = apply_edits(tmp_path, [EditBlock(
+        "logic.py", "    return a + b", "    return (a + b)\n")])[0]
+    assert good.ok is True
+
+
+def test_a_broken_file_may_still_be_edited(tmp_path):
+    """The rule is monotone: never make a parsing file unparsable — but a file
+    that already fails to parse must accept edits, or it could never be fixed."""
+    from spiral.edits import EditBlock, apply_edits
+
+    target = tmp_path / "broken.py"
+    target.write_text("def f(:\n    pass\n")
+    step = apply_edits(tmp_path, [EditBlock(
+        "broken.py", "def f(:", "def f(x:")])[0]
+    assert step.ok is True, "an intermediate edit on a broken file must land"
+
+
+def test_inline_html_scripts_are_held_to_the_same_bar(tmp_path):
+    import shutil as _sh
+
+    from spiral.edits import EditBlock, apply_edits
+
+    if not _sh.which("node"):
+        return
+    page = tmp_path / "index.html"
+    page.write_text("<button>Go</button><script>const x = 1;</script>\n")
+    bad = apply_edits(tmp_path, [EditBlock(
+        "index.html", "const x = 1;", "const x = 1;;)\n")])[0]
+    assert bad.ok is False and "stop parsing" in bad.reason
+    assert "const x = 1;</script>" in page.read_text()
+
+
+def test_a_new_file_that_does_not_parse_is_never_created(tmp_path):
+    from spiral.edits import EditBlock, apply_edits
+
+    result = apply_edits(tmp_path, [EditBlock("fresh.py", "", "def broken(:\n")])[0]
+    assert result.ok is False and "would not parse" in result.reason
+    assert not (tmp_path / "fresh.py").exists()

@@ -322,23 +322,49 @@ class RefineRun:
             "You are reading a LaTeX research manuscript. Extract what it IS — no "
             "judgement, no invention. JSON: {\"title\":str, \"field\":str, "
             "\"summary\":str, \"contributions\":[str], \"key_results\":[str], "
-            "\"terminology\":[str], \"arxiv_categories\":[str], \"queries\":[str]} — "
-            "queries: 3-5 short arXiv keyword searches (3-6 words) that would surface "
-            "the closest related literature.",
+            "\"terminology\":[str], \"domain\":\"physics-math|bio-med|mixed\", "
+            "\"channels\":[\"arxiv\"] or [\"biorxiv\",\"medrxiv\",\"europepmc\",\"pubmed\",\"crossref\"], "
+            "\"arxiv_categories\":[str], \"queries\":[str]} — channels: pick the databases "
+            "the related literature lives in (arxiv for physics/math/CS; the bio/med "
+            "databases for neuroscience/biology/medicine). queries: 3-5 short keyword "
+            "searches (3-6 words) that would surface the closest related literature.",
             f"MANUSCRIPT:\n{body}", role="critic", max_tokens=4096)
         if not got.get("queries"):
             raise RefineError("could not understand the manuscript (no search queries)")
         return got
 
     def build_corpus(self, understanding: dict) -> None:
+        from spiral import sources as S
+
         cats = [c for c in (understanding.get("arxiv_categories") or [])
                 if re.fullmatch(r"[a-z-]+(?:\.[A-Za-z-]+)?", str(c))][:4]
         queries = [str(q) for q in understanding.get("queries", [])][:4]
+        adapters = {"biorxiv": S.biorxiv, "medrxiv": S.medrxiv, "europepmc": S.europepmc,
+                    "pubmed": S.pubmed, "crossref": S.crossref}
+        channels = [c for c in (understanding.get("channels") or [])
+                    if c in ({"arxiv"} | set(adapters))]
+        if not channels:                             # deterministic fallback by field text
+            hint = (understanding.get("field", "") + " "
+                    + " ".join(understanding.get("terminology") or [])).lower()
+            channels = (["europepmc", "biorxiv", "medrxiv", "pubmed"]
+                        if re.search(r"neuro|bio|cell|clinic|medic|gene|protein|disease|"
+                                     r"patient|brain|immun|cancer", hint) else ["arxiv"])
+        self._say(f"  literature channels: {', '.join(channels)}")
         for i, q in enumerate(queries):
             if i:
-                time.sleep(3)                       # arXiv politeness — hard lesson
-            added = self.corpus.build(q, k=6, categories=cats or None,
-                                      on=lambda m: self._say(f"  {m}"))
+                time.sleep(3)                       # provider politeness — hard lesson
+            added = []
+            if "arxiv" in channels:
+                added += self.corpus.build(q, k=6, categories=cats or None,
+                                           on=lambda m: self._say(f"  {m}"))
+            for chan in channels:
+                if chan == "arxiv":
+                    continue
+                try:
+                    recs = adapters[chan](q, k=6)
+                except Exception:
+                    recs = []
+                added += self.corpus.ingest(recs, on=lambda m: self._say(f"  {m}"))
             self._say(f"  search “{q[:48]}” → +{len(added)}")
         if self.corpus.papers:
             try:

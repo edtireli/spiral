@@ -31,6 +31,13 @@ class SkillCard:
     description: str
     body: str
     path: Path
+    # ecosystems this discipline applies to; empty means universal. Without this
+    # gate, generic words in spiral's own bootstrap prompt ("configuration,
+    # resources, manifests") scored android-kotlin at exactly min_overlap and
+    # injected Kotlin discipline into every task of a Python project, while
+    # dependency-medic — the skill for the missing-dependency failure actually
+    # being hit — scored 1 and was filtered out.
+    applies_to: frozenset[str] = frozenset()
 
 
 def _parse(path: Path) -> SkillCard | None:
@@ -48,7 +55,13 @@ def _parse(path: Path) -> SkillCard | None:
     )
     if "name" not in fields or "description" not in fields:
         return None
-    return SkillCard(fields["name"], fields["description"], body, path)
+    applies = frozenset(
+        tag.strip().lower()
+        for tag in fields.get("applies_to", "").replace(",", " ").split()
+        if tag.strip()
+    )
+    return SkillCard(
+        fields["name"], fields["description"], body, path, applies)
 
 
 def load_skills(workspace: str | Path | None = None) -> list[SkillCard]:
@@ -81,7 +94,48 @@ def _tokens(text: str) -> set[str]:
 _EXT_ROUTES = {
     "android-kotlin": (".kt", ".kts", ".xml", "androidmanifest", "gradle"),
     "dark-ui-design": ("colors.xml", "themes.xml", "styles.xml", "layout/"),
+    # file evidence beats prose overlap, and a task editing a stylesheet needs the
+    # design discipline whatever its title happens to say. Without this, "Style
+    # keypad keys" matched on wording while "Create index.html with CSS custom
+    # properties" matched nothing.
+    "design-principles": (
+        ".css", ".scss", ".sass", ".less", ".html", ".htm", ".jsx", ".tsx",
+        ".vue", ".svelte", "layout/", "styles.xml", "themes.xml",
+    ),
 }
+
+
+def project_ecosystems(root: str | Path) -> set[str]:
+    """What this workspace actually is, from files rather than from prose."""
+    root = Path(root)
+
+    def has(*names: str) -> bool:
+        for name in names:
+            try:
+                if next((p for p in root.rglob(name) if not any(
+                        part in {".git", ".spiral", "node_modules", "build", "dist"}
+                        for part in p.parts)), None) is not None:
+                    return True
+            except OSError:
+                continue
+        return False
+
+    found: set[str] = set()
+    if has("AndroidManifest.xml", "build.gradle", "build.gradle.kts"):
+        found.add("android")
+    if has("*.xcodeproj", "*.xcworkspace", "Package.swift"):
+        found.add("ios")
+    if has("package.json"):
+        found.add("node")
+    if has("pyproject.toml", "requirements.txt", "*.py"):
+        found.add("python")
+    if has("index.html", "*.css"):
+        found.add("web")
+    if has("Cargo.toml"):
+        found.add("rust")
+    if has("go.mod"):
+        found.add("go")
+    return found
 
 
 def match_skills(
@@ -90,6 +144,7 @@ def match_skills(
     files: list[str] | None = None,
     top: int = 2,
     min_overlap: int = 2,
+    ecosystems: set[str] | None = None,
 ) -> list[SkillCard]:
     """Rank skills for a task: file-extension routes are decisive, keyword overlap
     between task text and skill name+description breaks the rest.
@@ -101,6 +156,8 @@ def match_skills(
     haystack = " ".join(files or []).lower() + " " + task_text.lower()
     scored = []
     for c in cards:
+        if c.applies_to and ecosystems is not None and not (c.applies_to & ecosystems):
+            continue          # right words, wrong language
         overlap = len(task & _tokens(c.name + " " + c.description))
         if any(ext in haystack for ext in _EXT_ROUTES.get(c.name, ())):
             overlap += min_overlap  # decisive boost

@@ -22,15 +22,24 @@ import os
 import re
 import tarfile
 from dataclasses import asdict, dataclass, field
+from dataclasses import fields as dataclass_fields
 from pathlib import Path
 
 MAX_DOWNLOAD = 30_000_000       # 30 MB cap per file
 _ARXIV_ID = re.compile(r"(\d{4}\.\d{4,5})(v\d+)?|([a-z-]+/\d{7})(v\d+)?", re.I)
 
 
+_UID_NS = ("doi", "pmid", "pmc", "epmc", "arxiv")
+
+
 @dataclass
 class Paper:
-    """One source paper. ``text`` is the extracted body (TeX preferred, else PDF)."""
+    """One source paper. ``text`` is the extracted body (TeX/JATS preferred, else PDF).
+
+    ``arxiv_id`` is a historical name: it holds the record's identifier, which for
+    non-arXiv sources is a **namespaced uid** (``doi:10.1101/…``, ``pmid:…``, ``pmc:…``).
+    ``bare_id`` is the dedup key across every provider; ``doi`` is the cross-provider
+    join key (a bioRxiv preprint and its journal version share a DOI)."""
     arxiv_id: str
     title: str = ""
     authors: list[str] = field(default_factory=list)
@@ -41,14 +50,25 @@ class Paper:
     pdf_path: str = ""
     tex_path: str = ""
     text: str = ""
-    body_source: str = ""       # tex | pdf | abstract | missing
+    body_source: str = ""       # tex | jats | pdf | abstract | missing
     fetch_errors: list[str] = field(default_factory=list)
     content_hash: str = ""
+    source: str = "arxiv"       # arxiv | biorxiv | medrxiv | pmc | pubmed | crossref | preprint
+    doi: str = ""
+    venue: str = ""
+    full_text_url: str = ""
+    full_text_kind: str = ""    # jats | pdf | tex | ""
 
     @property
     def bare_id(self) -> str:
-        """Version-stripped id (``2401.01234v2`` → ``2401.01234``) — the dedup key."""
-        return self.arxiv_id.split("v")[0]
+        """The dedup key. Bare arXiv ids stay version-stripped (``2401.01234v2`` →
+        ``2401.01234``) so existing stores are unchanged; namespaced uids are already
+        bare and pass through (``doi:10.1101/…``)."""
+        s = self.arxiv_id
+        if ":" in s and s.split(":", 1)[0].lower() in _UID_NS:
+            head, rest = s.split(":", 1)
+            return rest.split("v")[0] if head.lower() == "arxiv" else f"{head.lower()}:{rest}"
+        return s.split("v")[0]
 
 
 def parse_arxiv_id(s: str) -> str | None:
@@ -208,8 +228,12 @@ class Corpus:
     def _load(self):
         f = self._manifest()
         if f.is_file():
+            fields = {fld.name for fld in dataclass_fields(Paper)}
             for d in json.loads(f.read_text()).get("papers", []):
-                self.papers[Paper(**d).bare_id] = Paper(**d)
+                # tolerate schema drift in either direction: drop unknown keys so a
+                # store written by a newer/older spiral still loads
+                p = Paper(**{k: v for k, v in d.items() if k in fields})
+                self.papers[p.bare_id] = p
 
     def save(self):
         target = self._manifest()
@@ -250,7 +274,14 @@ class Corpus:
         if incoming.categories:
             existing.categories = list(dict.fromkeys(existing.categories + incoming.categories))
 
+    def _is_arxiv(self, paper: Paper) -> bool:
+        return (paper.source in ("", "arxiv")
+                and parse_arxiv_id(paper.arxiv_id) is not None
+                and ":" not in paper.arxiv_id.split("/")[0])
+
     def _fetch_bodies(self, paper: Paper):
+        if not self._is_arxiv(paper):
+            return self._fetch_bodies_source(paper)
         bid = paper.bare_id
         pdir = self.root / "papers" / bid.replace("/", "_")
         pdir.mkdir(parents=True, exist_ok=True)
@@ -287,6 +318,78 @@ class Corpus:
         paper.fetch_errors = list(dict.fromkeys(paper.fetch_errors))
         paper.content_hash = hashlib.sha256(
             (paper.text or "").encode("utf-8", "ignore")).hexdigest() if paper.text else ""
+
+    def _fetch_bodies_source(self, paper: Paper):
+        """Body fetch for non-arXiv sources: JATS full text (Europe PMC), a direct PDF
+        (bioRxiv/medRxiv/Crossref), or an Unpaywall-resolved OA PDF for a DOI. Same
+        contract as the arXiv path: best available body, abstract as the floor, never
+        raises."""
+        from spiral.sources import jats_to_text, unpaywall
+
+        pdir = self.root / "papers" / paper.bare_id.replace("/", "_").replace(":", "_")
+        pdir.mkdir(parents=True, exist_ok=True)
+        kind, url = paper.full_text_kind, paper.full_text_url
+
+        if not url and paper.doi:                            # resolve an OA PDF by DOI
+            try:
+                url, kind = unpaywall(paper.doi)
+            except Exception as exc:
+                paper.fetch_errors.append(f"unpaywall: {type(exc).__name__}: {exc}")
+
+        if kind == "jats" and url:
+            rep: dict = {}
+            raw = _download(url, report=rep)
+            if raw:
+                text = jats_to_text(raw.decode("utf-8", "ignore"))
+                if text:
+                    xp = pdir / "fulltext.xml"
+                    xp.write_bytes(raw)
+                    paper.text, paper.body_source = text, "jats"
+            elif rep.get("error"):
+                paper.fetch_errors.append(f"jats: {rep['error']}")
+        elif kind == "pdf" and url:
+            rep = {}
+            pdf = _download(url, report=rep)
+            if pdf and pdf[:4] == b"%PDF":
+                pp = pdir / "paper.pdf"
+                pp.write_bytes(pdf)
+                paper.pdf_path = str(pp)
+                text = extract_pdf_text(pp)
+                if text:
+                    paper.text, paper.body_source = text, "pdf"
+            elif rep.get("error"):
+                paper.fetch_errors.append(f"pdf: {rep['error']}")
+
+        if not paper.text:
+            paper.text = paper.abstract
+            paper.body_source = "abstract" if paper.abstract else "missing"
+        paper.fetch_errors = list(dict.fromkeys(paper.fetch_errors))
+        paper.content_hash = hashlib.sha256(
+            (paper.text or "").encode("utf-8", "ignore")).hexdigest() if paper.text else ""
+
+    def ingest(self, records, *, on=None) -> list[Paper]:
+        """Add normalised :class:`sources.Record` objects (bioRxiv, medRxiv, PMC,
+        PubMed, Crossref) into the store, fetching bodies. Returns newly-added papers.
+        The arXiv :meth:`build` path is untouched."""
+        added: list[Paper] = []
+        for r in records:
+            existed = self.has(r.uid)
+            if on and not existed:
+                on(r.uid)
+            p = Paper(
+                arxiv_id=r.uid, title=r.title, authors=list(r.authors),
+                abstract=r.abstract, published=r.published,
+                categories=list(getattr(r, "subjects", None) or []),
+                url=r.url, source=r.source, doi=r.doi, venue=r.venue,
+                full_text_url=r.full_text_url, full_text_kind=r.full_text_kind)
+            stored = self.add(p, fetch=not existed)
+            if existed:
+                if (not stored.text or stored.body_source in {"", "abstract", "missing"}):
+                    self._fetch_bodies(stored)
+            else:
+                added.append(stored)
+        self.save()
+        return added
 
     def build(self, query: str, k: int = 8, *, categories=None, on=None) -> list[Paper]:
         """Search arXiv (optionally restricted to ``categories``) and ingest the top
@@ -403,9 +506,16 @@ class Corpus:
             round_report["frontier_truncated"] = len(candidates) > cap
             for aid in candidates[:cap]:
                 e: Edge = meta.get(aid) or Edge(arxiv_id=aid)
+                # carry the neighbour's real source so a bio/med stub (doi:/pmid:/pmc:)
+                # fetches its body through the right adapter, not an arXiv 404
+                src = getattr(e, "source", "") or (
+                    "arxiv" if ":" not in aid else aid.split(":", 1)[0])
+                url = getattr(e, "url", "") or (
+                    f"https://arxiv.org/abs/{aid}" if src == "arxiv" else "")
                 try:
                     p = self.add(Paper(arxiv_id=aid, title=e.title, authors=e.authors,
-                                       url=f"https://arxiv.org/abs/{aid}"), fetch=True)
+                                       url=url, source=src or "arxiv",
+                                       doi=getattr(e, "doi", "") or ""), fetch=True)
                 except Exception as exc:
                     err = {"id": aid, "error": f"{type(exc).__name__}: {exc}"}
                     round_report["errors"].append(err)

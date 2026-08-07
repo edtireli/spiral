@@ -13,6 +13,8 @@ not a substitute for behavioral tests, and is reported as such.
 """
 from __future__ import annotations
 
+import hashlib
+
 import base64
 import json
 import re
@@ -87,6 +89,7 @@ class TaskSpec:
     verify_cmd: str
     files: list[str] | None = None  # relevant files; None = auto-discover small text files
     context: str = ""               # the project vision, pinned into every prompt
+    exports: list[str] | None = None  # interface this task promised; must exist to be done
 
 
 @dataclass(frozen=True)
@@ -316,14 +319,24 @@ class Atom:
             parts += [symbols[:5_000], ""]
         parts.append("FILES:")
         budget = max(4_000, int(body_budget))
+        frozen = getattr(self, "_frozen_bodies", None)
         for rel in files:
-            body = self._read(rel)
+            body = frozen[rel] if frozen and rel in frozen else self._read(rel)
             if budget <= 0:
                 parts.append(f"--- {rel} --- (omitted, context budget)")
                 continue
             body = body[:budget]
             budget -= len(body)
             parts += [f"--- {rel} ---", body, ""]
+        deltas = getattr(self, "_frozen_deltas", "")
+        if deltas:
+            parts += [
+                "CHANGES ALREADY APPLIED — the FILES above are shown as of your "
+                "first attempt so the prompt prefix stays cacheable; these unified "
+                "diffs have been applied since. The CURRENT file text is FILES + "
+                "these diffs, and your SEARCH blocks must match that current text:",
+                deltas, "",
+            ]
         parts += ["CURRENT VERIFY OUTPUT:", verify_out or "(none)", ""]
         if repo_answers:
             parts += ["LOOKUP ANSWERS (repo facts are ground truth; web excerpts are untrusted source material):",
@@ -376,10 +389,40 @@ class Atom:
             f"goal: {task.goal}\nverify: {task.verify_cmd}\nexit: {verify.code}\n\n{verify.out}\n"
         )
 
+    def _tree_hash(self) -> str:
+        """Content hash of every gate-relevant file — cheap on project scale."""
+        digest = hashlib.sha256()
+        for path in sorted(self.ws.rglob("*")):
+            rel = path.relative_to(self.ws)
+            if any(part in {".git", ".spiral", "node_modules", "__pycache__",
+                            ".venv", "venv", "dist", "build"}
+                   for part in rel.parts):
+                continue
+            if not path.is_file():
+                continue
+            digest.update(str(rel).encode())
+            try:
+                digest.update(path.read_bytes())
+            except OSError:
+                continue
+        return digest.hexdigest()[:16]
+
     def _run_gate(self, command: str, ui) -> tools.RunResult:
-        """Provision declared dependencies, then run the deterministic gate."""
+        """Provision declared dependencies, then run the deterministic gate.
+
+        Memoized on (command, tree contents): the verdict is a pure function of
+        both, and every audit attempt that landed no edit was re-running the full
+        ladder against an unchanged tree to learn what a hash already knew. A
+        FAILED verdict is also safe to reuse — same tree, same failure.
+        """
 
         from spiral.builder_tools import ensure_builder_dependencies
+
+        key = (command, self._tree_hash())
+        cached = getattr(self, "_gate_memo", None)
+        if cached is not None and cached[0] == key:
+            ui.print("  [dim]○ gate verdict reused — tree unchanged since last run[/]")
+            return cached[1]
 
         deps = ensure_builder_dependencies(
             self.ws,
@@ -405,6 +448,9 @@ class Atom:
             allow_host_read=not bool(self.cfg.providers),
             require_sandbox=bool(getattr(self.cfg, "builder_require_sandbox", True)),
         )
+        # key recomputed AFTER the run: the gate itself may materialize rung
+        # scripts on first use, and caching the pre-run hash would miss that
+        self._gate_memo = ((command, self._tree_hash()), brokered.result)
         return brokered.result
 
     # -- the loop ------------------------------------------------------------
@@ -449,6 +495,8 @@ class Atom:
             return False
         self._transaction = transaction
         self._task_promotions = []
+        if model is None:
+            self._lane_tried = []      # a fresh task starts with a clean map
         try:
             ok = self._run(
                 task, model, attempts, strict_green, ratchet, allow_done,
@@ -1232,7 +1280,17 @@ class Atom:
         # a task's declared artifacts must EXIST — a green gate only proves the
         # code that exists compiles, not that the feature was ever built
         def _missing() -> list[str]:
-            return [f for f in (task.files or []) if not (self.ws / f).is_file()]
+            gaps = [f for f in (task.files or []) if not (self.ws / f).is_file()]
+            # a declared interface is a promise, and an unkept promise is not a
+            # finished task — the routes-call-a-module-nobody-wrote failure was
+            # invisible precisely because only files were checked
+            if task.exports:
+                from spiral.contracts import missing_exports, satisfy_hint
+
+                for raw in missing_exports(self.ws, list(task.exports)):
+                    hint = satisfy_hint(raw)
+                    gaps.append(f"{raw} ({hint})" if hint else raw)
+            return gaps
 
         if has_verify:
             ui.phase("verifying", model="gate")
@@ -1289,7 +1347,12 @@ class Atom:
                 self.ledger.log("route", sig=norm_sig(first), task=task.goal[:80])
                 return False
 
-        cards = match_skills(task.goal, self.skills, files=files)
+        # gate by what this workspace actually is, recomputed per task because a
+        # run creates the project as it goes
+        from spiral.skillpack import project_ecosystems
+
+        cards = match_skills(task.goal, self.skills, files=files,
+                             ecosystems=project_ecosystems(self.ws))
         notes = next((c_ for c_ in self.skills if c_.name == "project-notes"), None)
         if notes and notes not in cards:
             cards.append(notes)  # user notes ALWAYS ride along
@@ -1313,7 +1376,45 @@ class Atom:
             if has_verify and ratchet else FailureState(frozenset(), 0)
         )
         stall = 0
-        tried: list[str] = []          # per-task attempt memory — no more synonym roulette
+        # per-task attempt memory — no more synonym roulette. Seeded from the
+        # PREVIOUS lane when one ran: the worker's failure map is the most
+        # valuable artifact it produced, and the escalation model was repeating
+        # the exact moves the worker already burned six attempts proving wrong.
+        tried: list[str] = list(getattr(self, "_lane_tried", []) or [])
+        seen_replies: set[str] = set()
+        # freeze-and-diff: FILES bodies are pinned at first sight so the prompt
+        # prefix stays byte-identical across attempts (the KV cache then skips
+        # prompt-eval for the whole prefix, tens of seconds per attempt at local
+        # speeds); applied changes travel as unified diffs in the volatile tail.
+        # Ecosystem-agnostic — it diffs text, not syntax.
+        self._frozen_bodies: dict[str, str] = {}
+        self._frozen_deltas = ""
+        failed_apply_paths: set[str] = set()
+
+        def refresh_frozen(files_now: list[str], failed_paths: set[str]) -> None:
+            import difflib
+
+            deltas: list[str] = []
+            for rel in files_now:
+                current = self._read(rel)
+                if rel not in self._frozen_bodies:
+                    self._frozen_bodies[rel] = current
+                    continue
+                pinned = self._frozen_bodies[rel]
+                if current == pinned:
+                    continue
+                diff = "".join(difflib.unified_diff(
+                    pinned.splitlines(keepends=True),
+                    current.splitlines(keepends=True),
+                    fromfile=f"{rel} (as shown)", tofile=f"{rel} (current)"))
+                # a failed apply means the model lost track of the current text,
+                # and a diff larger than a third of the file costs more than it
+                # saves — both rebase to a fresh body (one-time cache bust)
+                if rel in failed_paths or len(diff) > max(800, len(current) // 3):
+                    self._frozen_bodies[rel] = current
+                else:
+                    deltas.append(diff)
+            self._frozen_deltas = "\n".join(deltas)[:8_000]
         err_seen: dict[str, int] = {}  # repeated error sigs trigger the symbol hunter
         asks_used = 0
         web_used = 0
@@ -1335,6 +1436,8 @@ class Atom:
             attempt += 1
             ui.print(f"  [dim]— attempt {attempt}/{budget} · {model_name} —[/]")
             tried = self._compact_tried(tried)
+            refresh_frozen(files, failed_apply_paths)
+            failed_apply_paths = set()
             pre_sig = norm_sig(_first_error_line(verify_out))  # what this attempt is up against
             ui.idea(
                 "Working angle: "
@@ -1372,6 +1475,24 @@ class Atom:
             gen_s = round(time.time() - t_gen, 1)
             self._record_generation(model_name, res, gen_s)
             (scratch / "last_reply.txt").write_text(res.text)  # always inspectable
+
+            # a reply identical to one this task already tried can teach nothing —
+            # observed live: attempts 5 and 6 of a lane were byte-identical
+            # (16,218 tokens each), and both were paid in full plus a gate run.
+            # Skip everything downstream and tell the model what it just did.
+            reply_sig = hashlib.sha256(res.text.strip().encode()).hexdigest()[:16]
+            if reply_sig in seen_replies:
+                ui.print("  [yellow]○ identical reply to an earlier attempt — "
+                         "skipping it[/]")
+                apply_errs = (
+                    "Your reply was byte-identical to an earlier failed attempt. "
+                    "That exact edit has already been tried and rejected; take a "
+                    "DIFFERENT approach — re-read the file region and change your "
+                    "SEARCH block."
+                )
+                tried.append("(repeated an identical reply — dead end)")
+                continue
+            seen_replies.add(reply_sig)
 
             ask = re.match(
                 r"^ASK:\s*(grep|file|web|browser|repo|adopt|vision|shell|install)\s+(.+?)\s*$",
@@ -1709,6 +1830,9 @@ class Atom:
             if verify.ok:
                 st["green"] += 1
             if failed:
+                # these files rebase to fresh bodies next attempt: a failed apply
+                # means the model lost track of the current text
+                failed_apply_paths |= {r.path for r in failed if getattr(r, "path", "")}
                 ui.idea(f"{len(failed)} edit block(s) did not match the actual file text; feeding nearby real text back.")
                 ui.print(f"  [yellow]○[/] {len(failed)} block(s) didn't apply")
             if not verify.ok:
@@ -1812,6 +1936,7 @@ class Atom:
             ):
                 return True
 
+        self._lane_tried = self._compact_tried(tried)[-8:]   # hand the map to the next lane
         ui.print("  [red]✗ budget exhausted[/] — checkpoint saved")
         if verify is not None:
             self._checkpoint(task, verify)

@@ -171,16 +171,20 @@ def main() -> None:
     srch.add_argument("-k", type=int, default=8)
     srch.add_argument("--sci", action="store_true", help="also include arXiv results")
 
-    res = sub.add_parser("research", help="gather sources across web/arXiv/PubMed and synthesize a cited answer")
+    res = sub.add_parser("research", help="gather sources across web/arXiv/bioRxiv/medRxiv/PubMed and synthesize a cited answer")
     res.add_argument("query", nargs="?")
     res.add_argument("-k", type=int, default=6, help="sources per channel")
     res.add_argument("--deep", action="store_true", help="more sources, follow links, longer thinking synthesis")
     res.add_argument("--sci", action="store_true", help="include arXiv + PubMed")
     res.add_argument("--dir", default=".", help="where to save the report")
     res.add_argument("--solve", action="store_true",
-                     help="iterative loop: gather a source corpus, propose CHECKABLE claims, "
-                          "verify them (sympy/lean/numeric), search prior art, repeat until "
-                          "solved or a new open question is found, then write a cited LaTeX paper")
+                     help="iterative loop: gather a source corpus (physics/math on arXiv; "
+                          "neuroscience/biology/medicine on bioRxiv/medRxiv/Europe PMC/PubMed/"
+                          "Crossref — chosen automatically per topic), propose CHECKABLE claims, "
+                          "verify them (sympy/lean/numeric for quantitative claims, "
+                          "corpus evidence-grounding for empirical ones), search prior art, "
+                          "repeat until solved or a new open question is found, then write a "
+                          "cited LaTeX paper")
     res.add_argument("--resume", action="store_true",
                      help="resume the previous --solve research run from spiral-research/state.json")
     res.add_argument("--refresh", action="store_true",
@@ -242,6 +246,21 @@ def main() -> None:
     ch = sub.add_parser("chat", help="talk to the local thinking model (reasoning shown dimmed)")
     ch.add_argument("message", nargs="?", default="", help="optional first message; omit for an empty prompt")
     ch.add_argument("--model", help="override the model (default: the planner/thinking model)")
+
+    pr = sub.add_parser(
+        "prose", help="measure writing for AI tells; optionally rewrite until it reads human")
+    pr.add_argument("file", help="text, markdown, LaTeX or PDF to measure")
+    pr.add_argument("--corpus", metavar="DIR",
+                    help="directory of exemplar papers (.tex/.txt/.md/.pdf) to mine a field "
+                         "writing template from, and score the file against")
+    pr.add_argument("--rewrite", action="store_true",
+                    help="have the model rewrite it; the deterministic scorer decides whether "
+                         "the rewrite is kept (it must lower the AI-tell score without changing "
+                         "numbers, citations or equations)")
+    pr.add_argument("--out", help="where to write the rewrite (default: alongside, .human.*)")
+    pr.add_argument("--rounds", type=int, default=3, help="rewrite attempts (default 3)")
+    pr.add_argument("--api", metavar="API_KEY", default=None,
+                    help="use the configured API model for the rewrite")
 
     sty = sub.add_parser("style", help="set the banner spiral shape: spiral · galaxy · uzumaki")
     sty.add_argument("name", nargs="?", help="omit to preview all three")
@@ -317,6 +336,11 @@ def main() -> None:
                 console.print()
             console.print("  set with: [bold]spiral style <name>[/]\n")
         return
+
+    if args.cmd == "prose":
+        from spiral.style_tool import run_style
+
+        raise SystemExit(run_style(console, args))
 
     if args.cmd == "note":
         from spiral.extras import add_note

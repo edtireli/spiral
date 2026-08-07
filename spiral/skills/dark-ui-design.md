@@ -1,6 +1,7 @@
 ---
 name: dark-ui-design
 description: Accessible dark-surface design for products whose domain genuinely benefits from a dark theme.
+applies_to: android web ios desktop
 ---
 # Dark-surface craft
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Iterator
 
+import contextlib
 import httpx
 
 
@@ -34,6 +35,7 @@ class Ollama:
     def __init__(self, base_url: str = "http://localhost:11434", timeout: float = 1200.0,
                  providers: dict | None = None):
         self.base_url = base_url.rstrip("/")
+        self._no_think: set[str] = set()   # families that reject the thinking toggle
         self._timeout = timeout
         self._client = httpx.Client(timeout=timeout)
         if providers is None:
@@ -90,9 +92,10 @@ class Ollama:
         payload: dict[str, Any] = {
             "model": model,
             "messages": messages,
-            "think": think,
             "options": options,
         }
+        if model not in getattr(self, "_no_think", set()):
+            payload["think"] = think
         if keep_alive is not None:
             payload["keep_alive"] = keep_alive  # stop 5-min idle unloads mid-run
         if fmt is not None:
@@ -133,6 +136,12 @@ class Ollama:
         if on_delta is None:
             payload["stream"] = False
             r = self._client.post(f"{self.base_url}/api/chat", json=payload)
+            if r.status_code == 400 and payload.pop("think", None) is not None:
+                # not every family accepts the thinking toggle (gemma rejects what
+                # qwen requires); a 400 with think set is retried without it, and
+                # the model set stays swappable — the same lazy correction chat
+                # already uses
+                r = self._client.post(f"{self.base_url}/api/chat", json=payload)
             r.raise_for_status()
             data = r.json()
             msg = data.get("message", {}) or {}
@@ -148,7 +157,23 @@ class Ollama:
         text_parts: list[str] = []
         think_parts: list[str] = []
         last: dict = {}
-        with self._client.stream("POST", f"{self.base_url}/api/chat", json=payload) as r:
+        # not every family accepts the thinking toggle (gemma rejects what qwen
+        # requires). A 400 arrives before any evaluation, so retrying without
+        # `think` costs nothing; the model is remembered so later calls skip the
+        # round-trip entirely. A plain loop — two tries at most.
+        for attempt in (1, 2):
+            response = self._client.send(
+                self._client.build_request(
+                    "POST", f"{self.base_url}/api/chat", json=payload),
+                stream=True)
+            if (response.status_code == 400 and attempt == 1
+                    and payload.get("think") is not None):
+                response.close()
+                self._no_think.add(model)
+                payload.pop("think", None)
+                continue
+            break
+        with contextlib.closing(response) as r:
             r.raise_for_status()
             for line in r.iter_lines():
                 if not line:

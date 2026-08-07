@@ -35,6 +35,15 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 
+# Machine-decidable strengths always qualify a finding as a real result. For empirical
+# fields (neuroscience/biology/medicine) there is no SymPy oracle, so a claim grounded
+# in quoted anchors across ≥N independent papers — with disagreement surfaced — is the
+# accepted instrument and qualifies too. It is NOT accepted for physics/math, where a
+# proof or numeric certificate is the bar; see _qualifying_strengths().
+_QUALIFYING_MATH = frozenset({"formal", "exact", "computational"})
+_QUALIFYING_EMPIRICAL = frozenset({"grounded"})
+
+
 @dataclass
 class Finding:
     claim: dict
@@ -44,7 +53,7 @@ class Finding:
     round: int
     question: str = ""
     claim_id: str = ""
-    strength: str = "unverified"   # formal | exact | computational | empirical | executable
+    strength: str = "unverified"   # formal | exact | computational | grounded | empirical | executable
     required: bool = True
     replication: dict = field(default_factory=dict)
     obligation_id: str = ""
@@ -70,6 +79,8 @@ class ResearchState:
     research_commit: str = ""
     living_paper: dict = field(default_factory=dict)
     data_resources: dict = field(default_factory=dict)
+    field_domain: str = ""               # physics-math | bio-med | mixed (planner-chosen)
+    channels: list = field(default_factory=list)   # arxiv | biorxiv | medrxiv | europepmc | pubmed | crossref
 
 
 def _extract_json(text: str) -> dict:
@@ -1686,29 +1697,47 @@ class ResearchLoop:
                 claims.append(claim)
         return claims
 
+    # channel name → (adapter, needs-categories?). Europe PMC covers bioRxiv+medRxiv+PMC.
+    _SOURCE_CHANNELS = {"biorxiv", "medrxiv", "europepmc", "pubmed", "crossref"}
+    _BIO_HINTS = re.compile(
+        r"\b(neuro|brain|cortex|neuron|synap|glia|astrocyte|"
+        r"bio|cell|protein|gene|genom|rna|dna|enzyme|kinet|receptor|"
+        r"clinic|patient|disease|cancer|tumou?r|therap|drug|dose|"
+        r"medic|immun|patholog|aggregat|tdp-43|amyloid|tau|als|alzheimer|"
+        r"metabol|physiolog|vascul|blood|tissue)\b", re.I)
+
     def search_plan(self, n: int = 3) -> tuple[list[str], list[str]]:
-        """Decide WHERE on arXiv to look and WHAT to type: the right subject categories
-        plus focused keyword queries. 'Find the right place, then search there' — a
-        number-theory identity belongs in math.NT/math.CO, a gauge anomaly in
-        hep-th/hep-ph; an unrestricted search for a term like 'Ramanujan' drowns in
-        string-theory hits. Returns ``(categories, queries)``."""
+        """Decide WHERE to look and WHAT to type. For physics/math that's arXiv subject
+        categories; for neuroscience/biology/medicine it's bioRxiv, medRxiv, Europe PMC,
+        PubMed and Crossref. 'Find the right place, then search there.' Returns
+        ``(categories, queries)`` and sets ``state.field_domain`` + ``state.channels``
+        as a side effect (so the 2-tuple contract callers/tests rely on is preserved)."""
         if self._task_mode() == "expository" and self._literal_identity_claims():
+            self.state.field_domain, self.state.channels = "physics-math", ["arxiv"]
             return ["math.HO"], [
                 "binomial theorem proof",
                 "polynomial expansion identity",
                 "elementary algebraic identities",
             ][:n]
         system = (
-            "Choose where on arXiv to search for the TOPIC and what to type. Reply ONLY "
-            'JSON {"categories":["math.NT","math.CO"],"queries":["hypergeometric identity","..."]}. '
-            "categories: 1-4 real arXiv category codes for the field (math.NT, math.CO, "
-            "math.CA, math.AG, hep-th, hep-ph, gr-qc, quant-ph, cond-mat.stat-mech, cs.LG, …). "
-            "queries: 2-4 short keyword phrases (3-6 words), no punctuation, no cat: prefixes."
+            "Choose where to search for the TOPIC and what to type. Reply ONLY JSON "
+            '{"domain":"physics-math|bio-med|mixed",'
+            '"channels":["arxiv"] or ["biorxiv","medrxiv","europepmc","pubmed","crossref"],'
+            '"categories":["math.NT"],"queries":["short phrase","..."]}. '
+            "domain: which literature the TOPIC lives in. channels: pick the databases — "
+            "arxiv for physics/math/CS; biorxiv/medrxiv/europepmc/pubmed for "
+            "neuroscience/biology/medicine; crossref for anything with a DOI. "
+            "categories: 1-4 arXiv codes (math.NT, hep-th, gr-qc, q-bio.NC, …) ONLY if "
+            "arxiv is a channel, else []. queries: 2-4 short keyword phrases (3-6 words), "
+            "no punctuation, no prefixes."
         )
         data = self._think_json(
             system, f"TOPIC: {self.state.topic}", role="planner", reasoning=True)
         cats = [c.strip() for c in data.get("categories", []) if isinstance(c, str) and c.strip()][:4]
         qs = [q.strip() for q in data.get("queries", []) if isinstance(q, str) and q.strip()]
+        chans = [c.strip().lower() for c in (data.get("channels") or [])
+                 if isinstance(c, str) and c.strip().lower() in ({"arxiv"} | self._SOURCE_CHANNELS)]
+        domain = str(data.get("domain") or "").strip().lower()
         if not qs:                                   # deterministic fallback: salient keywords
             stop = {"discover", "previously", "unknown", "propose", "verify", "confirm",
                     "write", "against", "literature", "using", "which", "their", "these",
@@ -1716,23 +1745,71 @@ class ResearchLoop:
             words = re.findall(r"[A-Za-z]{4,}", self.state.topic)   # split hyphens/punct
             keys = [w for w in words if w.lower() not in stop][:6]
             qs = [" ".join(keys[:4])] if keys else [self.state.topic[:60]]
+        if not chans:                                # deterministic channel fallback
+            if self._BIO_HINTS.search(self.state.topic):
+                chans, domain = ["europepmc", "biorxiv", "medrxiv", "pubmed"], domain or "bio-med"
+            else:
+                chans, domain = ["arxiv"], domain or "physics-math"
+        self.state.field_domain = domain or ("bio-med" if "arxiv" not in chans else "physics-math")
+        self.state.channels = chans
         return cats, qs[:n]
 
+    def _gather_channels(self, query: str, k: int, on) -> tuple[list, dict]:
+        """Fan out one query across the non-arXiv channels the planner selected, ingest
+        the normalised records, and return ``(added_papers, per-channel health)``."""
+        from spiral import sources as S
+
+        adapters = {
+            "biorxiv": S.biorxiv, "medrxiv": S.medrxiv, "europepmc": S.europepmc,
+            "pubmed": S.pubmed, "crossref": S.crossref,
+        }
+        added, health = [], {}
+        for chan in self.state.channels:
+            if chan == "arxiv" or chan not in adapters:
+                continue
+            rep: dict = {}
+            try:
+                recs = adapters[chan](query, k=k, report=rep)
+            except Exception as exc:               # a provider must never break the loop
+                rep = {"source": chan, "source_ok": False,
+                       "error": f"{type(exc).__name__}: {exc}", "result_count": 0}
+                recs = []
+            health[chan] = {kk: rep.get(kk) for kk in
+                            ("source_ok", "result_count", "error")}
+            added += self.corpus.ingest(recs, on=on)
+        return added, health
+
     def gather(self, query: str, k: int = 8, categories=None) -> int:
-        self._say(f"gather · {('/'.join(categories) + ' · ') if categories else ''}{query[:50]}")
-        added = self.corpus.build(query, k=k, categories=categories,
-                                  on=lambda a: self._say(f"  + {a}"))
-        retrieval = dict(getattr(self.corpus, "last_build_report", {}) or {})
-        # Widen only when the category search itself returned nothing/failed.  A healthy
-        # search whose results are already in the corpus is evidence, not an empty search.
-        if not added and categories and not retrieval.get("result_count"):
-            added = self.corpus.build(query, k=k, on=lambda a: self._say(f"  + {a} (unrestricted)"))
-            retrieval = {
-                "restricted": retrieval,
-                "fallback": dict(getattr(self.corpus, "last_build_report", {}) or {}),
-                "source_ok": bool((getattr(self.corpus, "last_build_report", {}) or {}).get("source_ok")),
-                "result_count": int((getattr(self.corpus, "last_build_report", {}) or {}).get("result_count") or 0),
-            }
+        chans = self.state.channels or ["arxiv"]
+        self._say(f"gather · {('/'.join(categories) + ' · ') if categories else ''}"
+                  f"{('[' + ','.join(chans) + '] ') if chans != ['arxiv'] else ''}{query[:50]}")
+        added, retrieval = [], {}
+        if "arxiv" in chans or not any(c in self._SOURCE_CHANNELS for c in chans):
+            added = self.corpus.build(query, k=k, categories=categories,
+                                      on=lambda a: self._say(f"  + {a}"))
+            retrieval = dict(getattr(self.corpus, "last_build_report", {}) or {})
+            # Widen only when the category search itself returned nothing/failed. A healthy
+            # search whose results are already in the corpus is evidence, not an empty search.
+            if not added and categories and not retrieval.get("result_count"):
+                added = self.corpus.build(query, k=k, on=lambda a: self._say(f"  + {a} (unrestricted)"))
+                retrieval = {
+                    "restricted": retrieval,
+                    "fallback": dict(getattr(self.corpus, "last_build_report", {}) or {}),
+                    "source_ok": bool((getattr(self.corpus, "last_build_report", {}) or {}).get("source_ok")),
+                    "result_count": int((getattr(self.corpus, "last_build_report", {}) or {}).get("result_count") or 0),
+                }
+        # bio/med (and any other non-arXiv) channels
+        src_added, src_health = self._gather_channels(
+            query, k=k, on=lambda a: self._say(f"  + {a}"))
+        added = added + src_added
+        if src_health:
+            retrieval = dict(retrieval)
+            retrieval["channels"] = src_health
+            # the loop's health checks read source_ok/result_count — reflect the union
+            retrieval.setdefault("source_ok", any(
+                h.get("source_ok") for h in src_health.values()))
+            retrieval["result_count"] = int(retrieval.get("result_count") or 0) + sum(
+                int(h.get("result_count") or 0) for h in src_health.values())
         for p in added:
             if p.bare_id not in self.state.corpus_ids:
                 self.state.corpus_ids.append(p.bare_id)
@@ -3263,7 +3340,7 @@ class ResearchLoop:
                     "reason": "formal/exact verifier covers the full encoded proposition",
                 }
             )
-            qualifying = result["strength"] in {"formal", "exact", "computational"}
+            qualifying = result["strength"] in self._qualifying_strengths()
             passed = bool(
                 result["ok"] and qualifying and independence["independent"]
                 and method_audit.get("method_diversity")
@@ -3302,6 +3379,48 @@ class ResearchLoop:
         )
         return report
 
+    def _qualifying_strengths(self) -> set:
+        """Which finding strengths count as a real result. Math/physics: proof or
+        certificate only. Bio/med (empirical): add corpus-grounded evidence, the
+        instrument the user chose for fields without a machine oracle."""
+        base = set(_QUALIFYING_MATH)
+        if getattr(self.state, "field_domain", "") in ("bio-med", "mixed"):
+            base |= _QUALIFYING_EMPIRICAL
+        return base
+
+    def _verify_evidence_claim(self, c: dict) -> Finding:
+        """Ground an empirical claim in the corpus (neuroscience/biology/medicine have no
+        SymPy oracle). Hybrid: if the claim ALSO carries a checkable computation
+        (``code``), the numeric certificate must pass too — so a quantitative bio claim
+        (a rate, a dose-response, a statistic) is machine-checked where it can be and
+        literature-grounded where it can't. Support requires quoted anchors in ≥N
+        independent papers; disagreement is surfaced, never hidden."""
+        from spiral.research_evidence import evidence_support
+
+        statement = str(c.get("statement") or c.get("claim") or c.get("note") or "").strip()
+        min_support = int(c.get("min_support") or 2)
+        ev = evidence_support(statement, list(self.corpus.papers.values()),
+                              min_support=min_support)
+        # persist the grounding certificate — auditable like every other verifier
+        cert = self.dir / f"evidence-{hashlib.sha256(statement.encode()).hexdigest()[:12]}.json"
+        cert.write_text(json.dumps(ev.as_dict(), indent=2, ensure_ascii=False),
+                        encoding="utf-8")
+        ok, detail, strength = ev.supported, ev.detail, "grounded"
+        code = str(c.get("code") or "").strip()
+        if code:                                   # quantitative → machine-check too
+            from spiral.numeric_lab import check_numeric_claim
+            r = check_numeric_claim(code)
+            ok = ok and r.ok
+            strength = "computational" if r.ok else "unverified"
+            detail = f"{detail}; numeric {'passed' if r.ok else 'FAILED: ' + (r.error or '')[:120]}"
+        if not ev.supported:
+            strength = "unverified"
+        c = dict(c)
+        c["evidence_certificate"] = str(cert)
+        c["evidence_support_count"] = ev.support_count
+        c["evidence_dissent_count"] = len(ev.dissent)
+        return self._finding(c, ok, "evidence", detail[:200], strength=strength)
+
     def verify_claims(self, claims: list) -> list[Finding]:
         from spiral.numeric_lab import check_numeric_claim
         from spiral.verify_math import verify
@@ -3313,6 +3432,8 @@ class ResearchLoop:
                 fnd = self._finding(c, r.ok, "numeric", (r.error or r.stdout)[:200],
                                     strength=self._workbench_strength(c, r.ok)
                                     if c.get("validation") else "empirical")
+            elif kind in {"evidence", "empirical", "grounded"}:
+                fnd = self._verify_evidence_claim(c)
             elif kind in {"workbench", "certificate", "code_certificate"}:
                 fnd = self._verify_workbench_claim(c)
             else:
@@ -3469,7 +3590,7 @@ class ResearchLoop:
             " ".join(str((f.get("claim") or {}).get("note", "")).lower().split())
             for f in relevant
         }
-        qualifying_strengths = {"formal", "exact", "computational"}
+        qualifying_strengths = self._qualifying_strengths()
         qualifying = [f for f in relevant if f.get("strength") in qualifying_strengths]
         required = [c for c in (proposal.get("claims") or []) if c.get("required", True)]
         claim_contract_gaps = []
@@ -3668,7 +3789,7 @@ class ResearchLoop:
             before_corpus = len(self.corpus.papers)
             before_qualifying = {
                 f.get("claim_id") for f in self.state.findings
-                if f.get("ok") and f.get("strength") in {"formal", "exact", "computational"}
+                if f.get("ok") and f.get("strength") in self._qualifying_strengths()
             }
 
             per = max(3, int(getattr(
@@ -3773,7 +3894,7 @@ class ResearchLoop:
                 self.state.findings.extend(asdict(f) for f in findings)
                 if (getattr(self.cfg, "research_taste_model", True)
                         and proposal.get("_angle")
-                        and any(f.ok and f.strength in {"formal", "exact", "computational"}
+                        and any(f.ok and f.strength in self._qualifying_strengths()
                                 for f in findings)):
                     self.taste.observe(proposal["_angle"], "verified")
                 if self._task_mode() == "expository":
@@ -3813,7 +3934,7 @@ class ResearchLoop:
                 phase="round", action=decision.get("action", "continue"),
                 qualifying_findings=sum(
                     1 for f in findings
-                    if f.ok and f.strength in {"formal", "exact", "computational"}),
+                    if f.ok and f.strength in self._qualifying_strengths()),
                 completion_ready=bool(self.state.completion.get("ready")),
             )
 
@@ -3824,7 +3945,7 @@ class ResearchLoop:
                 and action in {"continue", "pivot"})
             after_qualifying = {
                 f.get("claim_id") for f in self.state.findings
-                if f.get("ok") and f.get("strength") in {"formal", "exact", "computational"}
+                if f.get("ok") and f.get("strength") in self._qualifying_strengths()
             }
             signature = (
                 bool(self.state.coverage.get("discovery_ready")),

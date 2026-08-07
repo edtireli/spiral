@@ -18,6 +18,8 @@ import json
 import hashlib
 import re
 import shlex
+import shutil
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -33,6 +35,8 @@ from spiral.agent import Atom, TaskSpec
 from spiral.appicon import TOKEN_COLORS, write_android_icon, write_android_tokens
 from spiral.banner import Spinner
 from spiral.config import Config
+from spiral.contracts import lint_contracts
+from spiral.ladder import is_python_gate, venv_prefix
 from spiral.llm import Ollama
 from spiral.planner import (
     Milestone, Plan, Task, analyze_deliverables, coverage_gaps, critique_plan,
@@ -178,12 +182,100 @@ def _detect_gate_here(ws: Path) -> str:
         return "make test && make" if has_test else "make"
     if next(ws.glob("*.sln"), None) or next(ws.glob("*.csproj"), None):
         return "dotnet test"
-    if (ws / "pyproject.toml").is_file() or (ws / "pytest.ini").is_file() or (ws / "tests").is_dir():
-        # exit 5 = "no tests collected" — a project with a pyproject but no tests yet
-        # is not failing, it just has nothing to assert. Treat 5 as green so an early
-        # greenfield project isn't a permanently-red gate; real failures (1) stay red.
-        return "python -m pytest -q || [ $? -eq 5 ]"
+    if (
+        (ws / "pyproject.toml").is_file() or (ws / "pytest.ini").is_file()
+        or (ws / "requirements.txt").is_file() or (ws / "tests").is_dir()
+        or next((p for p in ws.glob("*.py")), None) is not None
+    ):
+        # A ladder, not a single command: parse → load → run → test. `pytest -q`
+        # alone answers "does this work?" with "there are no tests, so yes", which
+        # is how a project that cannot be imported earns a green commit. The
+        # exit-5 tolerance still applies while no test file exists, and the ladder
+        # drops it the moment one does. See spiral/ladder.py.
+        from spiral.ladder import python_ladder
+
+        return python_ladder(ws)
     return ""
+
+
+_TEST_FILE_RX = re.compile(
+    r"(^|[./_-])(test|tests|spec)([._-]|$)|\.(test|spec)\.[jt]sx?$", re.I)
+_SKIP_DIRS = {"node_modules", ".git", "dist", "build", "vendor", "__pycache__",
+              ".spiral", ".venv", "venv", "target", "out", "coverage"}
+
+
+def _orphan_test_files(ws: Path) -> dict[str, list[Path]]:
+    """Test files present in the tree, grouped by language.
+
+    A generated test suite that nothing ever executes is worse than no tests: it
+    reads as evidence while proving nothing. A real run wrote a self-contradicting
+    assertion (-40 and -60 for the same call), committed it, and called the project
+    done — because the project had no manifest, so no test runner was ever detected
+    and the artifact gate only checks that the file *parses*."""
+    import os
+
+    found: dict[str, list[Path]] = {"js": [], "py": []}
+    for dirpath, dirnames, filenames in os.walk(ws):
+        # prune in place — rglob would still WALK node_modules before skipping it
+        dirnames[:] = [d for d in dirnames
+                       if d not in _SKIP_DIRS and not d.startswith(".")]
+        rel_dir = Path(dirpath).relative_to(ws)
+        in_test_dir = any(p.lower() in {"test", "tests", "spec", "__tests__"}
+                          for p in rel_dir.parts)
+        for name in filenames:
+            path = Path(dirpath) / name
+            suffix = path.suffix.lower()
+            if not (bool(_TEST_FILE_RX.search(name)) or in_test_dir):
+                continue
+            if suffix in {".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx"}:
+                found["js"].append(path)
+            elif suffix == ".py" and (path.stem.startswith("test_")
+                                      or path.stem.endswith("_test") or in_test_dir):
+                found["py"].append(path)
+    return {k: sorted(v)[:40] for k, v in found.items() if v}
+
+
+def _orphan_test_gate(ws: Path) -> str:
+    """A command that RUNS the workspace's tests when no manifest-based gate does.
+    Returns '' when there is nothing runnable — never a command that cannot pass for
+    environmental reasons (a missing runner is not the project's fault)."""
+    groups = _orphan_test_files(ws)
+    parts: list[str] = []
+    js = groups.get("js") or []
+    if js and shutil.which("node"):
+        # node >= 18 ships a test runner; older node has no built-in and would fail
+        # for a reason no edit could fix, so verify support before adopting it.
+        try:
+            probe = subprocess.run(["node", "--test", "--test-name-pattern", "^$",
+                                    "--test-only"], cwd=ws, capture_output=True,
+                                   text=True, timeout=30)
+            supported = "bad option" not in (probe.stderr or "").lower()
+        except Exception:
+            supported = False
+        if supported:
+            rel = sorted({str(p.relative_to(ws)) for p in js})
+            parts.append("node --test " + " ".join(shlex.quote(r) for r in rel))
+    py = groups.get("py") or []
+    if py:
+        try:
+            import importlib.util
+
+            has_pytest = importlib.util.find_spec("pytest") is not None
+        except Exception:
+            has_pytest = False
+        if has_pytest:
+            rel = sorted({str(p.relative_to(ws)) for p in py})
+            parts.append(f"{shlex.quote(sys.executable)} -m pytest -q "
+                         + " ".join(shlex.quote(r) for r in rel))
+    return " && ".join(parts)
+
+
+def _runs_tests(command: str) -> bool:
+    """Does this gate command already execute a test suite?"""
+    low = (command or "").lower()
+    return any(tok in low for tok in (
+        "pytest", "npm run test", " test", "--test", "gradlew test", "go test",
+        "cargo test", "mvn test", "unittest", "vitest", "jest"))
 
 
 def detect_gates(ws: Path) -> list[GateSpec]:
@@ -198,12 +290,15 @@ def detect_gates(ws: Path) -> list[GateSpec]:
         gate = _detect_gate_here(project_root)
         if not gate:
             continue
-        if gate.startswith("python "):
+        if is_python_gate(gate):
             venv_bin = (
                 project_root / ".spiral" / "dependency-cache" / "python"
                 / "venv" / "bin"
             )
-            gate = f"PATH={shlex.quote(str(venv_bin))}:\"$PATH\" {gate}"
+            # `export`, not a `VAR=x cmd` prefix: the latter only reaches the
+            # first command of a `&&` chain, so every rung after the first would
+            # run against the wrong interpreter.
+            gate = venv_prefix(venv_bin) + gate
         marker = next((
             name for name in (
                 "gradlew", "package.json", "mvnw", "pom.xml", "Cargo.toml",
@@ -222,7 +317,22 @@ def detect_gates(ws: Path) -> list[GateSpec]:
             rows.append(GateSpec(project_root, gate, marker))
             seen.add(key)
 
-    if not rows:
+    manifest_rows = list(rows)
+
+    # Tests that no gate executes are not evidence. If the workspace carries a test
+    # suite that nothing above runs, promote running it to a gate of its own — a
+    # suite that fails is a RED gate, not an absent one.
+    if not any(_runs_tests(row.command) for row in rows):
+        orphan = _orphan_test_gate(ws)
+        if orphan:
+            key = (str(ws), orphan)
+            if key not in seen:
+                rows.append(GateSpec(ws, orphan, "tests"))
+                seen.add(key)
+
+    # structural integrity still applies when no manifest-based gate was found —
+    # independent of whether an orphan test gate was just added
+    if not manifest_rows:
         from spiral.artifact_gate import verify_workspace
 
         artifact = verify_workspace(ws)
@@ -303,13 +413,57 @@ class Conductor:
         )
         if gate:
             # runtime-footgun linter rides the gate: compiles-fine-crashes-at-runtime
-            # patterns get fixed by the same loop as compile errors
-            gate = f"({gate}) && ({sys.executable} -m spiral.footguns .)"
+            # patterns get fixed by the same loop as compile errors.
+            # `gate` is already a parenthesised `&&`-chain from _compose_gates, and shell
+            # `&&` is associative, so append WITHOUT re-wrapping — re-wrapping produced a
+            # leading `((…))` that zsh/sh parse as an arithmetic expression, breaking the
+            # gate on every task with "bad math expression".
+            gate = f"{gate} && ({shlex.quote(sys.executable)} -m spiral.footguns .)"
             disp += " +footguns"
+            # a page whose <script> does not parse reports "9 verified, 0 errors"
+            # from the artifact gate and earns a commit; the browser finds it far
+            # too late. Composed like footguns rather than replacing anything.
+            from spiral.ladder import compose as _compose, web_rungs
+
+            scripts = web_rungs(self.ws)
+            if scripts:
+                # a BRACE group, not parens: compose() already returns a labelled
+                # `(cmd) || {…}` chain, and wrapping that in `(` produces a leading
+                # `((` — the arithmetic-evaluation trap this file was already bitten
+                # by once. `{ …; }` groups without introducing it.
+                gate = f"{gate} && {{ {_compose(scripts)}; }}"
+                disp += " +scripts"
+            # behaviour rungs, per ecosystem — the runtime probe for a page, a
+            # --help check for a CLI, the in-process app drive for python (that
+            # one lives in the ladder itself). The gate memo keeps repeat runs
+            # free on an unchanged tree, which is what makes a browser-driving
+            # rung affordable at task granularity.
+            from spiral.ladder import behave_rungs
+
+            behave = behave_rungs(self.ws)
+            if behave:
+                gate = f"{gate} && {{ {_compose(behave)}; }}"
+                disp += " +behave"
         if self.cfg.extra_gate:
             # user-defined blocking gate (their linter/tests) — veto power on every task
-            gate = f"({gate}) && ({self.cfg.extra_gate})" if gate else self.cfg.extra_gate
+            gate = f"{gate} && ({self.cfg.extra_gate})" if gate else self.cfg.extra_gate
             disp += " +extra_gate"
+        # the gate is the run's ground truth, so a gate that cannot PARSE is a
+        # broken instrument, not a red verdict — `((…))` composed here once read
+        # as shell arithmetic and every run aborted at bootstrap "fixing" healthy
+        # code. A syntax check at composition time makes that class impossible
+        # to ship: it costs one no-op shell fork and correctly attributes the
+        # fault to the harness.
+        if gate:
+            import subprocess
+
+            parse = subprocess.run(
+                ["/bin/zsh", "-n", "-c", gate], capture_output=True, text=True)
+            if parse.returncode != 0:
+                raise RuntimeError(
+                    "the composed build gate does not parse as shell — this is a "
+                    f"spiral bug, not a project fault: {parse.stderr.strip()[:200]} "
+                    f"· gate: {gate[:200]}")
         self.gate, self.gate_disp = gate, disp
         return True
 
@@ -447,6 +601,10 @@ class Conductor:
         for want in (
                 ".spiral/", "node_modules/", ".venv/", ".pytest_cache/",
                 ".mypy_cache/", ".gradle/", "build/", "app/build/", "target/",
+                # bytecode is regenerated by every gate run, and `git add -A`
+                # tracking it means the next task's transaction sees a dirty
+                # workspace and refuses to commit
+                "__pycache__/", "*.pyc",
                 "local.properties"):
             if want not in lines:
                 lines.append(want)
@@ -460,13 +618,23 @@ class Conductor:
 
     @staticmethod
     def _task_fingerprint(task: Task) -> str:
-        payload = json.dumps({
+        payload = {
             "title": task.title,
             "description": task.description,
             "files": task.files,
             "verify": task.verify,
             "requirements": task.requirements,
-        }, sort_keys=True)
+        }
+        # Contract fields join the fingerprint only when a task HAS them. Adding a
+        # field unconditionally rehashes every task, so an in-flight run resumes at
+        # task 1 and redoes work it had already committed — which is what happened
+        # the first time. A changed contract must invalidate its task; a new field
+        # must not invalidate everyone else's.
+        for field_name in ("exports", "imports"):
+            value = getattr(task, field_name, []) or []
+            if value:
+                payload[field_name] = value
+        payload = json.dumps(payload, sort_keys=True)
         return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
     def _task_is_resumably_done(self, key: str, task: Task) -> bool:
@@ -549,6 +717,11 @@ class Conductor:
         if web_dep or has("index.html") or any(
             k in g for k in (
                 "website", "web app", "web-app", "frontend", "landing page", "single-page",
+                # a calculator "as a static web page" is a UI, and missing that
+                # skipped the design stage, the deterministic foundation, and the
+                # visual review for the most common way people phrase a web goal
+                "web page", "webpage", "html page", "static site", "static page",
+                "single page", "index.html", "web ui", "web interface",
             )
         ):
             return "web"
@@ -620,6 +793,19 @@ class Conductor:
                 out += ("\n\nCANONICAL PALETTE — the app's colors are defined once in "
                         f"res/values/spiral_tokens.xml as {names}. Reference these for accent, "
                         "background, surface, and primary text; do not invent new color values.")
+        brief = getattr(self, "_capability_brief", "")
+        if brief:
+            out += ("\n\nCAPABILITIES FOR THIS BUILD (already resolved by the "
+                    "harness — do not re-install, and do not plan around tools "
+                    "listed as unavailable):\n" + brief[:1500])
+        # OUTSIDE the design.md branch: the generated palette deserves announcing
+        # whenever it exists, and requiring a design brief file to also exist made
+        # the announcement silently skip (no design.md -> workers never told ->
+        # the first task invented a second stylesheet next to the generated one)
+        if (self.ws / "tokens.css").is_file() and self._project_kind(goal) != "android":
+            from spiral.webfoundation import FAVICON_FILE, TOKENS_FILE, tokens_brief
+
+            out += "\n\n" + tokens_brief([TOKENS_FILE, FAVICON_FILE])
         try:
             capabilities = self.toolsmith.capability_brief()
             if capabilities:
@@ -773,7 +959,8 @@ class Conductor:
         reviews = []
         for rnd in range(1, self.cfg.plan_rounds + 1):
             normalize_plan_requirements(spec, plan)
-            lint = lint_plan(plan, existing) + coverage_gaps(spec, plan)
+            lint = (lint_plan(plan, existing) + coverage_gaps(spec, plan)
+                    + lint_contracts(plan, self.ws))
             for d in lint:
                 c.print(f"     [yellow]lint:[/] {d}")
             self.ol.evict(self.cfg.planner.name)  # make room for the critic
@@ -1271,10 +1458,11 @@ class Conductor:
                     dash.gate = self.gate
                 verify = t.verify.strip()
                 if self.gate:
-                    verify = f"({verify}) && ({self.gate})" if verify else self.gate
+                    verify = f"({verify}) && {self.gate}" if verify else self.gate
                 spec_task = TaskSpec(
                     goal=f"{t.title}\n{t.description}".strip(),
                     verify_cmd=verify, files=t.files or None, context=goal,
+                    exports=list(getattr(t, "exports", []) or []) or None,
                 )
                 status = self._run_task(
                     atom, spec_task, dash, allow_done=False,
@@ -1314,7 +1502,7 @@ class Conductor:
             hygiene_gate = str(self.state.get("hygiene_gate") or "")
             if hygiene_gate and self.state.get("hygiene_clean") is False:
                 authoritative_gate = (
-                    f"({hygiene_gate}) && ({self.gate})"
+                    f"({hygiene_gate}) && {self.gate}"
                     if self.gate else hygiene_gate
                 )
             if authoritative_gate:
@@ -1574,6 +1762,28 @@ class Conductor:
                 dash.print(f"  [green]● product audit green[/] · [dim]{path}[/]")
                 self._write_state(product_audit="green", product_audit_report=str(path))
                 return
+            # runtime regressions first go to the deterministic healer: the
+            # harness holds the history and a probe, so which commit broke the
+            # page is a binary search, not a judgment. A model repairing its own
+            # syntax error flip-flopped for whole attempt budgets; the revert
+            # costs zero tokens. Healed -> re-audit; refused -> remediation as
+            # before (the healer is a fast path, never a gatekeeper).
+            if any(str(row.get("id", "")).startswith("runtime-") for row in issues):
+                from spiral.regress import heal, runtime_predicate
+
+                try:
+                    healing = heal(self.ws, runtime_predicate(self.ws))
+                except Exception as exc:
+                    healing = None
+                    dash.print(f"  [yellow]○ healer unavailable[/] [dim]{exc}[/]")
+                if healing and healing.healed:
+                    dash.print(
+                        f"  [green]⟲ healed by revert[/] [dim]{healing.detail}[/]")
+                    self._write_state(last_green_head=tools.run(
+                        "git rev-parse HEAD", self.ws).out.strip())
+                    continue          # re-audit the healed tree
+                if healing and healing.guilty:
+                    dash.print(f"  [yellow]○ healer declined:[/] [dim]{healing.detail}[/]")
             signature = tuple((row.get("id"), row.get("evidence")) for row in issues)
             dash.print(f"[bold {CLAY}]━━ product audit {rnd} · {len(issues)} gap(s) ━━[/]")
             for issue in issues:
@@ -1642,7 +1852,13 @@ class Conductor:
             goal=("A build gate just became active and is failing. Repair whatever it "
                   "reports until it passes, with the smallest changes that keep the "
                   "project's intent and style."),
-            verify_cmd=self.gate, files=None, context=goal), dash)
+            verify_cmd=self.gate, files=None, context=goal), dash,
+            # ratchet for the same reason bootstrap does: a newly active gate
+            # usually reports several STACKED signatures (a missing dependency
+            # hiding a bad import), and clearing one of them is real progress.
+            # Without it strict_green reverts a correct partial fix, and the next
+            # task starts from the same red gate and rediscovers the same error.
+            ratchet=True)
 
     def _run_task(
         self, atom: Atom, spec: TaskSpec, ui,
@@ -1704,13 +1920,14 @@ class Conductor:
         app, draw the launcher icon from the design tokens and wire the manifest —
         the fiddly, always-the-same plumbing a small model reliably gets wrong, so
         the app never ships the stock robot. Committed only if the gate stays green."""
-        if self._project_kind(goal) != "android":
+        kind = self._project_kind(goal)
+        if kind not in {"android", "web", "gui", "desktop", "game"}:
             return
         from spiral.transactions import TaskTransaction
 
         try:
             transaction = TaskTransaction.begin(
-                self.ws, "android design foundation")
+                self.ws, f"{kind} design foundation")
         except RuntimeError as exc:
             dash.print(
                 f"  [yellow]○ foundation deferred:[/] [dim]{exc}[/]")
@@ -1727,9 +1944,20 @@ class Conductor:
         bg = icon.get("background") or tokens.get("background") or "#0A0A0A"
         glyph = icon.get("glyph") or "spiral"
         try:
-            written = write_android_icon(self.ws, accent, bg, glyph)
-            written += write_android_tokens(
-                self.ws, tokens)  # canonical palette resource
+            if kind == "android":
+                written = write_android_icon(self.ws, accent, bg, glyph)
+                written += write_android_tokens(
+                    self.ws, tokens)  # canonical palette resource
+                label = f"launcher icon [bold]{glyph}[/] + palette"
+            else:
+                # the web counterpart: a token stylesheet whose text colours were
+                # chosen by contrast arithmetic, plus a favicon, so readability and
+                # a coherent palette are true on the first commit instead of being
+                # remediated after the model guesses hex values
+                from spiral.webfoundation import write_web_foundation
+
+                written = write_web_foundation(self.ws, tokens)
+                label = f"design tokens + favicon [bold]{glyph}[/]"
         except Exception:
             transaction.rollback(reason="foundation generation failed")
             raise
@@ -1741,7 +1969,7 @@ class Conductor:
             return
         try:
             _short_head, moved = transaction.commit(
-                "spiral: foundation - launcher icon and palette")
+                f"spiral: foundation - {kind} design ground truth")
         except Exception:
             transaction.rollback(reason="foundation commit failed")
             raise
@@ -1750,7 +1978,64 @@ class Conductor:
         self._write_state(
             last_green_head=tools.run(
                 "git rev-parse HEAD", self.ws).out.strip())
-        dash.print(f"  [green]■ foundation:[/] launcher icon [bold]{glyph}[/] + palette · {len(written)} files")
+        dash.print(f"  [green]■ foundation:[/] {label} · {len(written)} files")
+
+    def _gate_predicate(self):
+        """The detected gate as a heal() predicate, re-derived per probe tree.
+
+        Re-detection is the point: some commits induce a DIFFERENT gate (a
+        package.json appearing switches it to npm), and the workspace's composed
+        gate references .spiral scripts a worktree does not carry. A broker rooted
+        at the probe tree keeps the sandbox honest about paths.
+        """
+        from spiral.command_broker import CommandBroker
+
+        def gate_ok(tree) -> bool:
+            tree = Path(tree)
+            gate = detect_gate(tree)
+            if not gate:
+                return True
+            result = CommandBroker(tree, self.cfg).run(
+                gate, timeout=self.cfg.verify_timeout,
+                purpose="verification-gate", allow_network=False,
+                allow_host_read=not bool(self.cfg.providers),
+                require_sandbox=bool(getattr(
+                    self.cfg, "builder_require_sandbox", True)),
+            )
+            return result.result.code == 0
+        return gate_ok
+
+    def _resolve_capabilities(self, goal: str) -> None:
+        """Ask what this build needs that this machine lacks, and close the gap.
+
+        Declaring the dependency beats installing it: the provisioning that already
+        runs before every gate picks it up, inside the sandbox and against the
+        install budget, and the repo ends up recording what it depends on. What
+        cannot be declared — a system binary, a model — is reported with the exact
+        command instead of being installed behind the user's back.
+        """
+        try:
+            from spiral.capability import resolve, write_capabilities
+        except Exception:
+            return
+        try:
+            outcome = resolve(self.ws, goal)
+        except Exception as exc:
+            self.c.print(f"  [yellow]○ capability check unavailable[/] [dim]{exc}[/]")
+            return
+        if not (outcome.present or outcome.declared or outcome.blocked):
+            return
+        write_capabilities(self.ws, outcome)
+        self._capability_brief = outcome.brief()
+        if outcome.declared:
+            names = sorted({p for need in outcome.declared for p in need.packages})
+            self.c.print(
+                f"  [green]●[/] capability: declared {len(names)} dependency(ies) "
+                f"this goal needs · [dim]{', '.join(names)}[/]")
+        for need in outcome.blocked:
+            self.c.print(
+                f"  [yellow]○ missing capability:[/] {need.binary or need.id} "
+                f"[dim]({need.why}) — install with: {need.install_hint}[/]")
 
     def build(self, goal: str, resume: bool = False, approve: bool = False) -> None:
         from spiral.dash import Dash
@@ -1758,6 +2043,11 @@ class Conductor:
         c = self.c
         t0 = time.time()
         self._preflight()
+        # capability gap FIRST, so declared dependencies land in the pre-run
+        # snapshot. Declaring after the snapshot would leave the workspace dirty
+        # and every task transaction would refuse to commit.
+        if not resume:
+            self._resolve_capabilities(self._raw_goal(goal))
         self._snapshot(resume=resume)
         if not resume:
             self.state = {
@@ -1858,6 +2148,26 @@ class Conductor:
                         ratchet=True,
                     )
                     if status == "blocked":
+                        # the models cannot fix it — but if some COMMIT broke the
+                        # gate, reverting that commit is a computation. Bootstrap
+                        # was the one termination path with no healer behind it,
+                        # and it aborts the entire run; try the cheap
+                        # deterministic exit before the expensive one.
+                        from spiral.regress import heal
+
+                        try:
+                            healing = heal(self.ws, self._gate_predicate())
+                        except Exception as exc:
+                            healing = None
+                            dash.print(f"  [yellow]○ gate healer unavailable[/] [dim]{exc}[/]")
+                        if healing and healing.healed:
+                            dash.print(f"  [green]⟲ gate healed by revert[/] [dim]{healing.detail}[/]")
+                            self._write_state(last_green_head=tools.run(
+                                "git rev-parse HEAD", self.ws).out.strip())
+                            status = "green" if self._gate_green(dash) else "blocked"
+                        elif healing and healing.detail:
+                            dash.print(f"  [yellow]○ gate healer declined:[/] [dim]{healing.detail}[/]")
+                    if status == "blocked":
                         dash.task(0, 0, "blocked")
                         dash.print("[red]■ bootstrap could not reach green — aborting run (nothing can be verified).[/]")
                         self._write_state(blocked=["M0 bootstrap"], tokens=atom.tokens, outcome="bootstrap_failed")
@@ -1874,6 +2184,11 @@ class Conductor:
 
             # ---- foundation: deterministic design ground truth (icon, etc.) -----
             self._foundation(dash, goal)
+            # the goal-with-design text was composed BEFORE the foundation existed,
+            # so its tokens/favicon brief silently skipped — and the first worker
+            # then invented its own stylesheet instead of linking the generated
+            # one. Recompose now that the files are on disk.
+            goal = self._goal_with_design(raw_goal)
 
             # ---- the grind: every task keeps the gate green ---------------------
             done = 0
@@ -1923,16 +2238,39 @@ class Conductor:
                         dash.gate = self.gate
                     verify = t.verify.strip()
                     if self.gate:
-                        verify = f"({verify}) && ({self.gate})" if verify else self.gate
+                        verify = f"({verify}) && {self.gate}" if verify else self.gate
                     spec = TaskSpec(
                         goal=f"{t.title}\n{t.description}".strip(),
                         verify_cmd=verify,
                         files=t.files or None,
                         context=goal,
+                        exports=list(getattr(t, "exports", []) or []) or None,
                     )
                     status = self._run_task(atom, spec, dash)
                     if status != "blocked":
                         self._verify_new_gate(dash, atom, goal)   # this task may have created the gate
+                    if status == "blocked" and self.gate and not self._gate_green(dash):
+                        # the task did not fail on its own work — it inherited a
+                        # RED GATE from an earlier commit (observed: a package
+                        # manifest whose test script pointed at a file that never
+                        # landed poisoned the gate for every task after it, and
+                        # each burned both lanes against a fault that was not
+                        # theirs). Which commit broke the gate is a computation:
+                        # bisect with the gate as the predicate, revert, retry
+                        # the task once. Refusals fall through to blocked.
+                        from spiral.regress import heal
+                        try:
+                            healing = heal(self.ws, self._gate_predicate())
+                        except Exception as exc:
+                            healing = None
+                            dash.print(f"  [yellow]○ gate healer unavailable[/] [dim]{exc}[/]")
+                        if healing and healing.healed:
+                            dash.print(f"  [green]⟲ gate healed by revert[/] [dim]{healing.detail}[/]")
+                            self._write_state(last_green_head=tools.run(
+                                "git rev-parse HEAD", self.ws).out.strip())
+                            status = self._run_task(atom, spec, dash)
+                        elif healing and healing.detail:
+                            dash.print(f"  [yellow]○ gate healer declined:[/] [dim]{healing.detail}[/]")
                     if status == "blocked":
                         blocked.append(f"{mi}.{ti} {t.title}")
                         dash.task(mi, ti, "blocked")
@@ -2000,7 +2338,7 @@ class Conductor:
                 clean_commands.append(f"({clean})")
             hygiene_gate = " && ".join(clean_commands)
             command = (
-                f"({hygiene_gate}) && ({self.gate})"
+                f"({hygiene_gate}) && {self.gate}"
                 if self.gate else hygiene_gate
             )
             r = self._run_verified_command(command)

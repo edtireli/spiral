@@ -84,3 +84,50 @@ def _run() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(_run())
+
+
+def test_gate_verdicts_are_memoized_on_tree_content(tmp_path):
+    """Every audit attempt that landed no edit re-ran the full ladder against an
+    unchanged tree — paying a subprocess for what a hash already knew."""
+    import subprocess
+
+    from spiral.agent import Atom
+    from spiral.config import Config
+
+    subprocess.run("git init -q .", shell=True, cwd=tmp_path, check=True)
+    (tmp_path / "thing.py").write_text("X = 1\n")
+    atom = Atom(tmp_path, Config())
+
+    class Quiet:
+        def print(self, *a, **k): pass
+        def __getattr__(self, _): return lambda *a, **k: None
+
+    first = atom._run_gate("echo once && true", Quiet())
+    assert first.code == 0
+    marker = atom._gate_memo
+    second = atom._run_gate("echo once && true", Quiet())
+    assert second.code == 0
+    assert atom._gate_memo is marker, "unchanged tree must reuse the verdict"
+
+    (tmp_path / "thing.py").write_text("X = 2\n")
+    atom._run_gate("echo once && true", Quiet())
+    assert atom._gate_memo is not marker, "a changed tree must re-run the gate"
+
+
+def test_a_changed_command_also_busts_the_memo(tmp_path):
+    import subprocess
+
+    from spiral.agent import Atom
+    from spiral.config import Config
+
+    subprocess.run("git init -q .", shell=True, cwd=tmp_path, check=True)
+    atom = Atom(tmp_path, Config())
+
+    class Quiet:
+        def print(self, *a, **k): pass
+        def __getattr__(self, _): return lambda *a, **k: None
+
+    ok = atom._run_gate("true", Quiet())
+    assert ok.code == 0
+    bad = atom._run_gate("false", Quiet())
+    assert bad.code != 0, "a different command must not reuse the old verdict"
