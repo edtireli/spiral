@@ -1151,7 +1151,7 @@ def coverage_gaps(spec: list[dict], plan: Plan) -> list[str]:
             if str(row.get("id") or "") not in declared:
                 gaps.append(
                     f"requirement {row.get('id', '?')} is UNCOVERED by explicit task mapping: "
-                    f"\"{row.get('text', '')[:90]}\"")
+                    f"\"{str(row.get('text') or '')[:90]}\"")
         return gaps
 
     haystack = " ".join(

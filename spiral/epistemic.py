@@ -472,7 +472,7 @@ class ObligationGraph:
                     "id": node["id"],
                     "type": f"obligation_{node.get('kind', 'item')}",
                     "kind": node.get("kind"),
-                    "label": node.get("statement", "")[:160],
+                    "label": str(node.get("statement") or "")[:160],
                     "title": node.get("statement", ""),
                     "status": node.get("status"),
                     "stage": node.get("stage"),

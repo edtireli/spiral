@@ -234,7 +234,7 @@ def pubmed(query: str, k: int = 6, timeout: float = 25.0) -> list[Hit]:
                 timeout=timeout, follow_redirects=True, headers=_UA,
                 trust_env=False) as cl:
             ids = cl.get(f"{base}/esearch.fcgi?db=pubmed&term={q}&retmax={k}&retmode=json").json()
-            idlist = ids.get("esearchresult", {}).get("idlist", [])
+            idlist = ((ids or {}).get("esearchresult") or {}).get("idlist") or []
             if not idlist:
                 return []
             txt = cl.get(f"{base}/efetch.fcgi?db=pubmed&id={','.join(idlist)}&rettype=abstract&retmode=text").text

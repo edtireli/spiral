@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import base64
 import json
+from spiral.nullsafe import pick_str
 import hashlib
 import os
 import re
@@ -1344,7 +1345,11 @@ class ResearchLoop:
         for p in papers:
             note = self._paper_note(p)
             notes.append(note)
-            self._say(f"  read · {note.get('arxiv_id', getattr(p, 'arxiv_id', 'paper'))[:24]}")
+            # `.get(k, default)` returns None when the key EXISTS with a null value, and
+            # a model writing this note routinely emits {"arxiv_id": null}. Use `or` so
+            # the fallback actually applies — this trap killed a 50-minute research run.
+            label = pick_str(note, "arxiv_id") or getattr(p, "arxiv_id", "") or "paper"
+            self._say(f"  read · {label[:24]}")
         return notes
 
     @staticmethod
@@ -3372,7 +3377,7 @@ class ResearchLoop:
         report["path"] = str(path)
         self._say(
             f"  {'✓' if report['passed'] else '✗'} [blind replication] "
-            f"{finding.claim.get('note', finding.claim_id)[:50]}")
+            f"{(pick_str(finding.claim, 'note') or finding.claim_id)[:50]}")
         self._log_thought(
             "blind-replication",
             f"{report['status']}: {finding.claim_id}", report=report,
@@ -3447,7 +3452,7 @@ class ResearchLoop:
                 else:
                     strength = "unverified"
                 fnd = self._finding(c, v.ok, v.backend, v.detail, strength=strength)
-            self._say(f"  {'✓' if fnd.ok else '✗'} [{fnd.backend}] {c.get('note', kind)[:50]}")
+            self._say(f"  {'✓' if fnd.ok else '✗'} [{fnd.backend}] {(pick_str(c, 'note') or kind)[:50]}")
             if fnd.ok:
                 fnd.replication = self._blind_replicate(fnd)
             self._sync_finding_obligation(fnd)
