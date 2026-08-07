@@ -24,12 +24,11 @@ _TEXTY = {".txt", ".md", ".tex", ".rst", ".markdown", ""}
 
 
 def read_document(path: Path) -> str:
-    """Text from a document. PDFs go through the corpus extractor already in spiral."""
-    if path.suffix.lower() == ".pdf":
-        from spiral.research_corpus import extract_pdf_text
+    """Plain text of a document, for measurement. Editing goes through
+    ``spiral.documents``, which keeps the document's structure instead of flattening it."""
+    from spiral.documents import read_document as _read
 
-        return extract_pdf_text(path)
-    return path.read_text(errors="replace")
+    return _read(path).text()
 
 
 def _load_corpus(root: Path) -> list[str]:
@@ -147,7 +146,11 @@ def run_style(console, args) -> int:
     if getattr(args, "api", None):
         _apply_tier(cfg, console, "api", api_key=args.api)
     ol = Ollama(cfg.base_url, providers=cfg.providers)
-    model = cfg.critic.name or cfg.planner.name
+    # rewriting prose is a reasoning job — use the strongest configured model,
+    # not the critic slot, which spiral deliberately fills with a small fast one
+    from spiral.config import Config as _C  # noqa: F401
+    model = (getattr(args, 'model', '') or cfg.planner.name or cfg.escalation.name
+             or cfg.worker.name or cfg.critic.name)
 
     guide = ""
     if template is not None and template.sample_size:
@@ -155,41 +158,65 @@ def run_style(console, args) -> int:
         if gaps:
             guide = "\nMatch this field's measured style:\n- " + "\n- ".join(gaps[:6])
 
-    best, best_score = text, before["ai_score"]
-    console.print(f"\n  [dim]rewriting with {model} — the scorer decides[/]")
-    for attempt in range(1, int(getattr(args, "rounds", 3)) + 1):
-        try:
-            res = ol.chat(model, [
-                {"role": "system", "content": _SYSTEM + guide},
-                {"role": "user", "content": text},
-            ], num_predict=max(1024, min(8192, len(text) // 2)), temperature=0.4,
-                num_ctx=cfg.spec_for(model).num_ctx, keep_alive=cfg.keep_alive)
-        except Exception as exc:
-            console.print(f"    [red]attempt {attempt}: model error {exc}[/]")
-            continue
-        candidate = (res.text or "").strip()
-        if not candidate:
-            console.print(f"    [yellow]attempt {attempt}: empty reply[/]")
-            continue
-        drift = content_drift(text, candidate)
-        score = ai_score(candidate)
-        if drift:
-            console.print(f"    [yellow]attempt {attempt} REJECTED[/] — {drift[0]}")
-            continue
-        if score >= best_score:
-            console.print(f"    [yellow]attempt {attempt} REJECTED[/] — score "
-                          f"{score:.1f} did not beat {best_score:.1f}")
-            continue
-        console.print(f"    [green]attempt {attempt} accepted[/] — {best_score:.1f} → {score:.1f}")
-        best, best_score = candidate, score
+    # Rewrite paragraph by paragraph through the document's own structure: a .docx keeps
+    # its styles, a .tex keeps its preamble and math, and each paragraph is accepted or
+    # rejected on its own evidence instead of the whole file riding on one generation.
+    from spiral.documents import default_output_path, read_document as read_doc, write_document
 
-    if best is text:
-        console.print("\n  [yellow]no rewrite passed the checks; original kept[/]")
+    doc = read_doc(path)
+    editable = doc.editable_segments
+    console.print(f"\n  [dim]rewriting with {model} — {len(editable)} editable "
+                  f"segment(s) of {len(doc.segments)}; the scorer decides each[/]")
+    if doc.kind == "tex":
+        console.print("  [dim]equations, figures, tables and the preamble are protected[/]")
+
+    replacements: dict = {}
+    kept = rejected = 0
+    rounds = max(1, int(getattr(args, "rounds", 3)))
+    for seg in editable:
+        if len(seg.text.split()) < 12:          # too short to be worth a model call
+            continue
+        seg_before = ai_score(seg.text)
+        best_text, best_score = None, seg_before
+        for _ in range(rounds):
+            try:
+                res = ol.chat(model, [
+                    {"role": "system", "content": _SYSTEM + guide},
+                    {"role": "user", "content": seg.text},
+                ], num_predict=max(512, min(4096, len(seg.text))), temperature=0.4,
+                    num_ctx=cfg.spec_for(model).num_ctx, keep_alive=cfg.keep_alive)
+            except Exception as exc:
+                console.print(f"    [red]segment {seg.index}: model error {exc}[/]")
+                break
+            candidate = (res.text or "").strip()
+            if not candidate:
+                continue
+            drift = content_drift(seg.text, candidate)
+            if drift:
+                continue                        # never trade facts for smoothness
+            score = ai_score(candidate)
+            if score < best_score:
+                best_text, best_score = candidate, score
+                break                           # first improvement wins; move on
+        if best_text is not None:
+            replacements[seg.index] = best_text
+            kept += 1
+        else:
+            rejected += 1
+
+    if not replacements:
+        console.print("\n  [yellow]no segment rewrite passed the checks; original "
+                      "left untouched[/]")
         return 1
-    out = Path(getattr(args, "out", None) or
-               path.with_suffix(f".human{path.suffix or '.txt'}"))
-    out.write_text(best)
-    console.print(f"\n  [bold]after rewrite[/]")
-    _report(console, best, template)
+
+    after_text = doc.with_replacements(replacements)
+    out = Path(getattr(args, "out", None) or default_output_path(path))
+    write_document(doc, replacements, out)
+    console.print(f"\n  [bold]after rewrite[/] [dim]({kept} segment(s) improved, "
+                  f"{rejected} left as written)[/]")
+    _report(console, after_text, template)
+    if path.suffix.lower() == ".pdf":
+        console.print("  [dim]a PDF cannot be rewritten in place; the edit is markdown[/]")
     console.print(f"\n  [green]●[/] written to [dim]{out}[/]")
+    console.print(f"  [dim]original untouched: {path}[/]")
     return 0
