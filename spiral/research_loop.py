@@ -82,6 +82,11 @@ class ResearchState:
     data_resources: dict = field(default_factory=dict)
     field_domain: str = ""               # physics-math | bio-med | mixed (planner-chosen)
     channels: list = field(default_factory=list)   # arxiv | biorxiv | medrxiv | europepmc | pubmed | crossref
+    # question_key -> {question, reason} for angles the well-posedness check refused.
+    # Carried in the state so it survives a round boundary AND a --resume: a refusal
+    # the model is never shown is one it walks into again next round, which is how the
+    # same H^5 of a 4-manifold cost two rounds in a row.
+    ruled_out_angles: dict = field(default_factory=dict)
 
 
 def _extract_json(text: str) -> dict:
@@ -2014,6 +2019,37 @@ class ResearchLoop:
         return self._think_json(
             system, user, role="planner", max_chars=10_000, reasoning=True)
 
+    def _remember_illposed(self, angle: dict, fatal: list) -> None:
+        """Record a rejected angle so the next round does not re-propose it."""
+        key = self._question_key(str(angle.get("question") or ""))
+        if not key:
+            return
+        ruled = self.state.ruled_out_angles
+        if key not in ruled:
+            ruled[key] = {
+                "question": " ".join(str(angle.get("question") or "").split())[:300],
+                "reason": fatal[0].sentence()[:300],
+            }
+
+    def _illposed_brief(self) -> str:
+        """The already-refused angles, as prompt text.
+
+        A deterministic refusal the model never sees is a refusal it will walk into
+        again — the same lesson as the build loop's identical-reply guard, and the
+        harness channel's: the reason has to reach whoever can act on it."""
+        ruled = list(self.state.ruled_out_angles.values())
+        if not ruled:
+            return ""
+        lines = ["ALREADY RULED OUT — arithmetic, not opinion. Do NOT propose these "
+                 "again, and do not propose a restatement of one:"]
+        for row in ruled[-12:]:
+            lines.append(f"- {row['question']}\n    why: {row['reason']}")
+        lines.append("A cohomology degree above the dimension of the space is zero "
+                     "before any differential is written. Check dim(G/H) against the "
+                     "degree you need BEFORE proposing, and pick a space large enough "
+                     "to carry it.")
+        return "\n".join(lines)
+
     def _precheck_angles(self, angles: list[dict]) -> list[dict]:
         """Refuse an angle whose own first check is forced to a trivial answer.
 
@@ -2048,6 +2084,11 @@ class ResearchLoop:
                     issues=[i.sentence() for i in issues])
                 # hand the reason back so the next proposal is better posed
                 angle["_wellposed"]["feedback"] = report(issues)
+                # …and REMEMBER it. Rejecting the angle without recording why left the
+                # reason attached to an object that was then thrown away, so the model
+                # proposed the identical vacuous question in the next round and lost a
+                # slot to it again. Observed twice on the same H^5 of a 4-manifold.
+                self._remember_illposed(angle, fatal)
                 continue
             if issues:
                 self._say(f"  ○ angle warning · {issues[0].sentence()[:90]}")
@@ -2086,9 +2127,11 @@ class ResearchLoop:
             "reject species/space/modality combinations that cannot be aligned honestly. Do not "
             "include generic survey questions."
         )
+        ruled_out = self._illposed_brief()
         user = (
             f"TOPIC:\n{self.state.topic}\n\n"
             + (f"RESEARCH BRIEF:\n{brief}\n\n" if brief else "")
+            + (f"{ruled_out}\n\n" if ruled_out else "")
             + f"IDEA FAMILIES:\n{json.dumps(families, indent=2)[:6000]}\n\n"
             + f"DEEP READ NOTES:\n{json.dumps(deep_notes, indent=2)[:7500]}\n\n"
             + f"BROAD READING NOTES:\n{self._notes_digest(notes, limit=20, chars=3500)}\n\n"
@@ -2110,11 +2153,21 @@ class ResearchLoop:
             angles = self.taste.rank(angles)
         seen_questions = set()
         deduped = []
+        repeats = 0
         for angle in angles:
             key = self._question_key(str(angle.get("question") or ""))
-            if key and key not in seen_questions:
-                seen_questions.add(key)
-                deduped.append(angle)
+            if not key or key in seen_questions:
+                continue
+            # a question already refused on arithmetic does not get re-adjudicated;
+            # the answer cannot have changed, and re-running it only re-prints the
+            # rejection the model has now been told about twice
+            if key in self.state.ruled_out_angles:
+                repeats += 1
+                continue
+            seen_questions.add(key)
+            deduped.append(angle)
+        if repeats:
+            self._say(f"  ○ {repeats} angle(s) re-proposed after being ruled out — dropped")
         angles = self._precheck_angles(deduped)
         for angle in angles:
             try:
