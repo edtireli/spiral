@@ -9,3 +9,6 @@ build/
 .DS_Store
 dist/
 *.whl
+
+# transient benchmark workspaces (each is its own git repo)
+bench/runs/
