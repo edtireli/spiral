@@ -459,7 +459,7 @@ class RefineRun:
                 self.report["kept_verbatim"].append({"part": name, "why": "size"})
                 return fragment
             fig_ctx = "\n".join(
-                f"FIGURE {n}: {v.get('description', '')[:300]}"
+                f"FIGURE {n}: {str(v.get('description') or '')[:300]}"
                 for n, v in fig_notes.items() if n.split(".")[0] in fragment)
             user = (f"FRAGMENT ({name}):\n{fragment}"
                     + (f"\n\nWHAT THE FIGURES SHOW:\n{fig_ctx}" if fig_ctx else ""))
