@@ -445,7 +445,19 @@ class Conductor:
                 gate = f"{gate} && {{ {_compose(behave)}; }}"
                 disp += " +behave"
         if self.cfg.extra_gate:
-            # user-defined blocking gate (their linter/tests) — veto power on every task
+            # user-defined blocking gate (their linter/tests) — veto power on every task.
+            # Checked on its own, before composition: `A && (B || true)` can still fail
+            # through A, so the composed gate looks fine while B's veto is silently
+            # worthless. The user asked for a blocking gate; one that cannot block is a
+            # mistake worth stopping for.
+            from spiral.harness_check import vacuous_gate as _vacuous
+
+            why = _vacuous(self.cfg.extra_gate)
+            if why:
+                raise RuntimeError(
+                    f"your extra_gate can never fail — {why}. It is configured as a "
+                    "blocking gate but would veto nothing, so every task would pass it "
+                    f"untested · extra_gate: {self.cfg.extra_gate[:160]}")
             gate = f"{gate} && ({self.cfg.extra_gate})" if gate else self.cfg.extra_gate
             disp += " +extra_gate"
         # the gate is the run's ground truth, so a gate that cannot PARSE is a
@@ -463,6 +475,17 @@ class Conductor:
                 raise RuntimeError(
                     "the composed build gate does not parse as shell — this is a "
                     f"spiral bug, not a project fault: {parse.stderr.strip()[:200]} "
+                    f"· gate: {gate[:200]}")
+            # parsing is only half of it. A gate that runs fine and cannot report a
+            # failure is worse than one that will not start, because it reports green
+            # and is believed.
+            from spiral.harness_check import vacuous_gate as _vacuous
+
+            vacuity = _vacuous(gate)
+            if vacuity:
+                raise RuntimeError(
+                    f"the composed build gate can never fail — {vacuity}. Every task "
+                    "would be scored green without being tested; this is a spiral bug "
                     f"· gate: {gate[:200]}")
         self.gate, self.gate_disp = gate, disp
         return True
