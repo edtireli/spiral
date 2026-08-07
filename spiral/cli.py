@@ -656,8 +656,20 @@ def main() -> None:
 
 
 def entry() -> None:
+    from spiral.harness_check import HarnessFault
+
     try:
         main()
+    except HarnessFault as fault:
+        # Not a build failure. The gate could not measure anything, so stopping and
+        # saying why is the honest outcome — reporting the code as red would be a lie
+        # about work that was never tested.
+        make_console().print(
+            f"\n  [red]■ stopped: the build gate is not usable[/]\n\n{fault}\n\n"
+            "  [dim]Nothing here is a verdict on your code. Fix the gate or its "
+            "environment, then resume with the same command + --resume[/]\n"
+        )
+        raise SystemExit(3)
     except KeyboardInterrupt:
         make_console().print(
             "\n  [rgb(217,119,87)]⠿ interrupted[/] — green work is committed, banked "

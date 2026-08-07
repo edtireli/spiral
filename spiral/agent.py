@@ -26,7 +26,7 @@ from pathlib import Path
 
 from rich.console import Console
 
-from spiral import tools
+from spiral import harness_check, tools
 from spiral.config import Config
 from spiral.ledger import Ledger
 from spiral.route import norm_sig
@@ -56,6 +56,13 @@ SYSTEM = (
     "control, fake result, or only the happy path.\n"
     "- If the TASK is ALREADY fully implemented in the FILES shown, reply with "
     "exactly: ALREADY_DONE (nothing else).\n"
+    "- If the FAILURE IS THE HARNESS, not the code — the gate names a program that is "
+    "not installed, does not parse as shell, was killed for resources, was blocked by "
+    "the sandbox, or cannot report a failure at all — open the reply with "
+    "HARNESS_ERROR: <what is wrong>. The claim is CHECKED against the gate output; if "
+    "the evidence bears it out the run stops and a human is told, and if it does not "
+    "you are shown why and must fix the code instead. Do not use it to avoid a hard "
+    "bug: an ordinary test failure or type error is never a harness error.\n"
     "- If you must reference an identifier, signature, file, framework API, current "
     "docs, example, upstream bug, package migration, or how others solved this, do "
     "NOT invent it. Reply exactly with one of: ASK: grep <name>, ASK: file <path>, "
@@ -1424,6 +1431,7 @@ class Atom:
         shell_used = 0
         install_used = 0
         implicit_used = 0
+        harness_refused = 0
         asked: set[str] = set()
         repo_answers = ""
         scratch = self.ws / ".spiral" / "scratch"
@@ -1475,6 +1483,44 @@ class Atom:
             gen_s = round(time.time() - t_gen, 1)
             self._record_generation(model_name, res, gen_s)
             (scratch / "last_reply.txt").write_text(res.text)  # always inspectable
+
+            # A correct diagnosis of a broken instrument must not be scored as a failed
+            # attempt — otherwise the only reply the loop can accept is an edit, and the
+            # model is forced to "fix" code that was never broken. The claim is checked
+            # against the gate's own output before any of that is granted.
+            #
+            # This has to sit AHEAD of the identical-reply check below: a model that is
+            # right about the gate says the same true thing every time, and answering a
+            # consistent correct diagnosis with "you repeated yourself, take a different
+            # approach" is the exact failure this channel exists to end.
+            if harness_check.claim_in(res.text) and not parse_edits(res.text):
+                hv = harness_check.adjudicate(
+                    res.text,
+                    (verify.out if verify is not None else ""),
+                    (verify.code if verify is not None else None),
+                    task.verify_cmd or "",
+                )
+                if hv.confirmed:
+                    ui.print("  [red]■ harness fault confirmed — not a fault in the code[/]")
+                    for f in hv.faults:
+                        ui.print(f"     [dim]{f.sentence()}[/]")
+                    self.ledger.log("harness_fault", task=task.goal[:60],
+                                    kinds=",".join(f.kind for f in hv.faults),
+                                    claim=hv.claim_text[:160])
+                    self._harness_faults = list(hv.faults)
+                    raise harness_check.HarnessFault(harness_check.report(hv.faults))
+                ui.print("  [yellow]○ harness-error claim refused — the evidence does "
+                         "not support it[/]")
+                self.ledger.log("harness_claim_refused", task=task.goal[:60],
+                                claim=hv.claim_text[:160])
+                apply_errs = hv.reason
+                # One free correction: being told precisely why the claim fails is worth
+                # a retry. After that it is charged like any other reply with no edits,
+                # so the channel cannot become a way to sit out the task.
+                if harness_refused < 1:
+                    harness_refused += 1
+                    attempt -= 1
+                continue
 
             # a reply identical to one this task already tried can teach nothing —
             # observed live: attempts 5 and 6 of a lane were byte-identical
