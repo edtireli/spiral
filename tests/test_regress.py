@@ -109,6 +109,55 @@ def test_a_fault_older_than_the_window_is_refused(tmp_path):
     assert "BROKEN" in (root / "index.html").read_text(), "nothing was touched"
 
 
+def test_an_unmeasurable_sweep_is_not_reported_as_a_verdict_on_history(tmp_path):
+    """Observed in both ecosystems: the probe is a `git worktree add` checkout, which
+    by definition carries no gitignored files — no node_modules, no .venv. The gate
+    predicate therefore reads BAD on every commit it is shown, including commits that
+    are perfectly good, and heal() concluded "the fault predates this run" — a
+    confident claim about history it never actually measured."""
+    root = _repo(tmp_path)
+    _commit(root, "one", **{".gitignore": "node_modules/\n", "index.html": "fine"})
+    _commit(root, "two breaks it", **{"index.html": "BROKEN"})
+    _commit(root, "three unrelated", **{"n.txt": "x"})
+    # the real workspace has its dependencies installed; git tracks none of them
+    (root / "node_modules" / "dep").mkdir(parents=True)
+    (root / "node_modules" / "dep" / "index.js").write_text("module.exports = 1\n")
+
+    def gate_needing_deps(tree: Path) -> bool:
+        if not (tree / "node_modules").is_dir():
+            return False           # `npm test` without an install: red, always
+        return _ok(tree)
+
+    outcome = heal(root, gate_needing_deps)
+    assert outcome.healed is False
+    assert "predates" not in outcome.detail, (
+        f"an unmeasurable sweep was stated as a fact about history: {outcome.detail}")
+    assert "node_modules" in outcome.detail, (
+        f"the real reason must be named: {outcome.detail}")
+    assert outcome.unusable_probe is True
+
+
+def test_a_commit_the_probe_cannot_check_out_is_not_scored_as_bad(tmp_path):
+    """A checkout that fails still leaves a tree, and the predicate happily judges it —
+    so the verdict gets attributed to a sha whose content was never materialised. Here
+    a missing object (a partial clone, a corrupted store) makes `git checkout` of the
+    one good commit fail, and its verdict must be "not measured", not "bad"."""
+    root = _repo(tmp_path)
+    good = _commit(root, "one", **{"index.html": "v1 fine"})
+    _commit(root, "two breaks it", **{"index.html": "v2 BROKEN"})
+    _commit(root, "three unrelated", **{"n.txt": "x"})
+    blob = _git(root, "rev-parse", f"{good}:index.html").strip()
+    (root / ".git" / "objects" / blob[:2] / blob[2:]).unlink()
+
+    outcome = heal(root, _ok)
+    assert outcome.healed is False
+    assert "predates" not in outcome.detail, (
+        f"a failed checkout was scored as a verdict on {good[:10]}: {outcome.detail}")
+    assert good[:10] in outcome.detail, (
+        f"the commit that could not be measured must be named: {outcome.detail}")
+    assert outcome.unusable_probe is True
+
+
 def test_a_dirty_tree_is_never_touched(tmp_path):
     root = _repo(tmp_path)
     _commit(root, "one", **{"index.html": "fine"})
@@ -156,6 +205,36 @@ def test_an_ineffective_revert_is_undone(tmp_path):
     assert outcome.healed is False
     assert "did not restore health" in outcome.detail
     assert _git(root, "rev-list", "--count", "HEAD").strip() == count_before
+
+
+def test_a_verification_that_raises_leaves_no_unverified_revert(tmp_path):
+    """The revert is committed BEFORE the post-revert check runs. If that check raises
+    rather than returning False, the exception used to propagate out of heal(); the
+    caller prints "healer unavailable" and the run continues on top of a Revert commit
+    nobody ever verified — the one state this module promises never to leave."""
+    root = _repo(tmp_path)
+    _commit(root, "one", **{"index.html": "fine"})
+    _commit(root, "two breaks it", **{"index.html": "BROKEN"})
+    head_before = _git(root, "rev-parse", "HEAD").strip()
+
+    def dies_on_the_real_tree(tree: Path) -> bool:
+        # the bisect probes fine and the verification blows up: the workspace runs
+        # the gate for real, where the probe worktree only ever ran it detached
+        if Path(tree).resolve() == root.resolve():
+            raise RuntimeError("gate runner exploded")
+        return _ok(tree)
+
+    raised: Exception | None = None
+    outcome: Healing | None = None
+    try:
+        outcome = heal(root, dies_on_the_real_tree)
+    except Exception as exc:          # exactly what conductor.py does around heal()
+        raised = exc
+    assert _git(root, "rev-parse", "HEAD").strip() == head_before, (
+        "an unverified Revert commit was left on HEAD")
+    assert not _git(root, "status", "--porcelain").strip(), "tree left clean"
+    assert raised is None, f"heal() must decline with a reason, not raise: {raised!r}"
+    assert outcome.healed is False and "raised" in outcome.detail, outcome.detail
 
 
 def test_probe_count_is_logarithmic_not_linear(tmp_path):

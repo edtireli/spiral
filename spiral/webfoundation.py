@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import json
 import math
+import re
+import sys
 from pathlib import Path
 
 from spiral.appicon import _spiral_path
@@ -30,26 +32,132 @@ from spiral.quality import contrast_ratio
 TOKENS_FILE = "tokens.css"
 FAVICON_FILE = "favicon.svg"
 
+DEFAULT_ACCENT = "#0D9488"
+_DEFAULT_RGB = (0x0D, 0x94, 0x88)  # DEFAULT_ACCENT, as channels
+
 # candidates for text on a surface, darkest and lightest first — near-black and
 # near-white read better than pure black and white, so they are preferred when
 # they clear the threshold
 _INK = ("#111827", "#1F2937", "#000000")
 _PAPER = ("#F9FAFB", "#E5E7EB", "#FFFFFF")
 
+# The colour names a model reaches for when it ignores the "#RRGGBB" it was asked
+# for. Not the full CSS list — anything outside this falls back visibly, which is
+# safe; the point is to stop the common cases costing a build.
+_NAMED = {
+    "black": "#000000", "white": "#FFFFFF", "silver": "#C0C0C0",
+    "gray": "#808080", "grey": "#808080", "lightgray": "#D3D3D3",
+    "lightgrey": "#D3D3D3", "darkgray": "#A9A9A9", "darkgrey": "#A9A9A9",
+    "slategray": "#708090", "slategrey": "#708090", "whitesmoke": "#F5F5F5",
+    "red": "#FF0000", "darkred": "#8B0000", "crimson": "#DC143C",
+    "firebrick": "#B22222", "maroon": "#800000", "tomato": "#FF6347",
+    "coral": "#FF7F50", "salmon": "#FA8072", "orange": "#FFA500",
+    "darkorange": "#FF8C00", "gold": "#FFD700", "yellow": "#FFFF00",
+    "khaki": "#F0E68C", "olive": "#808000", "green": "#008000",
+    "darkgreen": "#006400", "forestgreen": "#228B22", "seagreen": "#2E8B57",
+    "limegreen": "#32CD32", "lime": "#00FF00", "springgreen": "#00FF7F",
+    "teal": "#008080", "darkcyan": "#008B8B", "turquoise": "#40E0D0",
+    "aqua": "#00FFFF", "cyan": "#00FFFF", "skyblue": "#87CEEB",
+    "steelblue": "#4682B4", "dodgerblue": "#1E90FF", "royalblue": "#4169E1",
+    "blue": "#0000FF", "darkblue": "#00008B", "navy": "#000080",
+    "midnightblue": "#191970", "slateblue": "#6A5ACD", "indigo": "#4B0082",
+    "purple": "#800080", "darkviolet": "#9400D3", "violet": "#EE82EE",
+    "orchid": "#DA70D6", "plum": "#DDA0DD", "magenta": "#FF00FF",
+    "fuchsia": "#FF00FF", "hotpink": "#FF69B4", "pink": "#FFC0CB",
+    "lavender": "#E6E6FA", "brown": "#A52A2A", "sienna": "#A0522D",
+    "chocolate": "#D2691E", "peru": "#CD853F", "tan": "#D2B48C",
+    "wheat": "#F5DEB3", "beige": "#F5F5DC", "ivory": "#FFFFF0",
+}
+
+_RGB_FUNC = re.compile(r"^rgba?\(([^)]*)\)$", re.I)
+_HEX_ONLY = re.compile(r"^[0-9A-Fa-f]+$")
+
 
 def _clamp(value: float) -> int:
     return max(0, min(255, int(round(value))))
 
 
+def _channel(part: str) -> int:
+    """One rgb() argument, as 0-255. Raises ValueError on anything non-numeric,
+    which parse_color turns into a clean None."""
+    if part.endswith("%"):
+        return _clamp(float(part[:-1]) * 255 / 100)
+    return _clamp(float(part))
+
+
+def parse_color(color: object) -> tuple[int, int, int] | None:
+    """The channels behind a CSS colour, or None if it cannot be read.
+
+    Deliberately tolerant on the way in, because the token JSON is model output
+    with nothing enforcing it: planner's TOKENS_SCHEMA types the colour fields as
+    bare strings, and llm.py asks for response_format json_object, so "#RRGGBB" is
+    a request rather than a constraint. "teal", "rgb(13, 148, 136)" and "#0d9" all
+    turn up in real runs.
+
+    Equally strict about length: "#12345" used to read channels "12", "34", "5"
+    and hand back a colour nobody asked for. A refusal the caller can see beats a
+    wrong answer it cannot.
+    """
+    if not isinstance(color, str):
+        return None
+    text = _NAMED.get(color.strip().lower(), color.strip())
+    match = _RGB_FUNC.match(text)
+    if match:
+        parts = [p for p in re.split(r"[\s,/]+", match.group(1)) if p]
+        if len(parts) < 3:
+            return None
+        try:
+            return (_channel(parts[0]), _channel(parts[1]), _channel(parts[2]))
+        except ValueError:
+            return None
+    value = text[1:] if text.startswith("#") else text
+    if not _HEX_ONLY.match(value):
+        return None
+    if len(value) in (3, 4):                    # #RGB and #RGBA; alpha dropped
+        value = "".join(c * 2 for c in value[:3])
+    elif len(value) in (6, 8):                  # #RRGGBB and #RRGGBBAA
+        value = value[:6]
+    else:
+        return None
+    return (int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16))
+
+
+def _report_fallback(color: object, default: str, slot: str) -> None:
+    """Say what was substituted. A bad colour used to kill the run from inside
+    Conductor._foundation; the cure for that must not be a silent swap, which is
+    the same defect with the evidence removed."""
+    print(f"spiral: unreadable {slot} {color!r} — falling back to {default}",
+          file=sys.stderr)
+
+
 def _rgb(color: str) -> tuple[int, int, int]:
-    value = color.lstrip("#")
-    if len(value) == 3:
-        value = "".join(c * 2 for c in value)
-    return tuple(int(value[i:i + 2], 16) for i in (0, 2, 4))  # type: ignore[return-value]
+    """Channels for a colour, falling back to the default accent rather than
+    aborting the build. Callers that want the colour normalised for output — and
+    so want the fallback to reach the stylesheet too — use normalize_color."""
+    rgb = parse_color(color)
+    if rgb is None:
+        _report_fallback(color, DEFAULT_ACCENT, "colour")
+        return _DEFAULT_RGB
+    return rgb
 
 
 def _hex(rgb: tuple[int, int, int]) -> str:
     return "#{:02X}{:02X}{:02X}".format(*rgb)
+
+
+def normalize_color(color: object, default: str = DEFAULT_ACCENT, *,
+                    slot: str = "colour") -> str:
+    """Canonical #RRGGBB for a model-supplied colour, or ``default`` — out loud.
+
+    Normalising on the way in matters as much as not crashing: "var(--brand)"
+    copied straight into --accent leaves the page with no accent at all, and into
+    an SVG attribute it leaves a broken favicon.
+    """
+    rgb = parse_color(color)
+    if rgb is None:
+        _report_fallback(color, default, slot)
+        return default
+    return _hex(rgb)
 
 
 def mix(a: str, b: str, weight: float) -> str:
@@ -64,20 +172,25 @@ def readable_on(surface: str, *, minimum: float = 4.5,
     """The best text colour for this surface, decided by measurement.
 
     Tries near-black then near-white (whichever direction the surface calls for),
-    returns the first candidate clearing ``prefer``, else the best clearing
+    returns the first candidate clearing ``prefer``, else the first clearing
     ``minimum``, else the highest-contrast candidate available. A colour chosen
     this way cannot fail the contrast gate.
     """
     light_surface = (sum(_rgb(surface)) / 3) > 127
     ladder = _INK + _PAPER if light_surface else _PAPER + _INK
-    best, best_ratio = ladder[0], 0.0
+    best, best_ratio, acceptable = ladder[0], 0.0, ""
     for candidate in ladder:
         ratio = contrast_ratio(candidate, surface) or 0.0
         if ratio >= prefer:
             return candidate
+        # the ladder is ordered by preference, so a candidate that is merely good
+        # enough beats a later one that only measures higher — near-black over
+        # pure black. Taking the maximum instead is what left `minimum` inert.
+        if not acceptable and ratio >= minimum:
+            acceptable = candidate
         if ratio > best_ratio:
             best, best_ratio = candidate, ratio
-    return best
+    return acceptable or best
 
 
 def _secondary_on(surface: str, primary: str) -> str:
@@ -96,9 +209,12 @@ def _secondary_on(surface: str, primary: str) -> str:
 def build_tokens_css(tokens: dict | None = None) -> str:
     """Generate the stylesheet. Deterministic for a given token set."""
     tokens = tokens if isinstance(tokens, dict) else {}
-    accent = tokens.get("accent") or "#0D9488"
-    light_bg = tokens.get("background") or "#F2F4F6"
-    light_surface = tokens.get("surface") or "#FFFFFF"
+    accent = normalize_color(tokens.get("accent") or DEFAULT_ACCENT,
+                             DEFAULT_ACCENT, slot="accent")
+    light_bg = normalize_color(tokens.get("background") or "#F2F4F6",
+                               "#F2F4F6", slot="background")
+    light_surface = normalize_color(tokens.get("surface") or "#FFFFFF",
+                                    "#FFFFFF", slot="surface")
     dark_bg = "#0F1115"
     dark_surface = "#181B20"
 
@@ -252,6 +368,10 @@ def _svg_glyph(glyph: str, accent: str) -> str:
 def build_favicon(accent: str, background: str, glyph: str = "spiral") -> str:
     """A self-contained SVG favicon — the web counterpart of the launcher icon,
     so the page never ships the browser's blank-document default."""
+    # normalised here too: these go straight into SVG attributes, where a
+    # "var(--brand)" or a stray quote is a broken icon rather than a bad shade
+    accent = normalize_color(accent, DEFAULT_ACCENT, slot="icon foreground")
+    background = normalize_color(background, "#0F1115", slot="icon background")
     return (
         '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 108 108" '
         'width="108" height="108" role="img" aria-label="app icon">\n'
@@ -269,7 +389,7 @@ def write_web_foundation(workspace: str | Path, tokens: dict | None = None,
     target = root / subdir if subdir else root
     tokens = tokens if isinstance(tokens, dict) else {}
     icon = tokens.get("icon") if isinstance(tokens.get("icon"), dict) else {}
-    accent = tokens.get("accent") or "#0D9488"
+    accent = tokens.get("accent") or DEFAULT_ACCENT
     background = tokens.get("background") or "#0F1115"
     glyph = (icon or {}).get("glyph") or "spiral"
 
@@ -305,5 +425,6 @@ def tokens_brief(paths: list[str]) -> str:
 
 __all__ = [
     "build_tokens_css", "build_favicon", "write_web_foundation", "tokens_brief",
-    "readable_on", "mix", "TOKENS_FILE", "FAVICON_FILE",
+    "readable_on", "mix", "parse_color", "normalize_color",
+    "TOKENS_FILE", "FAVICON_FILE", "DEFAULT_ACCENT",
 ]

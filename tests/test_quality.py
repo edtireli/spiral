@@ -38,6 +38,17 @@ button:focus-visible { outline: 2px solid var(--accent); }
 @media (max-width: 480px) { button { width: 100%; } }
 """
 
+# the same stylesheet after a build step: every rule packed onto one line
+MINIFIED_CSS = (
+    ":root{--bg-surface:#FFFFFF;--text-primary:#111827;--accent:#0F766E}"
+    "@media(prefers-color-scheme:dark){:root{--bg-surface:#0F1115;"
+    "--text-primary:#F9FAFB;--accent:#2DD4BF}}"
+    "button{background:var(--accent);transition:transform 120ms ease}"
+    "button:hover{filter:brightness(1.1)}button:active{transform:scale(.97)}"
+    "button:focus-visible{outline:2px solid var(--accent)}"
+    "@media(max-width:480px){button{width:100%}}"
+)
+
 POLISHED_HTML = """
 <!doctype html><meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="stylesheet" href="style.css">
@@ -82,6 +93,31 @@ def test_nested_dark_theme_tokens_are_not_counted_as_loose(tmp_path):
     root = _write(tmp_path, {"style.css": POLISHED_CSS})
     inside, outside, _ = loose_colours([root / "style.css"])
     assert inside == 6 and outside == 0
+
+
+def test_minified_declarations_are_counted_wherever_they_sit_on_the_line(tmp_path):
+    """A line-anchored `--name:` matcher finds nothing in a stylesheet a build
+    step packed onto one line, so audit_ui demanded reusable custom properties
+    from a file that declares six of them — an unsatisfiable remediation task.
+    best_contrast reads the same tokens off the same file, so the two halves of
+    the module disagreed about whether the palette existed."""
+    root = _write(tmp_path, {"index.html": POLISHED_HTML, "style.css": MINIFIED_CSS,
+                             "app.js": POLISHED_JS})
+    inside, outside, examples = loose_colours([root / "style.css"])
+    assert (inside, outside) == (6, 0), f"loose: {examples}"
+    assert audit_ui(root, "web") == [], (
+        f"unexpected gaps: {[i['id'] for i in audit_ui(root, 'web')]}")
+
+
+def test_a_literal_packed_beside_a_declaration_is_still_loose(tmp_path):
+    """The counting must not swing the other way: on a packed line only the
+    colours inside a declaration's value are declared, not the whole line."""
+    root = _write(tmp_path, {
+        "style.css": ":root{--accent:#0F766E}button{color:#999999;border:1px "
+                     "solid #cccccc}"})
+    inside, outside, examples = loose_colours([root / "style.css"])
+    assert (inside, outside) == (1, 2)
+    assert examples, "a loose literal must come with an example line"
 
 
 def test_a_scaffold_fails_on_the_things_a_person_notices(tmp_path):

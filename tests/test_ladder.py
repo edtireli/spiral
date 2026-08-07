@@ -68,6 +68,41 @@ def test_entry_modules_and_app_targets_are_discovered(tmp_path):
         {"module": "app.main", "attr": "app", "kind": "asgi"}]
 
 
+def test_only_a_real_instantiation_is_an_app_target(tmp_path):
+    """A framework NAME is not an app. The ASGI pattern matched its alternatives
+    as prefixes, so a router factory, a bare class alias and an unrelated
+    constant all became smoke targets — and the smoke script then called the
+    class alias as an ASGI app, reddening the run rung unfixably."""
+    root = _project(tmp_path, {
+        "app/__init__.py": "",
+        "app/main.py": (
+            "from fastapi import FastAPI, APIRouter as FastAPIRouter\n"
+            "router = FastAPIRouter(prefix='/api')\n"
+            "AppClass = FastAPI\n"
+            "StarletteConfigDefaults = {'debug': False}\n"
+            "defaults = StarletteConfigDefaults\n"
+            "app = FastAPI()\n"
+        ),
+    })
+    assert python_app_targets(root) == [
+        {"module": "app.main", "attr": "app", "kind": "asgi"}]
+
+
+def test_an_app_built_inside_a_test_module_is_not_a_smoke_target(tmp_path):
+    """python_entry_modules skips tests/ and test_*; its sibling did not, so the
+    smoke script imported a test module outside pytest and ran its import-time
+    side effects."""
+    root = _project(tmp_path, {
+        "app/__init__.py": "",
+        "app/main.py": "from fastapi import FastAPI\napp = FastAPI()\n",
+        "tests/__init__.py": "",
+        "tests/test_api.py": (
+            "from fastapi import FastAPI\nfixture_app = FastAPI()\n"),
+    })
+    assert python_app_targets(root) == [
+        {"module": "app.main", "attr": "app", "kind": "asgi"}]
+
+
 def test_src_layout_modules_drop_the_src_prefix(tmp_path):
     root = _project(tmp_path, {
         "src/pkg/__init__.py": "",
@@ -262,6 +297,72 @@ def test_external_and_non_script_blocks_are_left_alone(tmp_path):
     assert done.returncode == 1 and "app.js" in done.stdout
 
 
+def test_es_module_syntax_is_not_a_syntax_error(tmp_path):
+    """`new vm.Script` compiles a CLASSIC script, so every `export`/`import`
+    read as "Unexpected token 'export'". The worker was then told to fix a
+    syntax error that did not exist and burned its whole budget on it."""
+    from spiral.ladder import compose, web_rungs
+
+    if not _node():
+        return
+    root = _project(tmp_path, {
+        "index.html": '<script type="module">\n'
+                      'import { add } from "./calc.mjs";\n'
+                      'export const ready = add(1, 2);\n'
+                      '</script>',
+        "calc.mjs": "export function add(a, b) {\n  return a + b;\n}\n",
+        "helpers.js": "import { add } from './calc.mjs';\n"
+                      "export const twice = (n) => add(n, n);\n",
+        "legacy.js": "var counter = 0;\n",
+    })
+    done = subprocess.run(compose(web_rungs(root)), shell=True, cwd=root,
+                          capture_output=True, text=True)
+    assert done.returncode == 0, done.stdout + done.stderr
+
+
+def test_a_broken_es_module_is_still_caught(tmp_path):
+    """Accepting module syntax must not amount to skipping modules."""
+    from spiral.ladder import compose, web_rungs
+
+    if not _node():
+        return
+    root = _project(tmp_path, {
+        "index.html": "<div>hi</div>",
+        "calc.mjs": "export function add(a, b) {\n  return a + ;\n}\n",
+    })
+    done = subprocess.run(compose(web_rungs(root)), shell=True, cwd=root,
+                          capture_output=True, text=True)
+    assert done.returncode == 1
+    assert "calc.mjs" in done.stdout
+    assert "rung failed: script-parse" in done.stdout
+
+    (root / "calc.mjs").write_text("export function add(a, b) {\n  return a + b;\n}\n")
+    (root / "index.html").write_text(
+        '<script type="module">\nimport { add } from "./calc.mjs";\n'
+        'console.log(add(1, );\n</script>')
+    done = subprocess.run(compose(web_rungs(root)), shell=True, cwd=root,
+                          capture_output=True, text=True)
+    assert done.returncode == 1
+    assert "index.html <script>" in done.stdout
+
+
+def test_a_classic_script_is_still_checked_as_a_classic_script(tmp_path):
+    """Module code is not a superset: top-level await is valid in a module and
+    broken in a plain <script>. Retrying everything as a module would launder
+    exactly that break."""
+    from spiral.ladder import compose, web_rungs
+
+    if not _node():
+        return
+    root = _project(tmp_path, {
+        "index.html": "<script>\nconst data = await fetch('/x');\n</script>",
+    })
+    done = subprocess.run(compose(web_rungs(root)), shell=True, cwd=root,
+                          capture_output=True, text=True)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "index.html <script>" in done.stdout
+
+
 def test_no_web_sources_means_no_web_rung(tmp_path):
     from spiral.ladder import has_web_sources, web_rungs
 
@@ -333,3 +434,54 @@ def test_the_cli_behave_rung_fails_on_a_tracebacking_help(tmp_path):
     done = subprocess.run(command, shell=True, cwd=root,
                           capture_output=True, text=True)
     assert done.returncode == 0, done.stdout[-200:]
+
+
+def test_the_cli_behave_rung_says_what_actually_failed(tmp_path):
+    """`> /dev/null 2>&1` threw the traceback away, so the worker saw a generic
+    rung label and had no idea which module raised what — the exact opposite of
+    this module's rule that a failing rung must say what failed."""
+    import sys as _sys
+
+    from spiral.ladder import behave_rungs, compose
+
+    root = _project(tmp_path, {
+        "tally/__init__.py": "",
+        "tally/__main__.py": "raise RuntimeError('kaboom-marker')\n",
+    })
+    rungs = [r for r in behave_rungs(root) if r.name.startswith("behave-cli")]
+    command = compose(rungs).replace("python ", f"{_sys.executable} ")
+    done = subprocess.run(command, shell=True, cwd=root,
+                          capture_output=True, text=True)
+    assert done.returncode == 1
+    out = done.stdout + done.stderr
+    assert "kaboom-marker" in out, f"the traceback never reached the worker: {out}"
+    assert "RuntimeError" in out
+    assert "tally" in out, "the failure must name the module that failed"
+
+
+def test_the_cli_help_probe_is_bounded(tmp_path, monkeypatch):
+    """A __main__ that ignores argv and starts a server ran until the broker's
+    verify_timeout (900s by default), so every such task cost fifteen minutes
+    and reported a timeout instead of a rung name."""
+    import sys as _sys
+    import time
+
+    import spiral.ladder as ladder
+
+    root = _project(tmp_path, {
+        "server/__init__.py": "",
+        "server/__main__.py": "import time\nwhile True:\n    time.sleep(0.05)\n",
+    })
+    monkeypatch.setattr(ladder, "CLI_HELP_TIMEOUT_S", 2.0, raising=False)
+    rungs = [r for r in ladder.behave_rungs(root)
+             if r.name.startswith("behave-cli")]
+    command = ladder.compose(rungs).replace("python ", f"{_sys.executable} ")
+    started = time.monotonic()
+    done = subprocess.run(command, shell=True, cwd=root, capture_output=True,
+                          text=True, timeout=25)
+    elapsed = time.monotonic() - started
+    assert elapsed < 20, "the --help probe must bound itself, not the broker"
+    assert done.returncode == 1
+    out = done.stdout + done.stderr
+    assert "server" in out and "did not exit" in out, (
+        f"a timed-out probe must say so, by name: {out}")
