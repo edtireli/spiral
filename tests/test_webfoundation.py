@@ -134,18 +134,27 @@ if __name__ == "__main__":
     import tempfile
 
     failures = 0
-    for name, fn in sorted(globals().items()):
-        if not name.startswith("test_") or not callable(fn):
-            continue
+    cases = [(n, f) for n, f in sorted(globals().items())
+             if n.startswith("test_") and callable(f)]
+    total, ran = len(cases), 0
+    for name, fn in cases:
         try:
             if fn.__code__.co_argcount:
                 with tempfile.TemporaryDirectory() as tmp:
                     fn(Path(tmp))
             else:
                 fn()
+            ran += 1
             print(f"  ok   {name}")
         except AssertionError as exc:
+            ran += 1
             failures += 1
             print(f"  FAIL {name}: {exc}")
-    print(f"\n{failures} failure(s)")
-    sys.exit(1 if failures else 0)
+        except Exception as exc:                    # an error is a failure, not a skip
+            ran += 1
+            failures += 1
+            print(f"  ERROR {name}: {type(exc).__name__}: {exc}")
+    # report the COUNT, not just the failures: "0 failure(s)" over a subset this
+    # runner quietly declined to call reads exactly like a clean suite.
+    print(f"\n{ran}/{total} ran · {failures} failure(s)")
+    sys.exit(1 if failures or ran != total else 0)

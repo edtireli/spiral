@@ -6,6 +6,12 @@ every gate green, because only declared FILES were checked, never the interface.
 
 Runs standalone (`python tests/test_contracts.py`) or under pytest.
 """
+# Run with pytest. There was once a hand-rolled runner below this point, which
+# collected globals() from where it sat mid-file, called each test with no
+# arguments, and caught only AssertionError. So it silently skipped every test
+# defined after it and every test taking a fixture, then printed "N/N passed".
+# A runner that reports a pass count over a subset it chose is the vacuous green
+# this suite exists to catch.
 from __future__ import annotations
 
 import sys
@@ -158,25 +164,6 @@ def test_a_bare_filename_is_a_verifiable_file_ref(tmp_path):
     assert missing_exports(tmp_path, ["style.css"]) == []
     assert missing_exports(tmp_path, ["missing.css"]) == ["missing.css"]
 
-if __name__ == "__main__":
-    import tempfile
-
-    failures = 0
-    for name, fn in sorted(globals().items()):
-        if not name.startswith("test_") or not callable(fn):
-            continue
-        try:
-            if fn.__code__.co_argcount:
-                with tempfile.TemporaryDirectory() as tmp:
-                    fn(Path(tmp))
-            else:
-                fn()
-            print(f"  ok   {name}")
-        except AssertionError as exc:
-            failures += 1
-            print(f"  FAIL {name}: {exc}")
-    print(f"\n{failures} failure(s)")
-    sys.exit(1 if failures else 0)
 
 
 

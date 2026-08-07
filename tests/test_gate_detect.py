@@ -6,6 +6,12 @@ with a pyproject but no tests yet becomes a permanently-red gate that thrashes.
 
 Runs standalone (`python tests/test_gate_detect.py`) or under pytest.
 """
+# Run with pytest. There was once a hand-rolled runner below this point, which
+# collected globals() from where it sat mid-file, called each test with no
+# arguments, and caught only AssertionError. So it silently skipped every test
+# defined after it and every test taking a fixture, then printed "N/N passed".
+# A runner that reports a pass count over a subset it chose is the vacuous green
+# this suite exists to catch.
 from __future__ import annotations
 
 import os
@@ -64,12 +70,6 @@ def test_tests_dir_alone_triggers_gate():
     assert "pytest" in detect_gate(d)
 
 
-if __name__ == "__main__":
-    for fn in (test_gate_redetected_when_project_materialises, test_no_tests_collected_is_green,
-               test_real_failure_still_red, test_tests_dir_alone_triggers_gate):
-        fn()
-        print(f"ok  {fn.__name__}")
-    print("all gate-detection tests passed")
 
 
 def test_composed_gate_is_not_double_parenthesised():
