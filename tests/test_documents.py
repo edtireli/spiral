@@ -112,3 +112,16 @@ def test_docx_keeps_headings_and_styles_through_an_edit():
     assert back.paragraphs[0].style.name.lower().startswith("heading")
     assert "testament" not in back.paragraphs[1].text
     assert "This connects several ideas." == back.paragraphs[1].text
+
+
+def test_prose_plan_lists_only_the_stages_that_will_run():
+    """A plan showing work that gets skipped is a plan you stop trusting."""
+    from spiral.prose_ui import prose_plan
+
+    measure_only = prose_plan(with_corpus=False, rewriting=False)
+    assert [m.title for m in measure_only.milestones] == ["read the document"]
+
+    full = prose_plan(with_corpus=True, rewriting=True)
+    titles = [m.title for m in full.milestones]
+    assert titles == ["read the document", "field template", "rewrite", "write out"]
+    assert full.task_count == 9

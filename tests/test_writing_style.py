@@ -171,3 +171,25 @@ def test_plain_human_prose_stays_clean():
              "with a time constant of 12.4 ms, about twice the 300 K value. We did not "
              "reproduce the anomaly reported earlier.")
     assert _tells(human) == []
+
+
+def test_mined_and_handwritten_tells_do_not_double_count():
+    """A mined section and a hand-written pattern often name the same habit
+    ('Superficial analyses' vs superficial-analysis). Reporting both inflates the
+    score and clutters the output."""
+    ids = {t.id for t in _tells(AI_PROSE)}
+    for hand, mined in [
+        ("superficial-analysis", "superficial-analyses"),
+        ("challenges-formula", "outline-like-conclusions-about-challenges-and-fu"),
+        ("significance-inflation", "undue-emphasis-on-significance-legacy-and-broade"),
+        ("ai-vocabulary", "high-density-of-ai-vocabulary-words"),
+        ("copula-avoidance", "avoidance-of-basic-copulatives-is-are-phrases"),
+    ]:
+        assert not (hand in ids and mined in ids), f"double-counted {hand} + {mined}"
+
+
+def test_mined_tells_still_add_coverage_where_handwritten_miss():
+    """Deduping must suppress duplicates, not silence the mined catalogue."""
+    ids = {t.id for t in _tells(
+        "It has been profiled in local media outlets and trade publications.")}
+    assert any("notability" in i for i in ids)
