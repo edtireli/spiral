@@ -25,6 +25,27 @@ class ChatResult:
     def total_tokens(self) -> int:
         return self.prompt_tokens + self.completion_tokens
 
+    @property
+    def spent_on_thinking(self) -> bool:
+        """The model reasoned until the budget ran out and never began answering.
+
+        ``num_predict`` is a cap on EVERYTHING a reasoning model emits, thinking
+        included — so a budget sized for an answer is one a thinker can exhaust
+        before it writes a word. The reply then comes back with prose in
+        ``thinking``, an empty ``content``, and ``done_reason == "length"``.
+
+        Reproduced against a local qwen3.6: with ``num_predict`` 16 and thinking on,
+        content comes back empty and done_reason "length" while ``thinking`` holds
+        the opening of a reasoning trace; with thinking off the same prompt answers
+        in two tokens and stops. It surfaces as "returned no text (empty response)",
+        which reads like a broken model rather than a budget that cut it off.
+        """
+        return bool(
+            not (self.text or "").strip()
+            and (self.thinking or "").strip()
+            and (self.raw or {}).get("done_reason") == "length"
+        )
+
 
 class Ollama:
     """Local Ollama client, plus a routing seam: any model named in `providers`
@@ -115,10 +136,14 @@ class Ollama:
         on_delta: Any | None = None,
         num_ctx: int | None = None,
         keep_alive: Any | None = None,
+        _recovering: bool = False,
     ) -> ChatResult:
         """One call, two modes. Without on_delta: blocking. With on_delta: streams,
         calling on_delta(kind, piece) per chunk (kind: 'think' | 'text') so a UI can
-        tick tokens live — the difference between a CLI that feels dead and alive."""
+        tick tokens live — the difference between a CLI that feels dead and alive.
+
+        A reasoning model that spends the whole budget thinking is retried once
+        with thinking off — see ``_answer_or_recover``."""
         import json as _json
 
         if model in self.providers:
@@ -145,12 +170,17 @@ class Ollama:
             r.raise_for_status()
             data = r.json()
             msg = data.get("message", {}) or {}
-            return ChatResult(
-                text=msg.get("content", ""),
-                thinking=msg.get("thinking"),
-                prompt_tokens=data.get("prompt_eval_count", 0),
-                completion_tokens=data.get("eval_count", 0),
-                raw=data,
+            return self._answer_or_recover(
+                ChatResult(
+                    text=msg.get("content", ""),
+                    thinking=msg.get("thinking"),
+                    prompt_tokens=data.get("prompt_eval_count", 0),
+                    completion_tokens=data.get("eval_count", 0),
+                    raw=data,
+                ),
+                model, messages, think=think, num_predict=num_predict,
+                temperature=temperature, stop=stop, fmt=fmt, on_delta=None,
+                num_ctx=num_ctx, keep_alive=keep_alive, recovering=_recovering,
             )
 
         payload["stream"] = True
@@ -188,12 +218,43 @@ class Ollama:
                     on_delta("text", msg["content"])
                 if chunk.get("done"):
                     last = chunk
+        return self._answer_or_recover(
+            ChatResult(
+                text="".join(text_parts),
+                thinking="".join(think_parts) or None,
+                prompt_tokens=last.get("prompt_eval_count", 0),
+                completion_tokens=last.get("eval_count", 0),
+                raw=last,
+            ),
+            model, messages, think=think, num_predict=num_predict,
+            temperature=temperature, stop=stop, fmt=fmt, on_delta=on_delta,
+            num_ctx=num_ctx, keep_alive=keep_alive, recovering=_recovering,
+        )
+
+    def _answer_or_recover(self, result: ChatResult, model: str,
+                           messages: list[dict], *, think: bool, recovering: bool,
+                           **call) -> ChatResult:
+        """Return the reply, or buy an answer from a model that only thought.
+
+        A reasoning model handed an answer-sized ``num_predict`` can spend all of
+        it reasoning and return empty content. Retrying with a bigger budget only
+        moves the wall — the thinking expands to fill it — so the retry turns
+        thinking OFF, which is what actually guarantees the model starts writing
+        immediately. Once, and only for a reply that produced literally nothing:
+        a short answer is not this, and must not pay for a second call.
+
+        The token cost of the wasted call is preserved in the returned result, so
+        budget accounting still sees what was really spent.
+        """
+        if recovering or not think or not result.spent_on_thinking:
+            return result
+        again = self.chat(model, messages, think=False, _recovering=True, **call)
         return ChatResult(
-            text="".join(text_parts),
-            thinking="".join(think_parts) or None,
-            prompt_tokens=last.get("prompt_eval_count", 0),
-            completion_tokens=last.get("eval_count", 0),
-            raw=last,
+            text=again.text,
+            thinking=result.thinking,
+            prompt_tokens=result.prompt_tokens + again.prompt_tokens,
+            completion_tokens=result.completion_tokens + again.completion_tokens,
+            raw={**(again.raw or {}), "spiral_recovered_from_thinking": True},
         )
 
     # -- OpenAI-compatible provider path (remote reasoning models) ---------------
