@@ -63,7 +63,8 @@ def test_the_guilty_commit_is_found_and_reverted(tmp_path):
     assert outcome.healed, outcome.detail
     assert outcome.guilty == guilty
     assert _ok(root), "the real tree must be healthy afterwards"
-    assert "hello" == (root / "other.txt").read_text().strip() or True
+    assert (root / "other.txt").read_text().strip() == "hello", (
+        "reverting the guilty commit must not disturb unrelated later work")
     assert (root / "more.txt").is_file(), "unrelated later work must survive"
     log = _git(root, "log", "--oneline")
     assert "Revert" in log
@@ -174,15 +175,24 @@ if __name__ == "__main__":
     import tempfile
 
     failures = 0
-    for name, fn in sorted(globals().items()):
-        if not name.startswith("test_") or not callable(fn):
-            continue
+    cases = [(n, f) for n, f in sorted(globals().items())
+             if n.startswith("test_") and callable(f)]
+    total, ran = len(cases), 0
+    for name, fn in cases:
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 fn(Path(tmp))
+            ran += 1
             print(f"  ok   {name}")
         except AssertionError as exc:
+            ran += 1
             failures += 1
             print(f"  FAIL {name}: {exc}")
-    print(f"\n{failures} failure(s)")
-    sys.exit(1 if failures else 0)
+        except Exception as exc:                    # an error is a failure, not a skip
+            ran += 1
+            failures += 1
+            print(f"  ERROR {name}: {type(exc).__name__}: {exc}")
+    # report the COUNT, not just the failures: "0 failure(s)" over a subset this
+    # runner quietly declined to call reads exactly like a clean suite.
+    print(f"\n{ran}/{total} ran · {failures} failure(s)")
+    sys.exit(1 if failures or ran != total else 0)

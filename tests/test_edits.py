@@ -1,6 +1,12 @@
 """Exercises the edit engine against the ways a local model actually errs.
 Runs standalone (`python tests/test_edits.py`) or under pytest.
 """
+# Run with pytest. There was once a hand-rolled runner below this point, which
+# collected globals() from where it sat mid-file, called each test with no
+# arguments, and caught only AssertionError. So it silently skipped every test
+# defined after it and every test taking a fixture, then printed "N/N passed".
+# A runner that reports a pass count over a subset it chose is the vacuous green
+# this suite exists to catch.
 from __future__ import annotations
 
 import os
@@ -78,22 +84,8 @@ def test_parse_fenced_multiblock():
     assert "return a + b + 0" in blocks[0].replace
 
 
-def _run():
-    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
-    failed = 0
-    for t in tests:
-        try:
-            t()
-            print(f"  \033[32mPASS\033[0m {t.__name__}")
-        except AssertionError as e:
-            failed += 1
-            print(f"  \033[31mFAIL\033[0m {t.__name__}: {e}")
-    print(f"\n{len(tests) - failed}/{len(tests)} passed")
-    return 1 if failed else 0
 
 
-if __name__ == "__main__":
-    raise SystemExit(_run())
 
 
 def test_an_edit_that_breaks_a_parsing_file_is_rejected_atomically(tmp_path):

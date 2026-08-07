@@ -1,6 +1,12 @@
 """Deterministic planner checks — the zero-token ground truth that runs before
 any model opinion. Standalone (`python tests/test_planner.py`) or under pytest.
 """
+# Run with pytest. There was once a hand-rolled runner below this point, which
+# collected globals() from where it sat mid-file, called each test with no
+# arguments, and caught only AssertionError. So it silently skipped every test
+# defined after it and every test taking a fixture, then printed "N/N passed".
+# A runner that reports a pass count over a subset it chose is the vacuous green
+# this suite exists to catch.
 from __future__ import annotations
 
 import os
@@ -125,22 +131,8 @@ def test_narrow_non_product_change_does_not_grow_scope():
     assert enrich_product_spec("Fix the parser off-by-one", original, "other") == original
 
 
-def _run():
-    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
-    failed = 0
-    for t in tests:
-        try:
-            t()
-            print(f"  \033[32mPASS\033[0m {t.__name__}")
-        except AssertionError as e:
-            failed += 1
-            print(f"  \033[31mFAIL\033[0m {t.__name__}: {e}")
-    print(f"\n{len(tests) - failed}/{len(tests)} passed")
-    return 1 if failed else 0
 
 
-if __name__ == "__main__":
-    raise SystemExit(_run())
 
 
 def test_deliverable_kind_is_reconciled_with_its_own_description():

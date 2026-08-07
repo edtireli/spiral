@@ -10,6 +10,12 @@ transaction guard.
 
 Runs standalone (`python tests/test_pipeline_integration.py`) or under pytest.
 """
+# Run with pytest. There was once a hand-rolled runner below this point, which
+# collected globals() from where it sat mid-file, called each test with no
+# arguments, and caught only AssertionError. So it silently skipped every test
+# defined after it and every test taking a fixture, then printed "N/N passed".
+# A runner that reports a pass count over a subset it chose is the vacuous green
+# this suite exists to catch.
 from __future__ import annotations
 
 import subprocess
@@ -129,6 +135,11 @@ def test_a_python_project_gets_a_shell_valid_ladder_that_finds_a_bad_import(tmp_
     (root / "requirements.txt").write_text("pytest\n")
 
     conductor = _conductor(root)
+    # Every real run snapshots before it runs a gate, and the snapshot is what
+    # provisions .gitignore. Skipping it here left `app/__pycache__/` untracked after
+    # the gate ran, which is exactly the dirty-tree-refuses-every-commit failure the
+    # snapshot's own comment describes — so the ordering is part of what is under test.
+    conductor._snapshot()
     assert conductor.gate, "a python project must have a gate"
     assert "rungs/parse.py" in conductor.gate and "rungs/load.py" in conductor.gate
     assert "((" not in conductor.gate, (
@@ -146,7 +157,17 @@ def test_a_python_project_gets_a_shell_valid_ladder_that_finds_a_bad_import(tmp_
     done = subprocess.run(gate, shell=True, cwd=root, capture_output=True,
                           text=True, env=env)
     assert done.returncode == 0, done.stdout[-400:]
-    assert _clean(root) or True   # rung scripts live under .spiral, which is ignored
+    # The gate must leave no trace of its own. The tree is not simply clean here —
+    # this test edited app/main.py two lines up — so the invariant is that the only
+    # dirty entry is that deliberate edit. Bytecode is the thing to watch: __pycache__
+    # left behind by a gate run is what makes the next task's transaction see a dirty
+    # workspace and refuse to commit, which is why _snapshot() provisions .gitignore.
+    dirty = sorted(
+        line[3:] for line in subprocess.run(
+            "git status --porcelain", shell=True, cwd=root,
+            capture_output=True, text=True).stdout.splitlines()
+        if ".spiral" not in line)
+    assert dirty == ["app/main.py"], f"the gate run left its own residue: {dirty}"
 
 
 def test_materializing_the_ladder_never_dirties_a_tracked_file(tmp_path):
@@ -171,27 +192,15 @@ def test_capability_resolution_lands_before_the_snapshot(tmp_path):
     assert "praw" in (root / "requirements.txt").read_text()
     conductor._snapshot()
     assert _clean(root)
-    assert "praw" in subprocess.run(
+    # `--stat` lists changed FILES, never their contents, so the original
+    # `assert "praw" in ... or True` could not have held on its own — the declaration
+    # to look for is requirements.txt landing inside the snapshot commit itself.
+    assert "requirements.txt" in subprocess.run(
         "git show --stat HEAD", shell=True, cwd=root,
-        capture_output=True, text=True).stdout or True
+        capture_output=True, text=True).stdout, (
+        "the declared dependency must be committed by the snapshot, not left dirty")
 
 
-if __name__ == "__main__":
-    import tempfile
-
-    failures = 0
-    for name, fn in sorted(globals().items()):
-        if not name.startswith("test_") or not callable(fn):
-            continue
-        try:
-            with tempfile.TemporaryDirectory() as tmp:
-                fn(Path(tmp))
-            print(f"  ok   {name}")
-        except AssertionError as exc:
-            failures += 1
-            print(f"  FAIL {name}: {exc}")
-    print(f"\n{failures} failure(s)")
-    sys.exit(1 if failures else 0)
 
 
 def test_the_workers_are_told_about_the_foundation_after_it_exists(tmp_path):

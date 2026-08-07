@@ -40,10 +40,16 @@ def test_the_vacuous_computation_is_caught():
 
 def test_nested_parens_in_the_argument_list_are_parsed():
     """The first version of this rule silently never fired: a naive [^)] capture stops
-    at the ')' inside su(5)."""
-    assert check_cohomology_claims("H^6(su(5),so(5);R)") == [] or True
-    issues = check_cohomology_claims("H^9(su(3),su(2);R)")   # dim 5, degree 9
+    at the ')' inside su(5), so the space never resolved and no issue could be raised.
+
+    Both directions are asserted, because a rule that never fires also "passes" the
+    good case — only the vacuous one proves the argument list was actually read."""
+    # dim(su(3)/su(2)) = 5, so degree 9 must be caught despite the inner parens
+    issues = check_cohomology_claims("H^9(su(3),su(2);R)")
     assert issues and issues[0].kind == "vacuous"
+    assert "su(3)/su(2)" in issues[0].subject, "the nested argument list was not parsed"
+    # dim(su(5)/so(5)) = 14, so degree 6 is genuinely fine
+    assert check_cohomology_claims("H^6(su(5),so(5);R)") == []
 
 
 def test_symbolic_degree_expands_over_the_proposed_dimensions():
