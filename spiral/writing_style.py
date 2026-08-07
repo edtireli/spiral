@@ -47,11 +47,26 @@ _TELLS: list[tuple[str, str, re.Pattern]] = [
      "replaces plain 'is/are' with inflated verbs",
      re.compile(r"\b(?:serves?\s+as|stands?\s+as|functions?\s+as|represents?|boasts?|"
                 r"embodies|encapsulates)\b", re.I)),
+    # Wikipedia catalogues THREE distinct negative parallelisms. An earlier version of
+    # this file implemented only the first and silently missed the other two, which are
+    # the ones that show up most in polished machine prose.
     ("negative-parallelism",
-     "the 'not only X but Y' / 'not X, but Y' construction",
-     re.compile(r"\bnot\s+(?:only|just|merely|simply)\b[^.!?]{0,80}?\bbut\b|"
-                r"\bit(?:'s|\s+is)\s+not\s+[^.!?]{0,60}?,\s*it(?:'s|\s+is)\b|"
-                r"\brather\s+than\s+(?:a|an|the)?\s*\w+ing\b", re.I)),
+     "'not only X but also Y' — the additive negative parallelism",
+     re.compile(r"\bnot\s+(?:only|just|merely|simply)\b[^.!?]{0,80}?\b(?:but|yet)\b", re.I)),
+    ("not-x-but-y",
+     "'not X, but Y' framing — asserts by contrast instead of stating",
+     re.compile(
+         # "not a mirror but a portal", "not a representation, but an act"
+         r"\bnot\s+(?:a|an|the|his|her|its|their)\s+[\w-]+(?:\s+[\w-]+){0,4}?\s*,?\s*"
+         r"\bbut\s+(?:a|an|the|rather|instead)\b|"
+         # "It's not X, it's Y"
+         r"\bit(?:'s|’s|\s+is|\s+was)\s+not\s+[^.!?]{0,60}?,\s*it(?:'s|’s|\s+is|\s+was)\b|"
+         # "no X, no Y, just Z"
+         r"\bno\s+[\w-]+\s*,\s*no\s+[\w-]+\s*,\s*(?:just|only|simply)\b", re.I)),
+    ("x-rather-than-y",
+     "'X rather than Y' framing, typically after a gerund",
+     re.compile(r"\b\w+ing\b[^.!?]{0,60}?\brather\s+than\b|"
+                r"\brather\s+than\s+(?:a|an|the)?\s*\w+(?:ing|ity|ism|ness|tion)\b", re.I)),
     ("superficial-analysis",
      "trailing '-ing' clause asserting unattributed significance",
      re.compile(r",\s+(?:highlighting|underscoring|emphasizing|reflecting|symbolizing|"
@@ -84,6 +99,39 @@ _TELLS: list[tuple[str, str, re.Pattern]] = [
      re.compile("[\U0001F300-\U0001FAFF\u2600-\u27BF]")),
     ("curly-quotes", "curly quotation marks/apostrophes",
      re.compile("[\u2018\u2019\u201c\u201d]")),
+]
+
+# Formatting tells must see the RAW text \u2014 markdown, headings and emphasis are exactly
+# what they are about, and prose-stripping destroys them. Each carries a density floor
+# so a single bold word or one em dash is not an accusation.
+_FORMAT_TELLS: list[tuple[str, str, re.Pattern, float]] = [
+    ("title-case-headings",
+     "headings in Title Case rather than sentence case",
+     # Title case keeps minor words lowercase ("Impact of Technology and Digitalization"),
+     # so requiring every word capitalised finds nothing. Instead: a heading line with
+     # three or more capitalised content words and no terminal punctuation.
+     re.compile(r"^\s{0,3}(?:#{1,6}\s+|\*\*)"
+                r"(?=(?:[^\n]*?\b[A-Z][a-z]{2,}\b){3,})"
+                r"[A-Z][^\n.!?]{4,90}$", re.M), 0.0),
+    ("boldface-overuse",
+     "mechanical boldface on terms mid-sentence",
+     re.compile(r"\*\*[^*\n]{2,60}\*\*"), 8.0),
+    ("inline-header-list",
+     "bullet + bold header + colon + description, the LLM list shape",
+     re.compile(r"^\s{0,4}(?:[-*+]|\d+\.)\s+\*\*[^*\n]{2,60}\*\*\s*[:\u2014-]", re.M), 0.0),
+    ("em-dash-overuse",
+     "em dashes standing in for other punctuation",
+     re.compile(r"\u2014"), 6.0),
+    ("title-as-proper-noun",
+     "opening sentence treating the title as a standalone entity",
+     re.compile(r"^\s{0,3}\*\*[^*\n]{3,80}\*\*\s+(?:refers?\s+to|is\s+a\s+term|"
+                r"describes|denotes)\b", re.M), 0.0),
+    ("skipped-heading-level",
+     "heading hierarchy jumps a level (## then ####)",
+     re.compile(r"^(#{2})\s+[^\n]+\n(?:[^\n#][^\n]*\n|\n)*?(#{4,6})\s", re.M), 0.0),
+    ("thematic-break-before-heading",
+     "horizontal rule inserted before a heading",
+     re.compile(r"^\s*(?:---+|\*\*\*+|___+)\s*\n+\s*#{1,6}\s", re.M), 0.0),
 ]
 
 _HEDGES = re.compile(
@@ -250,27 +298,77 @@ class Tell:
     examples: list
 
 
+_MINED_CACHE: list | None = None
+
+
+def _mined_tells() -> list:
+    """Phrase tells mined from Wikipedia's own 'Words to watch' boxes.
+
+    Loaded once and cached. Absent cache → empty list, so the hand-written structural
+    patterns still work; detection degrades, it never breaks."""
+    global _MINED_CACHE
+    if _MINED_CACHE is None:
+        try:
+            from spiral.ai_tells import compile_tells, load
+
+            _MINED_CACHE = compile_tells(load())
+        except Exception:
+            _MINED_CACHE = []
+    return _MINED_CACHE
+
+
+def _collect(rx, haystack: str, words: float, per_1k: bool,
+             floor: float = 0.0) -> tuple[float, list] | None:
+    hits = [m.group(0).strip() for m in rx.finditer(haystack)]
+    if not hits:
+        return None
+    count = round(len(hits) / (words / 1000.0), 2) if per_1k else float(len(hits))
+    if floor and count < floor:
+        return None                      # below the density floor: not a signal
+    seen, examples = set(), []
+    for h in hits:
+        key = " ".join(h.lower().split())
+        if key not in seen:
+            seen.add(key)
+            examples.append(" ".join(h.split())[:60])
+        if len(examples) == 4:
+            break
+    return count, examples
+
+
 def ai_tells(text: str, *, per_1k: bool = True) -> list[Tell]:
-    """Find the machine-prose markers Wikipedia catalogues. Deterministic and
-    quotable: every hit carries the text that triggered it, so a rewrite can be
-    checked rather than trusted."""
-    prose = _strip_tex(text or "")
-    words = max(1, len(_WORD.findall(prose)))
+    """Find the machine-prose markers Wikipedia catalogues.
+
+    Three sources, all deterministic: phrase lists mined straight from the page's
+    'Words to watch' boxes, hand-written patterns for the *structural* tells that are
+    described rather than listed (the negative parallelisms, rule of three), and
+    formatting tells that must see the raw text (title case, boldface, em dashes,
+    inline-header lists). Every hit carries the text that triggered it, so a rewrite can
+    be checked rather than trusted."""
+    raw = text or ""
+    prose = _strip_tex(raw)
+    words = max(1.0, float(len(_WORD.findall(prose))))
     out: list[Tell] = []
+    seen_ids: set[str] = set()
+
     for tid, why, rx in _TELLS:
-        hits = [m.group(0).strip() for m in rx.finditer(prose)]
-        if not hits:
+        got = _collect(rx, prose, words, per_1k)
+        if got:
+            out.append(Tell(tid, why, got[0], got[1]))
+            seen_ids.add(tid)
+
+    for slug, name, rx in _mined_tells():
+        if slug in seen_ids:
             continue
-        count = round(len(hits) / (words / 1000.0), 2) if per_1k else len(hits)
-        seen, examples = set(), []
-        for h in hits:
-            key = h.lower()
-            if key not in seen:
-                seen.add(key)
-                examples.append(h[:60])
-            if len(examples) == 4:
-                break
-        out.append(Tell(tid, why, count, examples))
+        got = _collect(rx, prose, words, per_1k)
+        if got:
+            out.append(Tell(slug, name.lower(), got[0], got[1]))
+
+    for tid, why, rx, floor in _FORMAT_TELLS:
+        got = _collect(rx, raw, words, per_1k, floor=floor)
+        if got:
+            out.append(Tell(tid, why, got[0], got[1]))
+
     return sorted(out, key=lambda t: -t.count)
 
 

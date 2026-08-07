@@ -1,0 +1,140 @@
+{
+ "source": "https://en.wikipedia.org/wiki/Wikipedia:Signs_of_AI_writing",
+ "sections": {
+  "Undue emphasis on significance, legacy, and broader trends": {
+   "words_to_watch": [
+    "stands/serves as",
+    "is a testament/reminder",
+    "a crucial/pivotal/vital/significant/key role/moment",
+    "underscores/highlights its importance/significance",
+    "reflects broader",
+    "symbolizing its ongoing/enduring/lasting",
+    "contributing to the",
+    "setting the stage for",
+    "marking/shaping the",
+    "represents/marks a shift",
+    "key turning point",
+    "evolving landscape",
+    "focal point",
+    "indelible mark",
+    "deeply rooted"
+   ],
+   "examples": []
+  },
+  "Canned emphasis on notability, attribution, and media coverage": {
+   "words_to_watch": [
+    "independent coverage",
+    "local/regional/national/[country name] media outlets",
+    "music/business/tech outlets",
+    "trade publications",
+    "profiled in",
+    "written by a leading expert",
+    "active social media presence"
+   ],
+   "examples": []
+  },
+  "Superficial analyses": {
+   "words_to_watch": [
+    "highlighting/underscoring/emphasizing ...",
+    "ensuring ...",
+    "reflecting/symbolizing ...",
+    "contributing to ...",
+    "cultivating/fostering ...",
+    "encompassing ...",
+    "enhancing ...",
+    "valuable insights",
+    "align/resonate with"
+   ],
+   "examples": []
+  },
+  "Promotional and advertisement-like language": {
+   "words_to_watch": [
+    "boasts a",
+    "vibrant",
+    "rich",
+    "profound",
+    "enhancing",
+    "showcasing",
+    "exemplifies",
+    "commitment to",
+    "natural beauty",
+    "nestled",
+    "in the heart of",
+    "groundbreaking",
+    "renowned",
+    "featuring",
+    "diverse array"
+   ],
+   "examples": []
+  },
+  "Vague attributions and overgeneralization of opinions": {
+   "words_to_watch": [
+    "Industry reports",
+    "Observers have cited",
+    "Experts argue",
+    "Some critics argue",
+    "several sources/publications",
+    "such as"
+   ],
+   "examples": []
+  },
+  "Outline-like conclusions about challenges and future prospects": {
+   "words_to_watch": [
+    "Despite its... faces several challenges...",
+    "Despite these challenges",
+    "Challenges and Legacy",
+    "Future Outlook"
+   ],
+   "examples": []
+  },
+  "High density of \"AI vocabulary\" words": {
+   "words_to_watch": [
+    "Additionally",
+    "align with",
+    "boasts",
+    "bolstered",
+    "crucial",
+    "delve"
+   ],
+   "examples": []
+  },
+  "Avoidance of basic copulatives (\"is\"/\"are\" phrases)": {
+   "words_to_watch": [
+    "serves as/stands as/marks/functions as/operates as/represents [a]",
+    "boasts/features/maintains/offers [a]",
+    "refers to"
+   ],
+   "examples": []
+  },
+  "Collaborative communication": {
+   "words_to_watch": [
+    "I hope this helps",
+    "Of course!",
+    "Certainly!"
+   ],
+   "examples": []
+  },
+  "Knowledge-cutoff disclaimers and speculation about gaps in sources": {
+   "words_to_watch": [
+    "as of [date]"
+   ],
+   "examples": []
+  },
+  "Section summaries": {
+   "words_to_watch": [
+    "In summary",
+    "In conclusion",
+    "Overall"
+   ],
+   "examples": []
+  },
+  "Prompt refusal": {
+   "words_to_watch": [
+    "as an AI language model",
+    "as a large language model",
+    "I cannot offer medical advice, but I can..."
+   ],
+   "examples": []
+  }
+ }
+}
