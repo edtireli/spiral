@@ -1,6 +1,7 @@
 ---
 name: android-kotlin
 description: Android app work in Kotlin — gradle, activities, layouts, resources, viewBinding, RecyclerView, TTS, MediaPlayer, animations, manifest. Use for any .kt, .kts, AndroidManifest, or res/ task.
+applies_to: android
 ---
 # Android/Kotlin discipline
 

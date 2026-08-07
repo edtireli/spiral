@@ -1,0 +1,179 @@
+{
+  "id": "web-calculator",
+  "kind": "web",
+  "goal": "Build a calculator as a single static web page: index.html plus its own CSS and JS, no build step and no CDN.\n\nIt must do arithmetic correctly (including chained operations, decimals, percent, sign flip, and backspace), keep a visible history of previous calculations that can be clicked to recall a result, and support full keyboard entry as well as clicking.\n\nIt must look and feel finished rather than functional: a coherent colour system defined once as CSS custom properties and referenced everywhere, a visible focus ring on every interactive control, pressed and hover states on the keys, a transition or animation on key presses and on results appearing, an icon or symbol on the clear and backspace controls rather than bare words, a readable empty state for the history panel before anything has been calculated, and an inline error state for division by zero that does not lose what the user typed. It must be usable on a phone and on a wide desktop window without clipping or overlap, and it must respect the operating system's light and dark preference.",
+  "budget_minutes": 240,
+  "checks": [
+    {
+      "id": "page-exists",
+      "weight": 3,
+      "why": "there is a page at all",
+      "shell": "ls index.html public/index.html src/index.html app/static/index.html 2>/dev/null | head -1 | grep -q ."
+    },
+    {
+      "id": "no-cdn",
+      "weight": 2,
+      "why": "self-contained, as the goal requires",
+      "shell": "! grep -rqiE --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=.spiral 'src=\"https?://|href=\"https?://[^\"]*\\.css' --include=*.html ."
+    },
+    {
+      "id": "has-js",
+      "weight": 2,
+      "why": "it is a calculator, not a mockup",
+      "shell": "grep -rqE --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=.spiral 'addEventListener|onclick' --include=*.html --include=*.js ."
+    },
+    {
+      "id": "arith-correct",
+      "weight": 6,
+      "why": "7+5 really evaluates to 12 in a browser",
+      "browser": {
+        "click": [
+          "7",
+          "+",
+          "5",
+          "="
+        ],
+        "expect_any": [
+          "12"
+        ]
+      }
+    },
+    {
+      "id": "keyboard",
+      "weight": 4,
+      "why": "keyboard entry, not mouse only",
+      "shell": "grep -rqE --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=.spiral \"keydown|keypress|keyup\" --include=*.html --include=*.js ."
+    },
+    {
+      "id": "history",
+      "weight": 3,
+      "why": "history panel exists in the markup",
+      "shell": "grep -rqiE --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=.spiral 'history' --include=*.html --include=*.js ."
+    },
+    {
+      "id": "tokens-defined",
+      "weight": 3,
+      "why": "a colour system, defined once",
+      "shell": "grep -rqE --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=.spiral '^\\s*--[a-z-]+\\s*:' --include=*.html --include=*.css ."
+    },
+    {
+      "id": "tokens-obeyed",
+      "weight": 4,
+      "why": "colours reference the tokens instead of being sprinkled as literals",
+      "python": "token_adherence"
+    },
+    {
+      "id": "focus-visible",
+      "weight": 3,
+      "why": "a visible focus ring on interactive controls",
+      "shell": "grep -rqE --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=.spiral ':focus(-visible)?\\s*[,{]' --include=*.html --include=*.css ."
+    },
+    {
+      "id": "press-states",
+      "weight": 2,
+      "why": "hover and pressed feedback on the keys",
+      "shell": "grep -rqE --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=.spiral ':hover\\s*[,{]' --include=*.html --include=*.css . && grep -rqE --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=.spiral ':active\\s*[,{]' --include=*.html --include=*.css ."
+    },
+    {
+      "id": "motion",
+      "weight": 3,
+      "why": "a transition or animation, not a static grid",
+      "shell": "grep -rqE --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=.spiral 'transition[^;]*:|@keyframes|animation\\s*:' --include=*.html --include=*.css ."
+    },
+    {
+      "id": "iconography",
+      "weight": 2,
+      "why": "symbols on clear/backspace rather than bare words",
+      "shell": "grep -rqE --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=.spiral '<svg|&#x?[0-9a-fA-F]+;|[\u232b\u2715\u00d7\u2190]' --include=*.html ."
+    },
+    {
+      "id": "empty-state",
+      "weight": 3,
+      "why": "the history panel says something before first use",
+      "shell": "grep -rqiE --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=.spiral 'no (previous |past )?calculations|nothing yet|empty|start typing|history is empty' --include=*.html --include=*.js ."
+    },
+    {
+      "id": "responsive",
+      "weight": 3,
+      "why": "usable on a phone",
+      "shell": "grep -rqE --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=.spiral 'name=\"viewport\"' --include=*.html . && grep -rqE --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=.spiral '@media' --include=*.html --include=*.css ."
+    },
+    {
+      "id": "dark-mode",
+      "weight": 3,
+      "why": "respects the OS preference, as the goal requires",
+      "shell": "grep -rqE --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=.spiral 'prefers-color-scheme' --include=*.html --include=*.css ."
+    },
+    {
+      "id": "aria",
+      "weight": 2,
+      "why": "controls are labelled for assistive tech",
+      "shell": "grep -rqE --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=.spiral 'aria-label|aria-live|role=' --include=*.html ."
+    },
+    {
+      "id": "contrast",
+      "weight": 4,
+      "why": "text on background clears WCAG AA (4.5:1), computed not asserted",
+      "python": "contrast"
+    },
+    {
+      "id": "no-placeholders",
+      "weight": 3,
+      "why": "no TODO, lorem ipsum, or stub left behind",
+      "shell": "! grep -rqiE --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=.spiral 'TODO|FIXME|lorem ipsum|coming soon|not implemented' --include=*.html --include=*.js --include=*.css ."
+    },
+    {
+      "id": "divide-by-zero-behaviour",
+      "weight": 6,
+      "why": "dividing by zero says so in the display, and never renders null/undefined/NaN anywhere",
+      "browser": {
+        "click": [
+          "8",
+          "\u00f7",
+          "0",
+          "="
+        ],
+        "read_any": [
+          "#display",
+          ".display",
+          "[aria-live]",
+          "[role=status]"
+        ],
+        "expect_any": [
+          "cannot",
+          "error",
+          "not allowed",
+          "undefined is not",
+          "infinity",
+          "divide by zero"
+        ],
+        "reject_any": [
+          "undefined",
+          "null",
+          "NaN"
+        ]
+      }
+    },
+    {
+      "id": "error-keeps-input",
+      "weight": 4,
+      "why": "the goal says an error must not lose what the user typed",
+      "browser": {
+        "click": [
+          "8",
+          "\u00f7",
+          "0",
+          "="
+        ],
+        "read_any": [
+          "#display",
+          ".display",
+          "[aria-live]"
+        ],
+        "expect_any": [
+          "8"
+        ]
+      }
+    }
+  ]
+}

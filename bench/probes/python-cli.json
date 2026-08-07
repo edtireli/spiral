@@ -1,0 +1,104 @@
+{
+  "id": "python-cli",
+  "kind": "cli",
+  "goal": "Build a command-line tool called `tally` that summarises a CSV file.\n\nInvoked as `python -m tally <file.csv>`, it prints, for every numeric column: the count of values, the minimum, the maximum, the mean and the median, aligned in a readable table with the column name first. Non-numeric columns are reported with their count of distinct values instead. Values that are blank or unparseable are skipped and counted separately as skipped, and the skipped count is shown.\n\nIt supports `--column NAME` to restrict output to one column, `--json` to emit the same summary as JSON instead of a table, and `--delimiter` to override the separator (default comma). `--help` explains every flag.\n\nFailures are handled like a real tool, not with a traceback: a file that does not exist, a file that is not readable, an empty file, a `--column` that is not present, and a malformed delimiter each produce a single clear message on stderr and a non-zero exit status. A traceback must never reach the user.\n\nThe package lives in `tally/` with a `__main__.py` so `python -m tally` works, and the numeric logic is importable and unit-tested separately from the CLI. Ship a pytest suite covering the statistics on a known fixture, the flag behaviour, and every failure case above.",
+  "budget_minutes": 180,
+  "checks": [
+    {
+      "id": "module-runs",
+      "weight": 5,
+      "why": "python -m tally --help exits 0",
+      "shell": "python -m tally --help >/dev/null 2>&1"
+    },
+    {
+      "id": "help-documents-flags",
+      "weight": 3,
+      "why": "--help mentions every flag",
+      "shell": "python -m tally --help 2>&1 | grep -q -- --column && python -m tally --help 2>&1 | grep -q -- --json && python -m tally --help 2>&1 | grep -q -- --delimiter"
+    },
+    {
+      "id": "stats-correct",
+      "weight": 8,
+      "why": "mean and median of a known column are right",
+      "shell": "printf 'n,label\\n1,a\\n2,b\\n3,a\\n4,c\\n' > /tmp/tally_probe.csv && out=$(python -m tally /tmp/tally_probe.csv 2>&1) && echo \"$out\" | grep -q '2\\.5' && echo \"$out\" | grep -qE '\\b4\\b' && echo \"$out\" | grep -qE '\\b1\\b'"
+    },
+    {
+      "id": "json-mode",
+      "weight": 4,
+      "why": "--json emits parseable JSON",
+      "shell": "printf 'n\\n1\\n2\\n3\\n' > /tmp/tally_json.csv && python -m tally --json /tmp/tally_json.csv 2>/dev/null | python -c 'import json,sys; json.load(sys.stdin)'"
+    },
+    {
+      "id": "column-filter",
+      "weight": 3,
+      "why": "--column restricts the output",
+      "shell": "printf 'a,b\\n1,2\\n3,4\\n' > /tmp/tally_col.csv && python -m tally --column a /tmp/tally_col.csv 2>&1 | grep -q a && ! python -m tally --column a /tmp/tally_col.csv 2>&1 | grep -qw b"
+    },
+    {
+      "id": "delimiter",
+      "weight": 3,
+      "why": "--delimiter overrides the separator",
+      "shell": "printf 'a;b\\n1;2\\n3;4\\n' > /tmp/tally_semi.csv && python -m tally --delimiter ';' /tmp/tally_semi.csv >/dev/null 2>&1"
+    },
+    {
+      "id": "non-numeric-columns",
+      "weight": 3,
+      "why": "text columns report distinct values",
+      "shell": "printf 'label\\na\\nb\\na\\n' > /tmp/tally_txt.csv && python -m tally /tmp/tally_txt.csv 2>&1 | grep -qiE 'distinct|unique|2'"
+    },
+    {
+      "id": "skipped-counted",
+      "weight": 3,
+      "why": "unparseable values are counted as skipped",
+      "shell": "printf 'n\\n1\\nxx\\n3\\n' > /tmp/tally_skip.csv && python -m tally /tmp/tally_skip.csv 2>&1 | grep -qi 'skip'"
+    },
+    {
+      "id": "missing-file-fails-cleanly",
+      "weight": 6,
+      "why": "a real tool says what is wrong and exits non-zero, with no traceback",
+      "shell": "out=$(python -m tally /tmp/definitely_absent_xyz.csv 2>&1); status=$?; [ $status -ne 0 ] && ! echo \"$out\" | grep -q Traceback && echo \"$out\" | grep -qiE 'not found|no such file|cannot (open|read)|does not exist'"
+    },
+    {
+      "id": "bad-column-fails-cleanly",
+      "weight": 4,
+      "why": "an unknown --column is an error, not a traceback",
+      "shell": "printf 'a\\n1\\n' > /tmp/tally_bc.csv && out=$(python -m tally --column nope /tmp/tally_bc.csv 2>&1); status=$?; [ $status -ne 0 ] && ! echo \"$out\" | grep -q Traceback"
+    },
+    {
+      "id": "empty-file-fails-cleanly",
+      "weight": 4,
+      "why": "an empty file is handled, not crashed on",
+      "shell": ": > /tmp/tally_empty.csv; out=$(python -m tally /tmp/tally_empty.csv 2>&1); status=$?; [ $status -ne 0 ] && ! echo \"$out\" | grep -q Traceback"
+    },
+    {
+      "id": "errors-go-to-stderr",
+      "weight": 3,
+      "why": "diagnostics belong on stderr so stdout stays pipeable",
+      "shell": "[ -z \"$(python -m tally /tmp/definitely_absent_xyz.csv 2>/dev/null)\" ]"
+    },
+    {
+      "id": "logic-is-importable",
+      "weight": 4,
+      "why": "the statistics are testable without the CLI",
+      "shell": "python -c \"import importlib,pkgutil,tally; mods=[m.name for m in pkgutil.iter_modules(tally.__path__)]; assert any(m not in {'__main__','cli'} for m in mods), mods\""
+    },
+    {
+      "id": "tests-exist-and-pass",
+      "weight": 6,
+      "why": "its own suite passes",
+      "shell": "python -m pytest -q >/dev/null 2>&1"
+    },
+    {
+      "id": "tests-cover-failures",
+      "weight": 4,
+      "why": "the failure cases are actually tested",
+      "shell": "grep -rqiE 'not ?found|missing|empty|invalid|raises|SystemExit|exit_code' tests/"
+    },
+    {
+      "id": "no-placeholders",
+      "weight": 3,
+      "why": "nothing left stubbed",
+      "shell": "! grep -rqiE 'TODO|FIXME|NotImplementedError|pass  # implement' --include=*.py tally/"
+    }
+  ]
+}

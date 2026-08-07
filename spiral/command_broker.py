@@ -133,7 +133,13 @@ class CommandBroker:
     ) -> tuple[list[str], bool]:
         sandbox = shutil.which("sandbox-exec")
         if sandbox and sys.platform == "darwin":
-            temp = os.environ.get("TMPDIR") or "/tmp"
+            # macOS TMPDIR carries a trailing slash, and a sandbox `subpath`
+            # with one matches nothing — every write to $TMPDIR (which is where
+            # python's tempfile points) was silently denied inside the gate.
+            # /var is also a symlink to /private/var and the kernel checks the
+            # REAL path, so both spellings must be allowed.
+            temp = (os.environ.get("TMPDIR") or "/tmp").rstrip("/") or "/tmp"
+            temp_real = str(Path(temp).resolve())
             profile = [
                 "(version 1)",
                 "(allow default)",
@@ -142,11 +148,27 @@ class CommandBroker:
                 profile.append("(deny network*)")
             if not allow_host_read:
                 tool_roots = [
+                    # the harness runs its own gates (artifact_gate, footguns) with
+                    # sys.executable — an editable/clone install lives outside the
+                    # packaged tool roots below, and denying it exits the gate 127.
+                    # NOT resolve()d: that follows a venv's symlink out to the base
+                    # interpreter and allows the wrong directory.
+                    Path(sys.executable).parent.parent,
+                    Path(sys.prefix),
+                    Path(sys.base_prefix),
+                    # spiral's own package tree, for the same reason: an editable
+                    # install imports it from the clone, not from site-packages
+                    Path(__file__).resolve().parent.parent,
                     Path.home() / "Library/Android/sdk",
                     Path.home() / ".cargo",
                     Path.home() / ".rustup",
                     Path.home() / ".elan",
                     Path.home() / ".local/bin",
+                    # pyenv shims are how `python` resolves on machines that use
+                    # it; denying them made every ladder rung fail with
+                    # "Operation not permitted", which the rung label then
+                    # misreported as a syntax error
+                    Path.home() / ".pyenv",
                     Path.home() / ".local/pipx",
                     Path.home() / ".local/share/uv",
                     Path.home() / ".cache/uv",
@@ -154,8 +176,16 @@ class CommandBroker:
                 ]
                 profile += [
                     f'(deny file-read* (subpath "{_sandbox_string(Path.home())}"))',
+                    # ...but let anything be STAT-ed. Build tools resolve their root
+                    # by walking ancestors of the workspace (pytest looks for an
+                    # inifile, npm for package.json, cargo for a workspace manifest);
+                    # denying metadata makes that walk raise PermissionError and the
+                    # gate is then permanently red for any project under $HOME.
+                    # Contents stay denied — only existence/size/mode leak.
+                    "(allow file-read-metadata)",
                     f'(allow file-read* (subpath "{_sandbox_string(self.root)}"))',
                     f'(allow file-read* (subpath "{_sandbox_string(temp)}"))',
+                    f'(allow file-read* (subpath "{_sandbox_string(temp_real)}"))',
                     *[
                         f'(allow file-read* (subpath "{_sandbox_string(path)}"))'
                         for path in tool_roots if path.exists()
@@ -166,6 +196,7 @@ class CommandBroker:
                 "(deny file-write*)",
                 f'(allow file-write* (subpath "{_sandbox_string(self.root)}"))',
                 f'(allow file-write* (subpath "{_sandbox_string(temp)}"))',
+                f'(allow file-write* (subpath "{_sandbox_string(temp_real)}"))',
                 '(allow file-write* (subpath "/tmp"))',
                 '(allow file-write* (subpath "/private/tmp"))',
                 '(allow file-write* (literal "/dev/null"))',

@@ -32,17 +32,38 @@ from dataclasses import dataclass, field
 
 @dataclass
 class Edge:
-    """A neighbour in the citation graph (a referenced or citing paper)."""
-    arxiv_id: str = ""
+    """A neighbour in the citation graph (a referenced or citing paper). ``arxiv_id``
+    is a historical name: it holds the neighbour's corpus uid, which is a namespaced id
+    (``doi:…``, ``pmid:…``, ``pmc:…``) for non-arXiv papers."""
+    arxiv_id: str = ""          # really the corpus uid (bare arXiv id or namespaced)
     title: str = ""
     year: int | None = None
     citations: int = 0
     authors: list[str] = field(default_factory=list)
     s2_id: str = ""
+    source: str = "arxiv"       # arxiv | biorxiv | pmc | pubmed | crossref | preprint
+    doi: str = ""
+    url: str = ""
 
 
 def _bare(arxiv_id: str) -> str:
     return (arxiv_id or "").split("v")[0]
+
+
+def _s2_id(uid: str) -> str:
+    """Map a corpus uid to the Semantic Scholar paper-id scheme. S2 resolves arXiv,
+    DOI, PMID and PMCID natively, so bio/med papers snowball the same as arXiv ones."""
+    u = _bare(uid or "")
+    low = u.lower()
+    if low.startswith("doi:"):
+        return f"DOI:{u.split(':', 1)[1]}"
+    if low.startswith("pmid:"):
+        return f"PMID:{u.split(':', 1)[1]}"
+    if low.startswith("pmc:"):
+        return f"PMCID:{u.split(':', 1)[1]}"
+    if low.startswith("arxiv:"):
+        return f"arXiv:{u.split(':', 1)[1]}"
+    return f"arXiv:{u}"      # bare id → legacy arXiv assumption
 
 
 # ── S2 graph API (network isolated) ──────────────────────────────────────────
@@ -63,22 +84,49 @@ def _get_json(url: str, timeout: float = 25.0):
     return None
 
 
+def _uid_from_external(ext: dict) -> tuple[str, str, str]:
+    """Pick a fetchable corpus uid from an S2 externalIds block. Prefer arXiv, then DOI,
+    then PMCID, then PMID — so bio/med neighbours (which almost never carry an ArXiv id)
+    still snowball. Returns ``(uid, source, doi)`` or ``("", "", "")``."""
+    ext = ext or {}
+    if ext.get("ArXiv"):
+        return _bare(ext["ArXiv"]), "arxiv", ""
+    doi = (ext.get("DOI") or "").strip().lower()
+    if doi:
+        src = "biorxiv" if doi.startswith(("10.1101", "10.64898")) else "crossref"
+        return f"doi:{doi}", src, doi
+    if ext.get("PubMedCentral"):
+        pmc = str(ext["PubMedCentral"]).strip()
+        pmc = pmc if pmc.upper().startswith("PMC") else f"PMC{pmc}"
+        return f"pmc:{pmc}", "pmc", ""
+    if ext.get("PubMed"):
+        return f"pmid:{str(ext['PubMed']).strip()}", "pubmed", ""
+    return "", "", ""
+
+
 def parse_edges(payload: dict, direction: str) -> list[Edge]:
     """Parse an S2 references/citations response. ``direction`` selects which side of
     each edge to read: ``references`` → the cited paper, ``citations`` → the citing one.
-    Only edges that carry an arXiv id are kept (we can only fetch those)."""
+    Edges are kept when they carry any id spiral can fetch (arXiv, DOI, PMCID, PMID)."""
     key = "citedPaper" if direction == "references" else "citingPaper"
     out: list[Edge] = []
-    for row in (payload or {}).get("data", []):
+    # S2 returns {"data": null} for some papers — .get("data", []) would hand back None
+    # and crash the iteration, so coalesce to an empty list explicitly.
+    for row in ((payload or {}).get("data") or []):
+        if not isinstance(row, dict):
+            continue
         p = row.get(key) or {}
-        aid = (p.get("externalIds") or {}).get("ArXiv")
-        if not aid:
+        uid, source, doi = _uid_from_external(p.get("externalIds") or {})
+        if not uid:
             continue
         out.append(Edge(
-            arxiv_id=_bare(aid), title=p.get("title", "") or "",
+            arxiv_id=uid, title=p.get("title", "") or "",
             year=p.get("year"), citations=int(p.get("citationCount", 0) or 0),
             authors=[a.get("name", "") for a in (p.get("authors") or [])][:6],
             s2_id=p.get("paperId", "") or "",
+            source=source, doi=doi,
+            url=(f"https://doi.org/{doi}" if doi else
+                 f"https://arxiv.org/abs/{uid}" if source == "arxiv" else ""),
         ))
     return out
 
@@ -91,7 +139,7 @@ def paper_edges(arxiv_id: str, direction: str, *, limit: int = 100,
     that distinction or a dead API can be misreported as a saturated graph.
     """
     fields = "externalIds,title,year,authors,citationCount"
-    url = (f"https://api.semanticscholar.org/graph/v1/paper/arXiv:{_bare(arxiv_id)}/"
+    url = (f"https://api.semanticscholar.org/graph/v1/paper/{_s2_id(arxiv_id)}/"
            f"{direction}?fields={fields}&limit={min(limit, 1000)}")
     payload = _get_json(url)
     if health is not None:

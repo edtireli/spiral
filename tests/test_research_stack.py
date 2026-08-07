@@ -2100,15 +2100,19 @@ def test_research_model_call_log_is_replayable_but_excludes_private_reasoning(tm
 
 
 # ── citation-graph corpus expansion ─────────────────────────────────────────
-def test_parse_edges_keeps_arxiv_drops_others():
+def test_parse_edges_keeps_fetchable_ids_drops_idless():
     from spiral.cite_graph import parse_edges
     payload = {"data": [
         {"citedPaper": {"externalIds": {"ArXiv": "hep-th/9711200"}, "title": "AdS/CFT",
                         "year": 1997, "citationCount": 20000, "authors": [{"name": "Maldacena"}]}},
-        {"citedPaper": {"externalIds": {"DOI": "10.x"}, "title": "no arxiv id"}},   # dropped
+        # bio/med neighbours carry a DOI, not an ArXiv id — now kept, not dropped
+        {"citedPaper": {"externalIds": {"DOI": "10.1016/j.cell.2020.01.001"}, "title": "a cell paper"}},
+        {"citedPaper": {"externalIds": {}, "title": "no fetchable id"}},   # still dropped
     ]}
-    edges = parse_edges(payload, "references")
-    assert len(edges) == 1 and edges[0].arxiv_id == "hep-th/9711200" and edges[0].citations == 20000
+    edges = {e.arxiv_id: e for e in parse_edges(payload, "references")}
+    assert len(edges) == 2
+    assert edges["hep-th/9711200"].citations == 20000 and edges["hep-th/9711200"].source == "arxiv"
+    assert edges["doi:10.1016/j.cell.2020.01.001"].source == "crossref"
     cit = parse_edges({"data": [{"citingPaper": {"externalIds": {"ArXiv": "2401.00001"},
                                                  "title": "builds on it"}}]}, "citations")
     assert cit[0].arxiv_id == "2401.00001"

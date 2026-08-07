@@ -1,6 +1,6 @@
 ---
 name: dependency-medic
-description: Build toolchain and dependency failures — gradle, JDK, SDK versions, AGP, maven resolution, kotlin plugin, npm, pip. Use when build errors mention versions, resolution, class file versions, AAR metadata, plugins, or licenses.
+description: Repair a failing build gate whose cause is the toolchain or a dependency, in any language — a missing module, ImportError or ModuleNotFoundError, an uninstalled package, version and plugin conflicts, gradle, JDK, SDK, AGP, maven resolution, npm, pip, cargo. Use when the build or gate cannot resolve, install, or import something, or when the error mentions versions, resolution, configuration, plugins, or licenses.
 ---
 # Dependency medic playbook
 

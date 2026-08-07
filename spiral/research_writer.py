@@ -992,7 +992,44 @@ def corpus_style_guide(papers) -> str:
         "- Use the corpus only for structure, terminology, and mathematical register; do not copy sentences.\n"
         "- State conventions before results, formulate precise assumptions, and distinguish proved statements from conjectural discussion.\n"
         "- Maintain a single notation system; if corpus conventions conflict, explicitly choose one and say so.\n"
+        + quantitative_style_guide(papers)
     )
+
+
+def quantitative_style_guide(papers) -> str:
+    """The measurable half of 'write like this field'.
+
+    Categorical guidance ('the field uses a Results section') cannot tell a writer that
+    they hedge three times as often as the field does, or that their sentences run
+    twice as long. These bands are mined from the corpus itself and are checkable after
+    the fact by ``spiral.writing_style.score_against`` — so the instruction and the test
+    are the same object."""
+    try:
+        from spiral.writing_style import mine_template
+
+        texts = [getattr(p, "text", "") or getattr(p, "abstract", "") for p in (papers or [])]
+        template = mine_template([t for t in texts if t])
+    except Exception:
+        return ""
+    if not template.sample_size or not template.targets:
+        return ""
+    lines = [f"- Measured style bands from {template.sample_size} corpus papers "
+             "(write inside these; they are checked after drafting):"]
+    labels = {
+        "mean_sentence_words": "words per sentence",
+        "hedges_per_1k": "hedging words per 1000 words",
+        "passive_per_1k": "passive constructions per 1000 words",
+        "first_person_per_1k": "first person (we/our) per 1000 words",
+        "citations_per_1k": "citations per 1000 words",
+        "equations_per_1k": "equations per 1000 words",
+        "mean_paragraph_sentences": "sentences per paragraph",
+    }
+    for key, (lo, med, hi) in sorted(template.targets.items()):
+        lines.append(f"    · {labels.get(key, key)}: aim {med} (field range {lo}–{hi})")
+    lines.append("- Avoid machine-prose tells: significance inflation ('stands as a "
+                 "testament'), 'serves as' in place of 'is', 'not only X but Y', trailing "
+                 "'-ing' clauses asserting importance, and 'Despite these challenges' endings.")
+    return "\n".join(lines) + "\n"
 
 
 def _prose_words(text: str) -> list[str]:

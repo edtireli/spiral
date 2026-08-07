@@ -335,6 +335,26 @@ def audit_product(workspace: str | Path, goal: str, project_kind: str = "other")
                 "with explicit tolerances.",
             ))
 
+    # finish quality: the floor a person notices immediately and a compiler never
+    # does — colour tokens, contrast, focus, states, motion, labels, responsive.
+    # Opinion is what let "a coherent visual system" pass on a scaffold, so these
+    # are computed. See spiral/quality.py.
+    from spiral.quality import audit_ui
+
+    issues.extend(audit_ui(workspace_root, project_kind))
+
+    # and then press the buttons. A remediation task can satisfy a requirement's
+    # wording while breaking its behaviour — the divide-by-zero case that showed
+    # the user the word "null" passed every static check, including this file's.
+    runtime_note = ""
+    try:
+        from spiral.uicheck import probe as _probe
+
+        runtime_issues, runtime_note = _probe(workspace_root)
+        issues.extend(runtime_issues)
+    except Exception as exc:                      # never fail the audit on the probe
+        runtime_note = f"runtime probe unavailable: {type(exc).__name__}: {exc}"
+
     report = {
         "schema_version": 1,
         "applicable": True,
@@ -363,10 +383,14 @@ def audit_product(workspace: str | Path, goal: str, project_kind: str = "other")
             "skipped": integrity.skipped,
             "errors": integrity.errors,
         },
+        "runtime_probe": runtime_note,
         "issues": issues,
         "scope": (
-            "Fail-only deterministic checks. A clean report does not prove usability, semantic "
-            "correctness, accessibility, or visual quality; runtime, spec, and visual gates remain required."
+            "Fail-only deterministic checks, now including the finish-quality floor "
+            "(colour tokens and their adherence, WCAG AA contrast, focus, interaction "
+            "states, motion, labels, responsiveness, empty states). A clean report "
+            "proves the floor was not skipped, not that the result is well designed; "
+            "runtime, spec, and visual gates remain required."
         ),
     }
     return report

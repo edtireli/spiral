@@ -1,6 +1,6 @@
 ---
 name: design-principles
-description: Domain-adaptive product design craft for complete UI, visualization, and interaction work.
+description: Product design craft for any interface work — colour and semantic tokens, type scale, spacing and layout, responsive and mobile widths, buttons and controls, the default hover focus pressed disabled loading empty and error states, keyboard order and visible focus, labels and screen readers, icons, animation and motion timing, charts and plots. Use for any task that styles, lays out, or polishes a screen, page, component, or visualization.
 ---
 # Product design craft
 

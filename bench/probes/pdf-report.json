@@ -1,0 +1,98 @@
+{
+  "id": "pdf-report",
+  "kind": "document",
+  "goal": "Build a tool that turns a CSV of daily sales into a printable PDF report.\n\nInvoked as `python -m salesreport data.csv --out report.pdf`, it produces a multi-page PDF containing: a title page with the report name, the date range covered and the row count; a summary table of totals and averages per product; a bar chart of revenue per product and a line chart of revenue over time; and a final page listing any rows that were skipped because they could not be parsed, or a line stating that none were.\n\nThe document has to look designed rather than dumped: a consistent typographic hierarchy, page margins, a header or footer carrying the page number, table rules or banding that make rows scannable, axis labels and units on both charts, and a restrained colour palette used consistently across the charts and the table.\n\nFailures are handled like a real tool: a missing input file, an unreadable file, a CSV with none of the expected columns, and an output path that cannot be written each produce one clear message on stderr and a non-zero exit status, never a traceback.\n\nThe CSV has columns `date,product,units,unit_price`. Revenue is units times unit_price. Include a pytest suite that covers the aggregation maths on a fixture, the skipped-row accounting, and the failure cases.",
+  "budget_minutes": 240,
+  "checks": [
+    {
+      "id": "capability-declared",
+      "weight": 5,
+      "why": "the PDF library it needs was worked out and declared, not wished for",
+      "shell": "grep -rqiE 'reportlab|fpdf|weasyprint|matplotlib' requirements.txt pyproject.toml 2>/dev/null"
+    },
+    {
+      "id": "capability-recorded",
+      "weight": 3,
+      "why": "the run recorded what it resolved",
+      "shell": "test -f .spiral/capabilities.json"
+    },
+    {
+      "id": "module-runs",
+      "weight": 5,
+      "why": "python -m salesreport --help exits 0",
+      "shell": "python -m salesreport --help >/dev/null 2>&1"
+    },
+    {
+      "id": "produces-a-pdf",
+      "weight": 10,
+      "why": "it really writes a PDF a reader can open",
+      "shell": "printf 'date,product,units,unit_price\\n2024-01-01,widget,3,2.50\\n2024-01-02,widget,4,2.50\\n2024-01-02,gadget,1,10.00\\n2024-01-03,gadget,2,10.00\\n' > /tmp/sales_probe.csv && rm -f /tmp/sales_probe.pdf && python -m salesreport /tmp/sales_probe.csv --out /tmp/sales_probe.pdf >/dev/null 2>&1 && head -c 5 /tmp/sales_probe.pdf | grep -q '%PDF' && [ $(wc -c < /tmp/sales_probe.pdf) -gt 5000 ]"
+    },
+    {
+      "id": "multipage",
+      "weight": 4,
+      "why": "a title page, a summary and a skipped-rows page is more than one page",
+      "shell": "[ $(strings /tmp/sales_probe.pdf | grep -c '/Type */Page\\b') -ge 2 ] || [ $(strings /tmp/sales_probe.pdf | grep -c '/Count') -ge 1 ]"
+    },
+    {
+      "id": "contains-the-data",
+      "weight": 5,
+      "why": "the products it was given appear in the document",
+      "shell": "strings /tmp/sales_probe.pdf | grep -qi widget && strings /tmp/sales_probe.pdf | grep -qi gadget"
+    },
+    {
+      "id": "charts-embedded",
+      "weight": 5,
+      "why": "two charts means drawing operators or an embedded image",
+      "shell": "strings /tmp/sales_probe.pdf | grep -qE '/Image|/XObject|re *f|c *S' "
+    },
+    {
+      "id": "totals-correct",
+      "weight": 8,
+      "why": "widget revenue is 17.50 and gadget 30.00 \u2014 the maths is right",
+      "shell": "strings /tmp/sales_probe.pdf | grep -qE '17[.,]50' && strings /tmp/sales_probe.pdf | grep -qE '30[.,]00|30[.,]0\\b'"
+    },
+    {
+      "id": "skipped-rows-accounted",
+      "weight": 5,
+      "why": "unparseable rows are reported, not silently dropped",
+      "shell": "printf 'date,product,units,unit_price\\n2024-01-01,widget,3,2.50\\nbad,row,xx,yy\\n' > /tmp/sales_bad.csv && rm -f /tmp/sales_bad.pdf && python -m salesreport /tmp/sales_bad.csv --out /tmp/sales_bad.pdf >/dev/null 2>&1 && strings /tmp/sales_bad.pdf | grep -qiE 'skip|excluded|ignored|1 row'"
+    },
+    {
+      "id": "missing-file-fails-cleanly",
+      "weight": 6,
+      "why": "no traceback reaches the user",
+      "shell": "out=$(python -m salesreport /tmp/absent_xyz.csv --out /tmp/x.pdf 2>&1); status=$?; [ $status -ne 0 ] && ! echo \"$out\" | grep -q Traceback"
+    },
+    {
+      "id": "wrong-columns-fails-cleanly",
+      "weight": 5,
+      "why": "a CSV without the expected columns is an error, not a crash",
+      "shell": "printf 'a,b\\n1,2\\n' > /tmp/sales_wrong.csv && out=$(python -m salesreport /tmp/sales_wrong.csv --out /tmp/y.pdf 2>&1); status=$?; [ $status -ne 0 ] && ! echo \"$out\" | grep -q Traceback"
+    },
+    {
+      "id": "unwritable-output-fails-cleanly",
+      "weight": 4,
+      "why": "an impossible output path is reported",
+      "shell": "out=$(python -m salesreport /tmp/sales_probe.csv --out /nonexistent_dir_xyz/r.pdf 2>&1); status=$?; [ $status -ne 0 ] && ! echo \"$out\" | grep -q Traceback"
+    },
+    {
+      "id": "tests-pass",
+      "weight": 6,
+      "why": "its own suite passes",
+      "shell": "python -m pytest -q >/dev/null 2>&1"
+    },
+    {
+      "id": "aggregation-is-unit-tested",
+      "weight": 4,
+      "why": "the maths is tested apart from the PDF writing",
+      "shell": "grep -rqiE 'revenue|total|aggregat' tests/"
+    },
+    {
+      "id": "no-placeholders",
+      "weight": 3,
+      "why": "nothing left stubbed",
+      "shell": "! grep -rqiE 'TODO|FIXME|NotImplementedError' --include=*.py ."
+    }
+  ]
+}

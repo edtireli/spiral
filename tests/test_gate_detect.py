@@ -70,3 +70,50 @@ if __name__ == "__main__":
         fn()
         print(f"ok  {fn.__name__}")
     print("all gate-detection tests passed")
+
+
+def test_composed_gate_is_not_double_parenthesised():
+    """A single detected gate + footguns must compose to `(a) && (b)`, never
+    `((a)) && (b)` — the double paren is arithmetic syntax and zsh/sh fail it with
+    'bad math expression', which broke `spiral build` on every task."""
+    d = Path(tempfile.mkdtemp()) / "dir with spaces"
+    d.mkdir(parents=True)
+    (d / "index.html").write_text("<!doctype html><title>x</title>")
+    c = Conductor(workspace=d)
+    assert "+footguns" in c.gate_disp
+    assert not c.gate.lstrip().startswith("(("), c.gate
+    assert "(( " not in c.gate and "((/" not in c.gate and "((python" not in c.gate
+    # prove it actually parses (syntax, not exit code) under both shells
+    for sh in ("/bin/sh", "/bin/zsh"):
+        if not Path(sh).exists():
+            continue
+        r = subprocess.run([sh, "-c", c.gate], cwd=d, capture_output=True, text=True)
+        assert "bad math expression" not in r.stderr, (sh, r.stderr)
+        assert "syntax error in expression" not in r.stderr, (sh, r.stderr)
+
+
+def test_an_unparseable_composed_gate_is_a_named_harness_fault(tmp_path, monkeypatch):
+    """`((…))` read as shell arithmetic once made every run abort at bootstrap
+    while the loop "fixed" healthy code. A gate that cannot parse must fail at
+    composition time, attributed to spiral, never to the project."""
+    import subprocess
+
+    import spiral.conductor as conductor_module
+    from spiral.conductor import Conductor
+
+    subprocess.run("git init -q .", shell=True, cwd=tmp_path, check=True)
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\nversion='0'\n")
+
+    original = conductor_module._compose_gates
+
+    def sabotage(ws, gates):
+        composed = original(ws, gates)
+        return f"(({composed}" if composed else composed
+
+    monkeypatch.setattr(conductor_module, "_compose_gates", sabotage)
+    try:
+        Conductor(tmp_path)
+    except RuntimeError as exc:
+        assert "spiral bug" in str(exc)
+    else:
+        raise AssertionError("a malformed gate must not be accepted silently")
