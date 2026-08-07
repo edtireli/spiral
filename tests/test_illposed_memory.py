@@ -94,3 +94,51 @@ def test_the_brief_is_bounded(loop):
             "check_plan": f"H^{9 + i}(su(3),su(2);R)"}])
     assert len(loop.state.ruled_out_angles) >= 20
     assert loop._illposed_brief().count("\n    why:") <= 12
+
+
+def _quiet(work):
+    got = ResearchLoop("WZW", workdir=work, cfg=Config.load())
+    got._say = lambda *a, **k: None
+    got._log_thought = lambda *a, **k: None
+    return got
+
+
+def test_the_memory_round_trips_through_the_real_save_path(tmp_path):
+    """``asdict``/json is what actually writes state.json, and ``self.dir`` IS the
+    workdir — pin the whole trip through the real functions, because a snapshot built
+    by hand proves only that the snapshot was built by hand."""
+    import json
+
+    work = tmp_path / "ws2"
+    work.mkdir()
+    first = _quiet(work)
+    first._precheck_angles([dict(VACUOUS)])
+    first._save()
+
+    written = json.loads(first._statefile().read_text())
+    assert written.get("ruled_out_angles"), "not written to disk by _save"
+
+    second = _quiet(work)
+    assert second.state.ruled_out_angles, "not read back by _load"
+    assert "ALREADY RULED OUT" in second._illposed_brief()
+
+
+@pytest.mark.parametrize("stored", [
+    {"topic": "WZW"},                                # written before the field existed
+    {"topic": "WZW", "ruled_out_angles": None},      # present, but null
+])
+def test_a_state_file_predating_the_memory_still_resumes(tmp_path, stored):
+    """``_load`` copies every key straight onto the state, so a null in the file lands
+    as a null on the field — `dict.get(k, default)` does not protect against that, and
+    the first refusal of the resumed run would raise instead of record. This is why
+    _load carries a migration list, and why the new field has to be on it."""
+    import json
+
+    work = tmp_path / f"ws{abs(hash(str(stored)))}"
+    work.mkdir()
+    (work / "state.json").write_text(json.dumps(stored))
+
+    revived = _quiet(work)
+    assert isinstance(revived.state.ruled_out_angles, dict), stored
+    revived._precheck_angles([dict(VACUOUS)])          # must not raise
+    assert revived.state.ruled_out_angles
