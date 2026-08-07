@@ -107,78 +107,142 @@ _SYSTEM = (
 
 
 def run_style(console, args) -> int:
+    """Entry point. Wrapped in the live cockpit so a long rewrite shows its work."""
+    from spiral.prose_ui import ProseProgress
+
     path = Path(args.file)
     if not path.is_file():
         console.print(f"  [red]no such file:[/] {path}")
         return 2
-    text = read_document(path)
-    if not text.strip():
-        console.print(f"  [red]no readable text in[/] {path}")
-        return 2
+    rewriting = bool(getattr(args, "rewrite", False))
+    with_corpus = bool(getattr(args, "corpus", None))
+    with ProseProgress(console, with_corpus=with_corpus, rewriting=rewriting,
+                       thought_log=path.parent / ".spiral-prose-thoughts.jsonl") as ui:
+        try:
+            return _run_style(ui, args, path, rewriting=rewriting)
+        except KeyboardInterrupt:
+            ui.print("  [yellow]interrupted — nothing was written[/]")
+            return 130
 
+
+def _run_style(ui, args, path: Path, *, rewriting: bool) -> int:
+    from spiral.documents import (
+        default_output_path, read_document as read_doc, write_document,
+    )
+
+    # ── M1 read the document ────────────────────────────────────────────────
+    ui.stage(0, 0, phase="parsing structure",
+             idea="Splitting prose from scaffolding: equations, preamble and headings are "
+                  "never handed to a rewriter.",
+             detail=path.name)
+    doc = read_doc(path)
+    text = doc.text()
+    if not text.strip():
+        ui.print(f"  [red]no readable text in[/] {path}")
+        return 2
+    editable = doc.editable_segments
+    ui.print(f"  [green]●[/] {path.name} · [bold]{doc.kind}[/] · {len(doc.segments)} "
+             f"segments, [bold]{len(editable)}[/] editable")
+    ui.done(0, 0)
+
+    ui.stage(0, 1, phase="measuring prose",
+             idea="Style is a measurement here, not an opinion — sentence length, hedging, "
+                  "passive rate, citation and equation density.")
+    m = measure(text)
+    ui.print(f"  [dim]{m.words} words · {m.sentences} sentences · "
+             f"mean {m.mean_sentence_words} words/sentence · "
+             f"hedges {m.hedges_per_1k}/1k · passive {m.passive_per_1k}/1k[/]")
+    ui.done(0, 1)
+
+    ui.stage(0, 2, phase="detecting AI tells",
+             idea="Matching the catalogue mined from Wikipedia's Signs of AI writing, plus "
+                  "structural and formatting patterns it describes but does not list.")
     template = None
-    if getattr(args, "corpus", None):
+    before = _report(ui, text, None)
+    ui.detail(f"score {before['ai_score']:.1f}/1k")
+    ui.done(0, 2)
+
+    mi = 1
+    if args.corpus:
         croot = Path(args.corpus)
         if not croot.is_dir():
-            console.print(f"  [red]--corpus is not a directory:[/] {croot}")
+            ui.print(f"  [red]--corpus is not a directory:[/] {croot}")
             return 2
-        console.print(f"  [dim]mining a writing template from {croot}…[/]")
+        ui.stage(mi, 0, phase="mining the field template",
+                 idea="Reading real papers from this field to learn what its writing "
+                      "actually measures, instead of guessing a house style.",
+                 detail=str(croot))
         texts = _load_corpus(croot)
         template = mine_template(texts)
         if not template.sample_size:
-            console.print("  [yellow]no usable exemplars found; scoring without a template[/]")
+            ui.print("  [yellow]no usable exemplars found; scoring without a template[/]")
+            ui.blocked(mi, 0)
         else:
-            console.print(f"  [green]●[/] template from {template.sample_size} documents"
-                          + (f" · sections: {' → '.join(template.section_order[:6])}"
-                             if template.section_order else ""))
+            ui.print(f"  [green]●[/] template from [bold]{template.sample_size}[/] documents"
+                     + (f" · sections: {' → '.join(template.section_order[:6])}"
+                        if template.section_order else ""))
+            ui.done(mi, 0)
+            ui.stage(mi, 1, phase="scoring against the band",
+                     idea="Reporting where this document sits outside the field's measured "
+                          "range — the gaps become the rewrite instructions.")
+            rep = score_against(text, template)
+            for g in rep["gaps"]:
+                ui.print(f"    [cyan]·[/] {g}")
+            if not rep["gaps"]:
+                ui.print("  [green]within the field's style band[/]")
+            ui.done(mi, 1)
+        mi += 1
 
-    console.print(f"\n  [bold]{path.name}[/]")
-    before = _report(console, text, template)
-
-    if not getattr(args, "rewrite", False):
+    if not rewriting:
+        ui.print("\n  [dim]measurement only — pass [bold]--rewrite[/bold] to edit[/]")
         return 0
+    return _rewrite(ui, args, path, doc, template, before, mi,
+                    default_output_path=default_output_path,
+                    write_document=write_document)
 
+
+def _rewrite(ui, args, path: Path, doc, template, before: dict, mi: int, *,
+             default_output_path, write_document) -> int:
+    """Segment-by-segment rewriting with the plan advancing as it goes."""
+    from spiral.cli import _apply_tier
     from spiral.config import Config
     from spiral.llm import Ollama
-    from spiral.cli import _apply_tier
 
     cfg = Config.load()
     if getattr(args, "api", None):
-        _apply_tier(cfg, console, "api", api_key=args.api)
+        _apply_tier(cfg, ui.dash.c, "api", api_key=args.api)
     ol = Ollama(cfg.base_url, providers=cfg.providers)
-    # rewriting prose is a reasoning job — use the strongest configured model,
-    # not the critic slot, which spiral deliberately fills with a small fast one
-    from spiral.config import Config as _C  # noqa: F401
-    model = (getattr(args, 'model', '') or cfg.planner.name or cfg.escalation.name
+    # rewriting prose is a reasoning job — take the strongest configured model, not the
+    # critic slot, which spiral deliberately fills with a small fast one
+    model = (getattr(args, "model", "") or cfg.planner.name or cfg.escalation.name
              or cfg.worker.name or cfg.critic.name)
 
+    text = doc.text()
     guide = ""
     if template is not None and template.sample_size:
         gaps = score_against(text, template)["gaps"]
         if gaps:
             guide = "\nMatch this field's measured style:\n- " + "\n- ".join(gaps[:6])
 
-    # Rewrite paragraph by paragraph through the document's own structure: a .docx keeps
-    # its styles, a .tex keeps its preamble and math, and each paragraph is accepted or
-    # rejected on its own evidence instead of the whole file riding on one generation.
-    from spiral.documents import default_output_path, read_document as read_doc, write_document
-
-    doc = read_doc(path)
-    editable = doc.editable_segments
-    console.print(f"\n  [dim]rewriting with {model} — {len(editable)} editable "
-                  f"segment(s) of {len(doc.segments)}; the scorer decides each[/]")
-    if doc.kind == "tex":
-        console.print("  [dim]equations, figures, tables and the preamble are protected[/]")
+    editable = [s for s in doc.editable_segments if len(s.text.split()) >= 12]
+    protected = len(doc.segments) - len(editable)
+    ui.stage(mi, 0, phase="rewriting segments", model=model,
+             idea=f"One paragraph at a time — the scorer decides each, so a single bad "
+                  f"generation cannot take the document with it. {protected} segment(s) "
+                  f"are protected and never sent to the model.")
+    ui.print(f"\n  [dim]rewriting with [bold]{model}[/bold] · {len(editable)} segment(s) "
+             f"· {protected} protected[/]")
 
     replacements: dict = {}
     kept = rejected = 0
+    facts_saved = 0
+    tokens = 0
     rounds = max(1, int(getattr(args, "rounds", 3)))
-    for seg in editable:
-        if len(seg.text.split()) < 12:          # too short to be worth a model call
-            continue
+    for n, seg in enumerate(editable, 1):
+        ui.detail(f"segment {n}/{len(editable)} · {seg.text.strip()[:48]}")
         seg_before = ai_score(seg.text)
         best_text, best_score = None, seg_before
-        for _ in range(rounds):
+        for attempt in range(1, rounds + 1):
             try:
                 res = ol.chat(model, [
                     {"role": "system", "content": _SYSTEM + guide},
@@ -186,37 +250,68 @@ def run_style(console, args) -> int:
                 ], num_predict=max(512, min(4096, len(seg.text))), temperature=0.4,
                     num_ctx=cfg.spec_for(model).num_ctx, keep_alive=cfg.keep_alive)
             except Exception as exc:
-                console.print(f"    [red]segment {seg.index}: model error {exc}[/]")
+                ui.print(f"    [red]segment {n}: model error {exc}[/]")
                 break
+            tokens += int(getattr(res, "prompt_tokens", 0) or 0) + int(
+                getattr(res, "completion_tokens", 0) or 0)
+            ui.tokens(tokens)
             candidate = (res.text or "").strip()
             if not candidate:
                 continue
             drift = content_drift(seg.text, candidate)
             if drift:
+                facts_saved += 1
+                ui.print(f"    [yellow]○[/] segment {n} attempt {attempt} rejected — "
+                         f"[dim]{drift[0]}[/]")
                 continue                        # never trade facts for smoothness
             score = ai_score(candidate)
             if score < best_score:
                 best_text, best_score = candidate, score
+                ui.print(f"    [green]✔[/] segment {n} · {seg_before:.0f} → "
+                         f"[bold]{score:.0f}[/] tells/1k")
                 break                           # first improvement wins; move on
+            ui.print(f"    [yellow]○[/] segment {n} attempt {attempt} rejected — "
+                     f"[dim]score {score:.0f} did not beat {best_score:.0f}[/]")
         if best_text is not None:
             replacements[seg.index] = best_text
             kept += 1
         else:
             rejected += 1
+    ui.done(mi, 0)
+
+    ui.stage(mi, 1, phase="guarding the facts",
+             idea="Every accepted rewrite kept its numbers, citations and equations — "
+                  "the easy way to sound human is to delete the specifics.")
+    ui.print(f"  [dim]{kept} improved · {rejected} left as written · "
+             f"{facts_saved} rejected for changing facts[/]")
+    ui.done(mi, 1)
 
     if not replacements:
-        console.print("\n  [yellow]no segment rewrite passed the checks; original "
-                      "left untouched[/]")
+        ui.print("\n  [yellow]no segment rewrite passed the checks; original untouched[/]")
         return 1
 
+    ui.stage(mi + 1, 0, phase="writing the document",
+             idea="Written back through the document's own structure, so a .docx keeps its "
+                  "styles and a .tex keeps its preamble and math. The original is never "
+                  "overwritten.")
     after_text = doc.with_replacements(replacements)
     out = Path(getattr(args, "out", None) or default_output_path(path))
     write_document(doc, replacements, out)
-    console.print(f"\n  [bold]after rewrite[/] [dim]({kept} segment(s) improved, "
-                  f"{rejected} left as written)[/]")
-    _report(console, after_text, template)
+    ui.done(mi + 1, 0)
+
+    ui.stage(mi + 1, 1, phase="re-measuring",
+             idea="Reporting the score after the edit, not the score hoped for.")
+    ui.print(f"\n  [bold]after rewrite[/] [dim]({kept} of {len(editable)} segments improved)[/]")
+    after = _report(ui, after_text, template)
+    ui.done(mi + 1, 1)
+
+    delta = before["ai_score"] - after["ai_score"]
+    ui.print(f"\n  [bold]AI-tell score[/] {before['ai_score']:.1f} → "
+             f"[bold]{after['ai_score']:.1f}[/] per 1000 words "
+             f"[green]({delta:+.1f})[/]" if delta > 0 else
+             f"\n  [bold]AI-tell score[/] {before['ai_score']:.1f} → {after['ai_score']:.1f}")
     if path.suffix.lower() == ".pdf":
-        console.print("  [dim]a PDF cannot be rewritten in place; the edit is markdown[/]")
-    console.print(f"\n  [green]●[/] written to [dim]{out}[/]")
-    console.print(f"  [dim]original untouched: {path}[/]")
+        ui.print("  [dim]a PDF cannot be rewritten in place; the edit is markdown[/]")
+    ui.print(f"  [green]●[/] written to [dim]{out}[/]")
+    ui.print(f"  [dim]original untouched: {path}[/]")
     return 0

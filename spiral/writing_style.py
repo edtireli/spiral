@@ -298,6 +298,18 @@ class Tell:
     examples: list
 
 
+# Mined section slug → the hand-written tell that already covers it. Without this the
+# same habit is reported twice under two names and the score is inflated.
+_MINED_ALIASES = {
+    "undue-emphasis-on-significance-legacy-and-broade": "significance-inflation",
+    "superficial-analyses": "superficial-analysis",
+    "outline-like-conclusions-about-challenges-and-fu": "challenges-formula",
+    "promotional-and-advertisement-like-language": "promotional",
+    "high-density-of-ai-vocabulary-words": "ai-vocabulary",
+    "avoidance-of-basic-copulatives-is-are-phrases": "copula-avoidance",
+    "vague-attributions-and-overgeneralization-of-opi": "vague-attribution",
+}
+
 _MINED_CACHE: list | None = None
 
 
@@ -358,7 +370,11 @@ def ai_tells(text: str, *, per_1k: bool = True) -> list[Tell]:
             seen_ids.add(tid)
 
     for slug, name, rx in _mined_tells():
-        if slug in seen_ids:
+        # A mined section and a hand-written pattern often name the SAME tell
+        # ("Superficial analyses" vs superficial-analysis). Counting both double-counts
+        # the score and clutters the report, so the mined one only speaks when the
+        # hand-written pattern it duplicates found nothing.
+        if slug in seen_ids or _MINED_ALIASES.get(slug) in seen_ids:
             continue
         got = _collect(rx, prose, words, per_1k)
         if got:
