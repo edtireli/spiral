@@ -39,8 +39,9 @@ def test_the_live_failure_is_recorded_not_just_printed(loop):
     assert loop._precheck_angles([dict(VACUOUS)]) == []
     assert loop.state.ruled_out_angles, "the refusal was printed and then forgotten"
     row = next(iter(loop.state.ruled_out_angles.values()))
-    assert "SU(3)/SU(2)xU(1)" in row["question"] or "H^5" in row["question"]
+    assert "H^5" in row["claim"], f"the claim must be kept verbatim: {row}"
     assert "dim" in row["reason"], f"the arithmetic must be kept: {row['reason']}"
+    assert row["question"], "an example wording is kept for the operator to read"
 
 
 def test_the_same_angle_is_not_adjudicated_twice(loop):
@@ -50,11 +51,47 @@ def test_the_same_angle_is_not_adjudicated_twice(loop):
     assert loop.state.ruled_out_angles == before, "a second refusal was recorded"
 
 
+# Reworded three ways, all asking for H^5 of the same 4-dimensional space. Seen live:
+# the run proposed exactly this in fresh sentences and each one was adjudicated and
+# reported as though it were new, twice within a single round.
+REWORDINGS = [
+    {"question": "Which cosets admit a nonvanishing H^5(SU(3)/SU(2)xU(1))?",
+     "check_plan": "Compute H^5(su(3), su(2)+u(1); R)"},
+    {"question": "Is the degree-5 WZW class on the composite-Higgs coset non-trivial?",
+     "target": "SU(3)/SU(2)xU(1)", "check_plan": "H^5(su(3),su(2)+u(1);R)"},
+    {"question": "Determine whether a 4D Wess-Zumino-Witten term exists for CP^2.",
+     "check_plan": "evaluate H^5(su(3), su(2)+u(1); R) explicitly"},
+]
+
+
+def test_a_refusal_is_keyed_by_the_claim_not_the_wording(loop):
+    """The arithmetic belongs to H^5(su(3)/su(2)+u(1)), not to the sentence around it."""
+    for angle in REWORDINGS:
+        assert loop._precheck_angles([dict(angle)]) == []
+    assert len(loop.state.ruled_out_angles) == 1, (
+        f"one claim recorded three times: {list(loop.state.ruled_out_angles)}")
+
+
+def test_a_reworded_repeat_is_not_reported_again(loop):
+    said = []
+    loop._say = said.append
+    for angle in REWORDINGS:
+        loop._precheck_angles([dict(angle)])
+    rejections = [s for s in said if "angle rejected" in s]
+    assert len(rejections) == 1, f"the same arithmetic was announced {len(rejections)}x"
+    assert any("already refused" in s for s in said), "the repeats were never accounted for"
+
+
+def test_the_claim_key_ignores_spacing_and_latex(loop):
+    assert loop._claim_key("H^5( su(3)/su(2) )") == loop._claim_key("H^5(su(3)/su(2))")
+    assert loop._claim_key(r"H^{5}(\mathfrak{su}(3))") != ""
+
+
 def test_the_reason_reaches_the_next_prompt(loop):
     loop._precheck_angles([dict(VACUOUS)])
     brief = loop._illposed_brief()
     assert "ALREADY RULED OUT" in brief
-    assert "SU(3)/SU(2)xU(1)" in brief or "H^5" in brief
+    assert "H^5" in brief
     assert "dim" in brief, "the arithmetic reason must travel with the refusal"
     # actionable, not merely a prohibition
     assert "before proposing" in brief.lower() or "check dim" in brief.lower()

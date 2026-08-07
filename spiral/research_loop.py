@@ -2025,20 +2025,49 @@ class ResearchLoop:
         return self._think_json(
             system, user, role="planner", max_chars=10_000, reasoning=True)
 
+    @staticmethod
+    def _claim_key(subject: str) -> str:
+        """Canonical id for the OBJECT a refusal is about, e.g. ``h^5(cp^2)``.
+
+        Resolved through the same space canonicaliser the arithmetic uses, so the two
+        spellings of one coset collide: a single proposal writes SU(3)/SU(2)xU(1) in
+        its prose and su(3)/su(2)+u(1) in its check plan, which are the same CP^2 and
+        must not be remembered as two separate refusals."""
+        from spiral.wellposed import canonical_space
+
+        text = re.sub(r"[\s{}$\\]", "", str(subject or "")).lower()
+        m = re.match(r"^h\^?(\d+)\((.+)\)$", text)
+        if not m:
+            return text
+        return f"h^{m.group(1)}({canonical_space(m.group(2))})"
+
     def _remember_illposed(self, angle: dict, fatal: list) -> None:
-        """Record a rejected angle so the next round does not re-propose it."""
-        key = self._question_key(str(angle.get("question") or ""))
-        if not key:
-            return
+        """Record what was refused, keyed by the claim rather than the wording.
+
+        Keying on the question text does not work, and the live run showed exactly why:
+        the model re-asked for H^5 of a 4-dimensional CP^2 in three different sentences,
+        which hashed to three different keys and so were adjudicated and reported three
+        separate times. The arithmetic is a property of ``H^5(su(3)/su(2)+u(1))``, not of
+        the prose wrapped around it, so that is what gets remembered.
+        """
         ruled = self.state.ruled_out_angles
-        if key not in ruled:
-            ruled[key] = {
-                "question": " ".join(str(angle.get("question") or "").split())[:300],
-                "reason": fatal[0].sentence()[:300],
-            }
+        question = " ".join(str(angle.get("question") or "").split())[:300]
+        for issue in fatal:
+            key = self._claim_key(issue.subject)
+            if key and key not in ruled:
+                ruled[key] = {
+                    "claim": issue.subject[:200],
+                    "reason": issue.detail[:280],
+                    "question": question,
+                }
+
+    def _already_refused(self, fatal: list) -> bool:
+        """True when every fatal issue here has been refused and reported before."""
+        keys = {self._claim_key(i.subject) for i in fatal}
+        return bool(keys) and keys.issubset(set(self.state.ruled_out_angles))
 
     def _illposed_brief(self) -> str:
-        """The already-refused angles, as prompt text.
+        """The already-refused claims, as prompt text.
 
         A deterministic refusal the model never sees is a refusal it will walk into
         again — the same lesson as the build loop's identical-reply guard, and the
@@ -2046,10 +2075,11 @@ class ResearchLoop:
         ruled = list(self.state.ruled_out_angles.values())
         if not ruled:
             return ""
-        lines = ["ALREADY RULED OUT — arithmetic, not opinion. Do NOT propose these "
-                 "again, and do not propose a restatement of one:"]
+        lines = ["ALREADY RULED OUT — arithmetic, not opinion. These computations are "
+                 "settled; do not propose them again under any wording:"]
         for row in ruled[-12:]:
-            lines.append(f"- {row['question']}\n    why: {row['reason']}")
+            what = row.get("claim") or row.get("question") or ""
+            lines.append(f"- {what}\n    why: {row.get('reason', '')}")
         lines.append("A cohomology degree above the dimension of the space is zero "
                      "before any differential is written. Check dim(G/H) against the "
                      "degree you need BEFORE proposing, and pick a space large enough "
@@ -2067,6 +2097,7 @@ class ResearchLoop:
         from spiral.wellposed import precheck, report
 
         kept: list[dict] = []
+        reruled = 0
         for angle in angles or []:
             text = " ".join(str(angle.get(k) or "") for k in (
                 "question", "target", "why_interesting", "check_plan", "first_check",
@@ -2083,11 +2114,17 @@ class ResearchLoop:
                 "blocked": bool(fatal),
             }
             if fatal:
-                self._say(f"  ✗ angle rejected · {fatal[0].sentence()[:90]}")
+                # a claim refused before is refused again silently — printing the same
+                # arithmetic once per rewording is noise that hides how often it happened
+                repeat = self._already_refused(fatal)
+                if repeat:
+                    reruled += 1
+                else:
+                    self._say(f"  ✗ angle rejected · {fatal[0].sentence()[:90]}")
                 self._log_thought(
                     "wellposedness",
                     f"rejected an angle before spending a round on it: {fatal[0].sentence()}",
-                    issues=[i.sentence() for i in issues])
+                    issues=[i.sentence() for i in issues], repeat=repeat)
                 # hand the reason back so the next proposal is better posed
                 angle["_wellposed"]["feedback"] = report(issues)
                 # …and REMEMBER it. Rejecting the angle without recording why left the
@@ -2099,6 +2136,9 @@ class ResearchLoop:
             if issues:
                 self._say(f"  ○ angle warning · {issues[0].sentence()[:90]}")
             kept.append(angle)
+        if reruled:
+            self._say(f"  ○ {reruled} angle(s) re-asked a claim already refused "
+                      "— dropped without re-reporting")
         if angles and not kept:
             self._say("  ✗ every candidate angle was ill-posed; re-proposing")
         return kept
@@ -2159,21 +2199,12 @@ class ResearchLoop:
             angles = self.taste.rank(angles)
         seen_questions = set()
         deduped = []
-        repeats = 0
         for angle in angles:
             key = self._question_key(str(angle.get("question") or ""))
             if not key or key in seen_questions:
                 continue
-            # a question already refused on arithmetic does not get re-adjudicated;
-            # the answer cannot have changed, and re-running it only re-prints the
-            # rejection the model has now been told about twice
-            if key in self.state.ruled_out_angles:
-                repeats += 1
-                continue
             seen_questions.add(key)
             deduped.append(angle)
-        if repeats:
-            self._say(f"  ○ {repeats} angle(s) re-proposed after being ruled out — dropped")
         angles = self._precheck_angles(deduped)
         for angle in angles:
             try:

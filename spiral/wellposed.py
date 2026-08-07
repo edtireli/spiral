@@ -64,7 +64,13 @@ def lie_dim(name: str) -> int | None:
     return None
 
 
-_PRODUCT = re.compile(r"\s*(?:x|×|\\times)\s*", re.I)
+# A subgroup is written as a product of groups or as a direct sum of algebras, and the
+# two spellings turn up in the same proposal: SU(3)/SU(2)xU(1) in the prose and
+# su(3)/su(2)+u(1) in the check plan. Both name CP^2, so both must reduce to it —
+# splitting on `x` alone left `su(2)+u(1)` unparseable and its dimension unknown.
+# the backslash is optional because canonical_space strips backslashes before it gets
+# here, so `\oplus` arrives as a bare `oplus`
+_PRODUCT = re.compile(r"\s*(?:x|×|\+|⊕|\\?times|\\?oplus)\s*", re.I)
 
 
 def _sum_dims(spec: str) -> int | None:
@@ -106,8 +112,12 @@ _KNOWN_SPACES: dict[str, str] = {
 def canonical_space(spec: str) -> str:
     """A canonical name for a homogeneous space, resolving exceptional isomorphisms.
     Two specs sharing a canonical name are the same manifold."""
-    key = re.sub(r"[\s{}$\\]", "", (spec or "")).lower().replace("×", "x")
+    key = re.sub(r"[\s{}$\\]", "", (spec or "")).lower()
     key = key.replace("mathrm", "").replace("mathfrak", "")
+    # the table is keyed with `x`, so every product spelling has to arrive as `x` —
+    # otherwise su(3)/su(2)+u(1) misses the CP^2 entry that su(3)/su(2)xu(1) hits and
+    # the same manifold ends up with two canonical names
+    key = _PRODUCT.sub("x", key)
     if key in _KNOWN_SPACES:
         return _KNOWN_SPACES[key]
     d = coset_dim(key)
