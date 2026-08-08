@@ -2025,6 +2025,93 @@ class ResearchLoop:
         return self._think_json(
             system, user, role="planner", max_chars=10_000, reasoning=True)
 
+    # Fields to fetch a contrasting corpus from, per domain. The point is deliberate
+    # distance: a second corpus from the same field is more of the same reading, and
+    # the whole premise is that the unstated implication lives across a boundary
+    # nobody reads both sides of.
+    ADJACENT_FIELDS = {
+        "physics-math": ["math.AT", "math.KT", "math.DG", "math.RT", "math.QA"],
+        "bio-med": ["q-bio.QM", "q-bio.MN", "stat.ME", "cs.LG"],
+    }
+
+    def _discovery_brief(self) -> str:
+        """Cross-field structural gaps, as prompt text for the angle proposer.
+
+        Asking a model for "a novel angle" inside one corpus returns that corpus's own
+        consensus, which is how five rounds of searching a worked field produced five
+        verdicts of "known". A gap between two literatures is a countable property of
+        their co-occurrence structure, so it is computed and handed over as structure,
+        never as a claim.
+        """
+        from collections import Counter
+
+        from spiral.corpus_sufficiency import concept_terms
+        from spiral.discovery import brief as gap_brief
+        from spiral.discovery import find_connections
+
+        papers = list(getattr(self.corpus, "papers", {}).values())
+        if len(papers) < 12:
+            return ""
+
+        def bag(paper) -> list[str]:
+            head = f"{getattr(paper, 'title', '')} {getattr(paper, 'abstract', '')}"
+            return sorted(set(concept_terms(head + " " + (getattr(paper, 'text', '') or '')[:6000])))
+
+        domain = (self.state.field_domain or "physics-math")
+        adjacent = self.ADJACENT_FIELDS.get(domain) or self.ADJACENT_FIELDS["physics-math"]
+        # the corpus splits into what the run searched for and what the citation graph
+        # dragged in from further out; the second is the closest thing to a distant
+        # literature already on disk, and costs no fetch
+        seeded = {u for u in (self.state.corpus_ids or [])}
+        near = [bag(p) for p in papers if p.arxiv_id in seeded]
+        far = [bag(p) for p in papers if p.arxiv_id not in seeded]
+        if len(near) < 6 or len(far) < 6:
+            return ""
+        seeds = [t for t, _ in Counter(
+            t for doc in near for t in doc).most_common(24)]
+        links = find_connections(near, far, seeds=seeds, min_bridges=2, limit=10)
+        if not links:
+            return ""
+        self._log_thought(
+            "cross-field-gaps",
+            f"{len(links)} structurally absent connections between the seeded corpus "
+            f"and its citation neighbourhood ({', '.join(adjacent[:3])} territory)",
+            links=[c.as_dict() for c in links[:6]])
+        return gap_brief(links, source_field="the seeded literature",
+                         distant_field="its wider citation neighbourhood")
+
+    # rounds of cross-field mining to spend on a closed corpus before calling it.
+    # Small on purpose: mining a closed corpus is cheap, but repeating it is the same
+    # stall in a different costume.
+    MINE_ROUNDS = 2
+
+    def _corpus_readiness(self):
+        """Measure whether the corpus is sampled to closure.
+
+        Two samples out of the same papers: the works they cite, and the concepts they
+        use. Coverage is Good–Turing, richness is Chao1, and the third criterion is the
+        empirical marginal gain — see corpus_sufficiency for why all three.
+        """
+        from spiral.corpus_sufficiency import concept_terms, readiness
+
+        reference_lists: list[list[str]] = []
+        concept_lists: list[list[str]] = []
+        for paper in list(getattr(self.corpus, "papers", {}).values()):
+            body = (getattr(paper, "text", "") or "")[:40_000]
+            head = f"{getattr(paper, 'title', '')} {getattr(paper, 'abstract', '')}"
+            cited = re.findall(r"(?:arXiv:|doi:)\s*([\w./\-]+)", body, re.I)
+            if cited:
+                reference_lists.append([c.lower().rstrip(".,;") for c in cited])
+            terms = concept_terms(head + " " + body[:6000])
+            if terms:
+                concept_lists.append(sorted(set(terms)))
+        # With no extractable reference lists the citation reading is not a measurement
+        # of anything, so the concept reading answers for both rather than a missing
+        # sample silently counting as closure.
+        if not reference_lists:
+            reference_lists = concept_lists
+        return readiness(reference_lists, concept_lists)
+
     @staticmethod
     def _claim_key(subject: str) -> str:
         """Canonical id for the OBJECT a refusal is about, e.g. ``h^5(cp^2)``.
@@ -2174,10 +2261,12 @@ class ResearchLoop:
             "include generic survey questions."
         )
         ruled_out = self._illposed_brief()
+        gaps = self._discovery_brief() if self.state.coverage.get("mine") else ""
         user = (
             f"TOPIC:\n{self.state.topic}\n\n"
             + (f"RESEARCH BRIEF:\n{brief}\n\n" if brief else "")
             + (f"{ruled_out}\n\n" if ruled_out else "")
+            + (f"{gaps}\n\n" if gaps else "")
             + f"IDEA FAMILIES:\n{json.dumps(families, indent=2)[:6000]}\n\n"
             + f"DEEP READ NOTES:\n{json.dumps(deep_notes, indent=2)[:7500]}\n\n"
             + f"BROAD READING NOTES:\n{self._notes_digest(notes, limit=20, chars=3500)}\n\n"
@@ -4018,14 +4107,40 @@ class ResearchLoop:
             priors = []
             if proposal.get("_no_proposal") or proposal.get("no_proposal"):
                 reason = proposal.get("reasoning", "no grounded checkable proposal yet")
+                # "no proposal" used to mean "gather more", unconditionally and
+                # forever. A real run took that branch in five consecutive rounds —
+                # including after its own citation graph reported saturation — and
+                # ended with 279 papers and zero findings. Whether more reading can
+                # help is a measurable property of the corpus, so measure it.
+                ready = self._corpus_readiness()
+                sufficiency = ready.as_dict()
+                # dry_rounds is the loop's own counter, maintained from made_progress;
+                # a second reimplementation here read a history key that does not exist
+                # and so called every round barren.
+                barren = dry_rounds + 1
+                if ready.phase == "gather":
+                    self._say(f"reflect · corpus still open · {ready.references.sentence()}")
+                else:
+                    # Closed. More fetching cannot be the plan, so mine the corpus for
+                    # cross-field structure instead — and once that has had its rounds,
+                    # let the existing plateau check end the run rather than inventing
+                    # a second terminal path beside it.
+                    self.state.coverage["mine"] = True
+                    if barren < self.MINE_ROUNDS:
+                        self._say("reflect · corpus sampled to closure — mining for "
+                                  f"cross-field connections · {ready.concepts.sentence()}")
+                    else:
+                        sufficiency["closed_and_barren"] = True
+                        self._say(f"reflect · closed corpus, {barren} rounds without a "
+                                  "finding — further reading is not a plan")
+                self.state.coverage["sufficiency"] = sufficiency
                 decision = {
                     "assessment": reason,
                     "novel": False,
                     "action": "continue",
                     "next_query": proposal.get("next_query", ""),
-                    "reason": reason,
+                    "reason": f"{reason} · corpus: {ready.detail[:200]}",
                 }
-                self._say("reflect · deepen corpus before verification")
             else:
                 findings = self.verify_claims(proposal.get("claims", []))
                 self.state.findings.extend(asdict(f) for f in findings)
@@ -4124,6 +4239,13 @@ class ResearchLoop:
                 self._say("  no verified progress this round — re-planning the search angle")
                 cats, queries = self.search_plan()
             patience = max(4, int(getattr(self.cfg, "research_plateau_patience", 8)))
+            # A measurably closed corpus makes blind patience the wrong instrument.
+            # Waiting eight dry rounds is right while there is still literature to
+            # find; once Good–Turing coverage says the next paper is redundant, the
+            # remaining rounds only re-read what is already in hand — which is exactly
+            # how one run spent four of its five hours.
+            if (self.state.coverage.get("sufficiency") or {}).get("closed_and_barren"):
+                patience = min(patience, self.MINE_ROUNDS + 1)
             info_plateau = self.scheduler.plateau_report(
                 patience=patience,
                 floor=float(getattr(self.cfg, "research_information_gain_floor", 0.04)),
