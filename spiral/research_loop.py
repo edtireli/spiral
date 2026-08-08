@@ -2092,16 +2092,16 @@ class ResearchLoop:
         use. Coverage is Good–Turing, richness is Chao1, and the third criterion is the
         empirical marginal gain — see corpus_sufficiency for why all three.
         """
-        from spiral.corpus_sufficiency import concept_terms, readiness
+        from spiral.corpus_sufficiency import concept_terms, readiness, references_in
 
         reference_lists: list[list[str]] = []
         concept_lists: list[list[str]] = []
         for paper in list(getattr(self.corpus, "papers", {}).values()):
             body = (getattr(paper, "text", "") or "")[:40_000]
             head = f"{getattr(paper, 'title', '')} {getattr(paper, 'abstract', '')}"
-            cited = re.findall(r"(?:arXiv:|doi:)\s*([\w./\-]+)", body, re.I)
+            cited = references_in(body)
             if cited:
-                reference_lists.append([c.lower().rstrip(".,;") for c in cited])
+                reference_lists.append(cited)
             terms = concept_terms(head + " " + body[:6000])
             if terms:
                 concept_lists.append(sorted(set(terms)))

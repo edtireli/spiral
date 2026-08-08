@@ -43,10 +43,15 @@ def _stock(loop, papers):
 def test_an_open_corpus_is_measured_as_open():
     """Every paper about something different: nothing is settled and more reading is
     genuinely the right call."""
+    # digit-free distinct words on purpose: concept_terms drops anything carrying a
+    # digit (that is what removes citation keys like damtp-r-94-7), so `unique1` as a
+    # stand-in concept vanishes and every document collapses to the same one term
+    letters = "abcdefghijklmnopqrstuvwxyz"
     loop = _loop()
-    _stock(loop, [_paper(f"a{i}", f"topic {i}",
-                         f"unique{i} concept{i} distinct{i} separate{i}")
-                  for i in range(30)])
+    _stock(loop, [
+        _paper(f"a{i}", f"subject {letters[i % 26] * 5}",
+               " ".join(f"{letters[(i + k) % 26] * 4}{letters[k]}zz" for k in range(6)))
+        for i in range(30)])
     assert loop._corpus_readiness().phase == "gather"
 
 
