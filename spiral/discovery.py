@@ -146,6 +146,7 @@ def find_connections(
     distant_documents: list[list[str]],
     *,
     seeds: list[str] | None = None,
+    distant_endpoints: set[str] | None = None,
     min_strength: float = 0.20,
     min_bridges: int = 2,
     limit: int = 12,
@@ -157,6 +158,15 @@ def find_connections(
     concepts the run actually cares about; without it every term in the corpus is a
     candidate and the result is dominated by generic vocabulary.
 
+    ``seeds`` and ``distant_endpoints`` should be the terms each side is *distinctive*
+    for, measured against a background — but the documents passed in must NOT be
+    pre-filtered to those terms, and the distinction is the whole architecture. An
+    endpoint earns its place by being specific to its corpus; a bridge earns its place
+    by being shared. Filtering both sides down to their distinctive vocabularies first
+    left {coset, gauged} facing {anti-de sitter, holography} with an empty intersection
+    and no bridge could exist. Specificity picks the endpoints, the frequency band picks
+    the bridges, and each measure does only the job it is good at.
+
     A connection survives only if it is genuinely absent: A and C must never co-occur in
     ANY document of EITHER corpus. A pair that already appears together is not a
     discovery, it is a citation — and this is the whole test, so it is applied to both
@@ -165,8 +175,13 @@ def find_connections(
     a_side = Associations(source_documents)
     c_side = Associations(distant_documents)
 
-    # endpoints come from `attested`, bridges from the banded `vocabulary`
-    a_terms = [t for t in (seeds or sorted(a_side.attested)) if t in a_side.attested]
+    # endpoints come from `attested`, bridges from the banded `vocabulary`.
+    # `seeds if seeds is not None` rather than `seeds or …`: an EMPTY seed list means
+    # the caller found no distinctive source concepts, and falling back to the whole
+    # vocabulary there turns "nothing to ask about" into "ask about everything" —
+    # which is how `acad cienc` and `algorithms` became research concepts.
+    chosen = seeds if seeds is not None else sorted(a_side.attested)
+    a_terms = [t for t in chosen if t in a_side.attested]
     shared = a_side.vocabulary & c_side.vocabulary
     if not a_terms or not shared:
         return []
@@ -190,6 +205,8 @@ def find_connections(
         for b, a_strength in bridges_of_a.items():
             for c in c_side.partners(b):
                 if c == a or c == b or c in shared:
+                    continue
+                if distant_endpoints is not None and c not in distant_endpoints:
                     continue
                 c_strength = c_side.confidence(b, c)
                 if c_strength < min_strength:
