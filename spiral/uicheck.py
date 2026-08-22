@@ -50,7 +50,7 @@ ROLES = {
     "digit": r"^[1-9]$",
     "zero": r"^0$",
     "divide": r"^[/\u00f7]$",
-    "operator": r"^[+\-\u2212*\u00d7/\u00f7]$",
+    "operator": r"^[-+\u2212*\u00d7/\u00f7]$",
     "decimal": r"^[.,]$",
     "equals": r"^=$|^enter$|^equals$",
     "clear": r"^(ac|c|clear|reset)$",

@@ -143,7 +143,9 @@ def test_thinking_off_is_never_retried():
 
 # ------------------------------------------------------------------ live
 @pytest.mark.skipif(
-    not __import__("shutil").which("ollama"), reason="no local ollama")
+    bool(__import__("os").environ.get("SPIRAL_OFFLINE_TESTS"))
+    or not __import__("shutil").which("ollama"),
+    reason="offline test mode or no local ollama")
 def test_against_the_real_model_if_one_is_installed():
     """The bug was found live, so pin it live where the machine allows."""
     import httpx

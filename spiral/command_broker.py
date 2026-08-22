@@ -107,6 +107,151 @@ _NODE_PACKAGE = re.compile(
     r"(?:@[A-Za-z0-9*^~<>=_.+-]+)?$"
 )
 _BREW_FORMULA = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.+-]{0,100}$")
+_MANAGED_ENV = "SPIRALCHAT_EXTERNAL_GIT_APPROVAL"
+
+# Environment variables are capabilities too.  In particular, Git's environment
+# can redirect metadata to an arbitrary path, inject configuration and helpers, or
+# hand a child process an SSH agent.  A controller-managed shell gets fixed safe
+# values below; neither the host environment nor a model-provisioned ``extra`` map
+# may replace them.
+_VCS_ENV = re.compile(
+    r"^(?:GIT(?:HUB|LAB)?|GH|GLAB|BITBUCKET|SSH)(?:_|$)", re.I,
+)
+_MANAGED_RESERVED_ENV = frozenset({
+    "HOME", "NETRC", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+    "XDG_RUNTIME_DIR",
+})
+
+_CREDENTIAL_DIRECTORY_NAMES = (
+    ".ssh",
+    ".config/gh",
+    ".config/glab-cli",
+    ".config/git",
+    "Library/Application Support/GitHub CLI",
+    "Library/Keychains",
+)
+_CREDENTIAL_FILE_NAMES = (
+    ".gitconfig",
+    ".git-credentials",
+    ".netrc",
+    ".config/git/config",
+    ".config/gh/hosts.yml",
+    ".config/glab-cli/config.yml",
+)
+_BLOCKED_CREDENTIAL_EXECUTABLES = frozenset({
+    "at", "automator", "crontab", "gh", "glab", "launchctl", "open",
+    "osascript", "security", "shortcuts", "scp", "sftp", "ssh",
+    "ssh-add", "ssh-agent", "ssh-keygen", "git-credential-manager",
+    "git-credential-manager-core", "git-credential-osxkeychain",
+})
+
+
+def _managed_execution() -> bool:
+    return os.environ.get(_MANAGED_ENV) == "1"
+
+
+def _credential_boundaries() -> tuple[tuple[Path, str], ...]:
+    """Host credential stores that a managed shell must not read directly."""
+
+    home = Path.home()
+    rows = [
+        *((home / relative, "tree") for relative in _CREDENTIAL_DIRECTORY_NAMES),
+        *((home / relative, "file") for relative in _CREDENTIAL_FILE_NAMES),
+    ]
+    # Stable de-duplication matters when one explicit file also sits under a
+    # protected directory; duplicate deny rules are harmless but noisy in audits.
+    unique: dict[tuple[str, str], tuple[Path, str]] = {}
+    for path, kind in rows:
+        unique.setdefault((str(path), kind), (path, kind))
+    return tuple(unique[key] for key in sorted(unique))
+
+
+def _credential_executables() -> tuple[Path, ...]:
+    """Resolve credential helpers and processes that can delegate host egress."""
+
+    candidates: set[Path] = {
+        Path("/usr/bin/security"),
+        Path("/usr/bin/open"),
+        Path("/usr/bin/osascript"),
+        Path("/usr/bin/automator"),
+        Path("/usr/bin/shortcuts"),
+        Path("/usr/bin/at"),
+        Path("/usr/bin/crontab"),
+        Path("/bin/launchctl"),
+        Path("/usr/bin/ssh"),
+        Path("/usr/bin/scp"),
+        Path("/usr/bin/sftp"),
+        Path("/usr/bin/ssh-add"),
+        Path("/usr/bin/ssh-agent"),
+        Path("/usr/bin/ssh-keygen"),
+        Path("/usr/libexec/git-core/git-credential-osxkeychain"),
+    }
+    for name in _BLOCKED_CREDENTIAL_EXECUTABLES:
+        found = shutil.which(name)
+        if found and Path(found).name in _BLOCKED_CREDENTIAL_EXECUTABLES:
+            candidates.add(Path(found))
+    expanded: set[Path] = set()
+    for path in candidates:
+        if not path.exists():
+            continue
+        expanded.add(path)
+        try:
+            expanded.add(path.resolve(strict=True))
+        except OSError:
+            pass
+    return tuple(sorted(expanded, key=str))
+
+
+def _git_metadata_boundaries(root: str | Path) -> tuple[tuple[Path, str], ...]:
+    """Return the worktree marker, real gitdir, and linked common directory.
+
+    ``.git`` may be a directory, symlink, or a small ``gitdir:`` pointer used by
+    submodules and linked worktrees.  Protecting only ``workspace/.git`` leaves a
+    worktree's real metadata writable elsewhere on disk, so the pointer and its
+    optional ``commondir`` are resolved without invoking Git.
+    """
+
+    base = Path(root).resolve()
+    marker = base / ".git"
+    rows: list[tuple[Path, str]] = [(marker, "tree" if marker.is_dir() else "file")]
+    gitdir: Path | None = None
+    try:
+        if marker.is_dir():
+            gitdir = marker.resolve(strict=True)
+        elif marker.is_file() and marker.stat().st_size <= 64 * 1024:
+            first = marker.read_text(encoding="utf-8", errors="replace").splitlines()[0]
+            if first.lower().startswith("gitdir:"):
+                value = first.split(":", 1)[1].strip()
+                candidate = Path(value)
+                if not candidate.is_absolute():
+                    candidate = marker.parent / candidate
+                gitdir = candidate.resolve(strict=True)
+    except (IndexError, OSError):
+        gitdir = None
+    if gitdir is not None and gitdir.is_dir():
+        rows.append((gitdir, "tree"))
+        common_file = gitdir / "commondir"
+        try:
+            if common_file.is_file() and common_file.stat().st_size <= 64 * 1024:
+                value = common_file.read_text(
+                    encoding="utf-8", errors="replace",
+                ).splitlines()[0].strip()
+                common = Path(value)
+                if not common.is_absolute():
+                    common = gitdir / common
+                common = common.resolve(strict=True)
+                if common.is_dir():
+                    rows.append((common, "tree"))
+        except (IndexError, OSError):
+            pass
+    # A bare workspace has no .git marker.  Treat its root as metadata rather
+    # than offering a writable full-access shell over it.
+    if (base / "HEAD").is_file() and (base / "objects").is_dir():
+        rows.append((base, "tree"))
+    unique: dict[tuple[str, str], tuple[Path, str]] = {}
+    for path, kind in rows:
+        unique.setdefault((str(path), kind), (path, kind))
+    return tuple(unique[key] for key in sorted(unique))
 
 
 def shell_executable() -> str:
@@ -131,8 +276,14 @@ def scrubbed_environment(
     root = Path(workspace).resolve()
     home = root / ".spiral" / "runtime-home"
     cache = root / ".spiral" / "runtime-cache"
+    managed = _managed_execution()
     home.mkdir(parents=True, exist_ok=True)
     cache.mkdir(parents=True, exist_ok=True)
+    try:
+        home.chmod(0o700)
+        cache.chmod(0o700)
+    except OSError:
+        pass
     keep = {
         "PATH", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TMPDIR", "SHELL",
         "CC", "CXX", "JAVA_HOME", "SDKROOT", "DEVELOPER_DIR",
@@ -144,21 +295,45 @@ def scrubbed_environment(
     env.update({
         # Workspace runs must not discover dotfiles, credentials, or unrelated
         # personal data through ordinary `~` expansion. An explicitly approved
-        # full-access run has different semantics: point `~` at the user's actual
-        # home so "find the project in Documents" works like it does in an
-        # interactive coding agent. Secret-valued process variables remain omitted.
-        "HOME": str(Path.home()) if full_access else str(home),
+        # standalone full-access run has different semantics. Controller-managed
+        # full access still points `~` at a private runtime home: absolute host
+        # paths remain available, while Git/gh/SSH cannot silently load ambient
+        # identities or credential helpers.
+        "HOME": str(Path.home()) if full_access and not managed else str(home),
         "XDG_CACHE_HOME": str(cache),
         "PYTHONNOUSERSITE": "1",
         "PYTHONDONTWRITEBYTECODE": "1",
         "GIT_TERMINAL_PROMPT": "0",
         "GIT_ASKPASS": "/usr/bin/false",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_OPTIONAL_LOCKS": "0",
         "NO_COLOR": "1",
         "CI": "1",
     })
+    if managed:
+        config_home = home / ".config"
+        data_home = home / ".local" / "share"
+        config_home.mkdir(parents=True, exist_ok=True)
+        data_home.mkdir(parents=True, exist_ok=True)
+        env.update({
+            "XDG_CONFIG_HOME": str(config_home),
+            "XDG_DATA_HOME": str(data_home),
+            "GH_CONFIG_DIR": str(config_home / "gh"),
+            "NETRC": os.devnull,
+            "SSH_ASKPASS": "/usr/bin/false",
+            "SSH_ASKPASS_REQUIRE": "force",
+        })
     for key, value in (extra or {}).items():
-        if not _SECRET.search(str(key)):
-            env[str(key)] = str(value)
+        name = str(key)
+        if _SECRET.search(name):
+            continue
+        if managed and (
+            _VCS_ENV.match(name) or name.upper() in _MANAGED_RESERVED_ENV
+        ):
+            continue
+        env[name] = str(value)
     return env
 
 
@@ -260,6 +435,64 @@ def _reference_read_rule(path: Path) -> str:
 def _reference_write_deny_rule(path: Path) -> str:
     kind = "subpath" if path.is_dir() else "literal"
     return f'(deny file-write* ({kind} "{_sandbox_string(path)}"))'
+
+
+def _mac_boundary_rule(operation: str, path: Path, kind: str) -> str:
+    selector = "subpath" if kind == "tree" else "literal"
+    return f'({operation} ({selector} "{_sandbox_string(path)}"))'
+
+
+def _managed_mac_rules(root: Path) -> list[str]:
+    """Mandatory managed-shell rules, independent of permission mode.
+
+    The regex covers nested repositories and creation of a new ``.git`` marker;
+    explicit resolved boundaries additionally cover linked worktree metadata whose
+    physical directory may not itself be named ``.git``.
+    """
+
+    rules = [
+        "(deny network*)",
+        # A sandboxed process must not ask an already-running unsandboxed app to
+        # perform the network action on its behalf.
+        "(deny appleevent-send)",
+        # macOS sandbox regexes match canonical absolute paths.  Keep this simple
+        # (no lookarounds) for compatibility with older sandbox-exec engines.
+        r'(deny file-write* (regex #".*/[.]git(/.*)?$"))',
+    ]
+    rules.extend(
+        _mac_boundary_rule("deny file-write*", path, kind)
+        for path, kind in _git_metadata_boundaries(root)
+    )
+    rules.extend(
+        _mac_boundary_rule("deny file-read*", path, kind)
+        for path, kind in _credential_boundaries()
+    )
+    rules.extend(
+        f'(deny process-exec (literal "{_sandbox_string(path)}"))'
+        for path in _credential_executables()
+    )
+    return rules
+
+
+def _append_bwrap_managed_masks(argv: list[str], root: Path) -> None:
+    """Overlay current-repository metadata and credential stores in bwrap."""
+
+    for path, _kind in _git_metadata_boundaries(root):
+        if path.exists():
+            argv.extend(["--ro-bind", str(path), str(path)])
+        elif path == root / ".git":
+            # Bubblewrap creates a file mount point for a file source.  Presenting
+            # an immutable .git marker also prevents a hidden `git init`/mkdir.
+            argv.extend(["--ro-bind", os.devnull, str(path)])
+    for path, kind in _credential_boundaries():
+        if not path.exists():
+            continue
+        if kind == "tree":
+            argv.extend(["--tmpfs", str(path)])
+        else:
+            argv.extend(["--ro-bind", os.devnull, str(path)])
+    for path in _credential_executables():
+        argv.extend(["--ro-bind", os.devnull, str(path)])
 
 
 @dataclass
@@ -364,9 +597,9 @@ class CommandBroker:
                 "git history/worktree/remote mutations require a separate explicit "
                 "user approval"
             )
-        # Full-access keeps only the catastrophic backstop; the rest of the fence
-        # (network tools, communication, arbitrary git inspection, workspace-only
-        # writes) is exactly what this mode exists to remove.
+        # Standalone full access keeps only the catastrophic lexical backstop.
+        # Controller-managed full access is additionally constrained by the OS
+        # profile assembled below; lexical matching is never its Git boundary.
         if full_access:
             return catastrophic_error(command)
         if _COMMUNICATION.search(command):
@@ -399,13 +632,19 @@ class CommandBroker:
         self, command: str, cwd: Path, allow_network: bool,
         allow_host_read: bool, full_access: bool = False,
     ) -> tuple[list[str], bool]:
-        # Full access is the whole machine, on purpose: writes anywhere, reads
-        # anywhere, network on — so spiral can find a folder across the disk,
-        # write into it, browse, and modify its own installed source. There is no
-        # confinement profile to build; the catastrophic backstop in policy_error
-        # is the only thing standing. Reported as sandboxed=False so the run log
-        # is honest about what it was.
-        if full_access:
+        from spiral.safety_kernel import protected_boundaries
+
+        managed = _managed_execution()
+        kernel_boundaries = protected_boundaries(self.root)
+        kernel_paths = [
+            boundary.path for boundary in kernel_boundaries
+            if boundary.path.exists()
+        ]
+        # A standalone full-access run retains the historical whole-machine
+        # semantics.  SpiralChat-managed full access is different: filesystem
+        # reach remains broad, but the shell must still be OS-isolated from
+        # network egress, Git metadata, and ambient VCS credentials.
+        if full_access and not kernel_boundaries and not managed:
             return [shell_executable(), "-lc", command], False
         # Workspace confinement is an enforcement mode, not a hint from a caller.
         # Older local-model call sites passed allow_host_read=True because prompts
@@ -414,6 +653,19 @@ class CommandBroker:
         allow_host_read = False
         sandbox = shutil.which("sandbox-exec")
         if sandbox and sys.platform == "darwin":
+            if full_access:
+                profile = ["(version 1)", "(allow default)"]
+                if managed:
+                    profile.extend(_managed_mac_rules(self.root))
+                profile.extend(
+                    _mac_boundary_rule(
+                        "deny file-write*", boundary.path, boundary.kind,
+                    )
+                    for boundary in kernel_boundaries
+                )
+                return [
+                    sandbox, "-p", " ".join(profile), shell_executable(), "-lc", command,
+                ], True
             # macOS TMPDIR carries a trailing slash, and a sandbox `subpath`
             # with one matches nothing — every write to $TMPDIR (which is where
             # python's tempfile points) was silently denied inside the gate.
@@ -425,7 +677,7 @@ class CommandBroker:
                 "(version 1)",
                 "(allow default)",
             ]
-            if not allow_network:
+            if not allow_network and not managed:
                 profile.append("(deny network*)")
             if not allow_host_read:
                 tool_roots = [
@@ -486,15 +738,42 @@ class CommandBroker:
                 f'(deny file-write* (subpath "{_sandbox_string(self.root / ".spiral" / "tools")}"))',
                 *[_reference_write_deny_rule(path) for path in self.reference_roots],
             ]
+            if managed:
+                profile.extend(_managed_mac_rules(self.root))
             return [
                 sandbox, "-p", " ".join(profile), shell_executable(), "-lc", command,
             ], True
         bwrap = shutil.which("bwrap")
-        if bwrap and not allow_network:
+        # bwrap cannot make a not-yet-created exact path read-only. Fail closed and let
+        # ``run`` reject the unsandboxed full-access command when such a boundary exists.
+        if (
+            bwrap and full_access and (managed or kernel_boundaries)
+            and all(boundary.path.exists() for boundary in kernel_boundaries)
+        ):
+            argv = [
+                bwrap,
+            ]
+            if managed:
+                argv.append("--unshare-net")
+            argv.extend([
+                "--die-with-parent", "--bind", "/", "/", "--dev", "/dev",
+            ])
+            if managed:
+                _append_bwrap_managed_masks(argv, self.root)
+            for protected in kernel_paths:
+                argv.extend(["--ro-bind", str(protected), str(protected)])
+            argv.extend([
+                "--proc", "/proc", "--chdir", str(cwd),
+                "/bin/sh", "-lc", command,
+            ])
+            return argv, True
+        if bwrap and (not allow_network or managed):
             argv = [
                 bwrap, "--unshare-net", "--die-with-parent", "--ro-bind", "/", "/",
                 "--bind", str(self.root), str(self.root), "--dev", "/dev",
             ]
+            if managed:
+                _append_bwrap_managed_masks(argv, self.root)
             for protected in (
                 self.root / ".git", self.root / ".spiral" / "tools",
             ):
@@ -519,9 +798,13 @@ class CommandBroker:
         full_access: bool = False,
     ) -> BrokerResult:
         command = str(command or "").strip()
+        managed = _managed_execution()
         # The broker is the final capability boundary. A stale or hostile caller
         # cannot turn a workspace run into a host-reading or networked run by passing
-        # permissive booleans; only full_access authorizes either capability.
+        # permissive booleans. Full access can widen filesystem reach; in a managed
+        # run it never grants shell egress because networked Git is a typed action.
+        if managed:
+            allow_network = False
         if not full_access:
             allow_network = False
             allow_host_read = False
@@ -546,8 +829,52 @@ class CommandBroker:
             })
             return BrokerResult(result, False, manifest)
 
-        argv, sandboxed = self._argv(
-            command, work, allow_network, allow_host_read, full_access=full_access)
+        from spiral.safety_kernel import SafetyBoundaryError, protection_active
+
+        try:
+            argv, sandboxed = self._argv(
+                command, work, allow_network, allow_host_read,
+                full_access=full_access,
+            )
+        except SafetyBoundaryError as exc:
+            result = RunResult(
+                command, 126,
+                f"broker refused stale protected-path contract: {exc}",
+                True,
+            )
+            manifest = self._record({
+                "kind": purpose, "command": command, "cwd": str(work),
+                "ok": False, "blocked": True,
+                "reason": f"protected-path contract: {exc}",
+            })
+            return BrokerResult(result, False, manifest)
+
+        if full_access and protection_active(self.root) and not sandboxed:
+            result = RunResult(
+                command, 126,
+                "broker refused managed self-modification because safety-kernel "
+                "write protection is unavailable on this host",
+                True,
+            )
+            manifest = self._record({
+                "kind": purpose, "command": command, "cwd": str(work),
+                "ok": False, "blocked": True,
+                "reason": "safety-kernel sandbox unavailable",
+            })
+            return BrokerResult(result, False, manifest)
+        if managed and not sandboxed:
+            result = RunResult(
+                command, 126,
+                "broker refused managed shell execution because mandatory Git/network "
+                "isolation is unavailable on this host",
+                True,
+            )
+            manifest = self._record({
+                "kind": purpose, "command": command, "cwd": str(work),
+                "ok": False, "blocked": True,
+                "reason": "managed Git/network sandbox unavailable",
+            })
+            return BrokerResult(result, False, manifest)
         # Full access is deliberately unsandboxed; require_sandbox does not apply.
         if require_sandbox and not sandboxed and not full_access:
             result = RunResult(
@@ -622,8 +949,12 @@ class CommandBroker:
             "command": command,
             "cwd": audit_cwd,
             "sandboxed": sandboxed,
-            "network": "allowed" if allow_network or full_access else "denied",
+            "network": (
+                "denied" if managed else
+                "allowed" if allow_network or full_access else "denied"
+            ),
             "host_read": (
+                "allowed-except-vcs-credentials" if managed and full_access else
                 "allowed" if allow_host_read or full_access else
                 "workspace+references" if self.reference_roots else "workspace-only"
             ),

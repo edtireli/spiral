@@ -13,7 +13,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from spiral.command_broker import CommandBroker
+from spiral.command_broker import CommandBroker, scrubbed_environment
 from spiral.config import Config
 from spiral.edits import EditBlock, apply_edits
 from spiral.tools import list_dir, read_file
@@ -70,6 +70,35 @@ def test_linux_workspace_profile_uses_bwrap_with_network_and_reference_isolation
         if argv[index:index + 3] == ["--ro-bind", str(reference), str(reference)]
     )
     assert ref_at > 0
+
+
+def test_managed_linux_full_access_unshares_network_and_masks_git_metadata(
+    tmp_path, monkeypatch,
+):
+    import spiral.command_broker as broker_module
+
+    gitdir = tmp_path / ".git"
+    gitdir.mkdir()
+    (gitdir / "HEAD").write_text("ref: refs/heads/main\n")
+    monkeypatch.setenv("SPIRALCHAT_EXTERNAL_GIT_APPROVAL", "1")
+    monkeypatch.delenv("SPIRALCHAT_PROTECTED_PATHS", raising=False)
+    monkeypatch.setattr(broker_module.sys, "platform", "linux")
+    monkeypatch.setattr(
+        broker_module.shutil, "which",
+        lambda name: "/usr/bin/bwrap" if name == "bwrap" else None,
+    )
+
+    argv, sandboxed = CommandBroker(tmp_path)._argv(
+        "python build.py", tmp_path, allow_network=True,
+        allow_host_read=True, full_access=True,
+    )
+
+    assert sandboxed is True
+    assert argv[0] == "/usr/bin/bwrap"
+    assert "--unshare-net" in argv
+    assert ["--ro-bind", str(gitdir), str(gitdir)] == argv[
+        argv.index("--ro-bind"):argv.index("--ro-bind") + 3
+    ]
 
 
 def test_workspace_mode_fails_closed_when_linux_sandbox_is_unavailable(
@@ -377,6 +406,219 @@ def test_full_access_uses_real_home_but_still_scrubs_secret_environment(
 
     assert result.code == 0, result.out
     assert result.out.splitlines() == [str(user_home), "True", "SCRUBBED"]
+
+
+def test_managed_full_access_uses_isolated_home_and_fixed_vcs_environment(
+    tmp_path, monkeypatch,
+):
+    host_home = tmp_path / "host-home"
+    host_home.mkdir()
+    monkeypatch.setenv("HOME", str(host_home))
+    monkeypatch.setenv("SPIRALCHAT_EXTERNAL_GIT_APPROVAL", "1")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent.sock")
+    monkeypatch.setenv("GITHUB_TOKEN", "host-token")
+
+    env = scrubbed_environment(tmp_path, {
+        "HOME": str(host_home),
+        "XDG_CONFIG_HOME": str(host_home / ".config"),
+        "GIT_CONFIG_GLOBAL": str(host_home / ".gitconfig"),
+        "GIT_SSH_COMMAND": "ssh -F secret-config",
+        "SSH_AUTH_SOCK": "/tmp/injected-agent.sock",
+        "GH_TOKEN": "injected-token",
+        "PATH": "/safe/tools:/usr/bin",
+    }, full_access=True)
+
+    runtime_home = tmp_path / ".spiral" / "runtime-home"
+    assert env["HOME"] == str(runtime_home)
+    assert env["XDG_CONFIG_HOME"] == str(runtime_home / ".config")
+    assert env["GIT_CONFIG_GLOBAL"] == os.devnull
+    assert env["GIT_CONFIG_SYSTEM"] == os.devnull
+    assert env["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert env["GIT_OPTIONAL_LOCKS"] == "0"
+    assert env["GIT_ASKPASS"] == "/usr/bin/false"
+    assert env["PATH"] == "/safe/tools:/usr/bin"
+    assert "GIT_SSH_COMMAND" not in env
+    assert "SSH_AUTH_SOCK" not in env
+    assert "GH_TOKEN" not in env
+    assert "GITHUB_TOKEN" not in env
+
+
+def test_managed_full_access_profile_denies_network_credentials_and_real_gitdirs(
+    tmp_path, monkeypatch,
+):
+    import spiral.command_broker as broker_module
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    gitdir = tmp_path / "metadata" / "worktrees" / "one"
+    common = tmp_path / "metadata"
+    gitdir.mkdir(parents=True)
+    (gitdir / "commondir").write_text("../..\n")
+    (workspace / ".git").write_text(f"gitdir: {gitdir}\n")
+    monkeypatch.setenv("SPIRALCHAT_EXTERNAL_GIT_APPROVAL", "1")
+    monkeypatch.delenv("SPIRALCHAT_PROTECTED_PATHS", raising=False)
+    monkeypatch.setattr(broker_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        broker_module.shutil, "which",
+        lambda name: "/usr/bin/sandbox-exec" if name == "sandbox-exec" else None,
+    )
+
+    argv, sandboxed = CommandBroker(workspace)._argv(
+        "python build.py", workspace, allow_network=True,
+        allow_host_read=True, full_access=True,
+    )
+
+    assert sandboxed is True
+    profile = argv[2]
+    assert "(deny network*)" in profile
+    assert "(deny appleevent-send)" in profile
+    assert r'(deny file-write* (regex #".*/[.]git(/.*)?$"))' in profile
+    assert f'(literal "{workspace / ".git"}")' in profile
+    assert f'(subpath "{gitdir}")' in profile
+    assert f'(subpath "{common}")' in profile
+    assert f'(deny file-read* (subpath "{Path.home() / ".ssh"}"))' in profile
+    assert '(deny process-exec (literal "/usr/bin/ssh"))' in profile
+    assert '(deny process-exec (literal "/usr/bin/open"))' in profile
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin" or not Path("/usr/bin/sandbox-exec").is_file(),
+    reason="adversarial enforcement check uses the macOS kernel sandbox",
+)
+def test_managed_full_access_os_boundary_blocks_direct_and_subprocess_git_writes(
+    tmp_path, monkeypatch,
+):
+    workspace = tmp_path / "workspace"
+    gitdir = workspace / ".git"
+    gitdir.mkdir(parents=True)
+    head = gitdir / "HEAD"
+    head.write_text("ref: refs/heads/main\n")
+    ordinary = workspace / "ordinary.txt"
+    monkeypatch.setenv("SPIRALCHAT_EXTERNAL_GIT_APPROVAL", "1")
+    monkeypatch.delenv("SPIRALCHAT_PROTECTED_PATHS", raising=False)
+    broker = CommandBroker(workspace)
+
+    ordinary_code = (
+        "from pathlib import Path;"
+        f"Path({str(ordinary)!r}).write_text('ordinary write allowed')"
+    )
+    ordinary_result = broker.run(
+        f"{shlex.quote(sys.executable)} -c {shlex.quote(ordinary_code)}",
+        timeout=10, require_sandbox=False, full_access=True,
+    ).result
+    assert ordinary_result.code == 0, ordinary_result.out
+    assert ordinary.read_text() == "ordinary write allowed"
+
+    direct_code = (
+        "import os;"
+        f"fd=os.open({str(head)!r},os.O_WRONLY|os.O_TRUNC);"
+        "os.write(fd,b'compromised');os.close(fd)"
+    )
+    direct_result = broker.run(
+        f"{shlex.quote(sys.executable)} -c {shlex.quote(direct_code)}",
+        timeout=10, require_sandbox=False, full_access=True,
+    ).result
+    assert direct_result.code != 0
+    assert head.read_text() == "ref: refs/heads/main\n"
+
+    child_code = (
+        "from pathlib import Path;"
+        f"Path({str(head)!r}).write_text('subprocess compromised')"
+    )
+    parent_code = (
+        "import subprocess,sys;"
+        f"p=subprocess.run([sys.executable,'-c',{child_code!r}]);"
+        "print(p.returncode);"
+        "raise SystemExit(0 if p.returncode != 0 else 9)"
+    )
+    subprocess_result = broker.run(
+        f"{shlex.quote(sys.executable)} -c {shlex.quote(parent_code)}",
+        timeout=10, require_sandbox=False, full_access=True,
+    ).result
+    assert subprocess_result.code == 0, subprocess_result.out
+    assert head.read_text() == "ref: refs/heads/main\n"
+
+    network_code = (
+        "import errno,socket,sys;"
+        "s=socket.socket(socket.AF_INET,socket.SOCK_STREAM);"
+        "code=s.connect_ex(('127.0.0.1',9));"
+        "print(code);"
+        "raise SystemExit(0 if code in (errno.EACCES,errno.EPERM) else 7)"
+    )
+    network_result = broker.run(
+        f"{shlex.quote(sys.executable)} -c {shlex.quote(network_code)}",
+        timeout=10, require_sandbox=False, full_access=True,
+    ).result
+    assert network_result.code == 0, network_result.out
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin" or not Path("/usr/bin/sandbox-exec").is_file(),
+    reason="Git mutation enforcement check uses the macOS kernel sandbox",
+)
+def test_managed_shell_keeps_git_inspection_but_os_denies_hidden_git_add(
+    tmp_path, monkeypatch,
+):
+    import subprocess
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.test"],
+        cwd=workspace, check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"], cwd=workspace, check=True,
+    )
+    tracked = workspace / "tracked.txt"
+    tracked.write_text("base\n")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=workspace, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=workspace, check=True)
+    index = workspace / ".git" / "index"
+    index_before = index.read_bytes()
+    tracked.write_text("changed\n")
+    monkeypatch.setenv("SPIRALCHAT_EXTERNAL_GIT_APPROVAL", "1")
+    monkeypatch.delenv("SPIRALCHAT_PROTECTED_PATHS", raising=False)
+    broker = CommandBroker(workspace)
+
+    inspection = broker.run(
+        "git status --short", timeout=10,
+        require_sandbox=False, full_access=True,
+    ).result
+    assert inspection.code == 0, inspection.out
+    assert "tracked.txt" in inspection.out
+
+    child_code = (
+        "import subprocess,sys;"
+        f"p=subprocess.run(['/usr/bin/'+'g'+'it','-C',{str(workspace)!r},"
+        "'a'+'dd','tracked.txt']);"
+        "print(p.returncode);"
+        "raise SystemExit(0 if p.returncode != 0 else 8)"
+    )
+    mutation = broker.run(
+        f"{shlex.quote(sys.executable)} -c {shlex.quote(child_code)}",
+        timeout=10, require_sandbox=False, full_access=True,
+    ).result
+
+    assert mutation.code == 0, mutation.out
+    assert index.read_bytes() == index_before
+
+
+def test_managed_full_access_fails_closed_without_os_sandbox(tmp_path, monkeypatch):
+    import spiral.command_broker as broker_module
+
+    monkeypatch.setenv("SPIRALCHAT_EXTERNAL_GIT_APPROVAL", "1")
+    monkeypatch.delenv("SPIRALCHAT_PROTECTED_PATHS", raising=False)
+    monkeypatch.setattr(broker_module.sys, "platform", "linux")
+    monkeypatch.setattr(broker_module.shutil, "which", lambda _name: None)
+
+    result = CommandBroker(tmp_path).run(
+        "true", full_access=True, require_sandbox=False,
+    ).result
+
+    assert result.blocked and result.code == 126
+    assert "mandatory Git/network isolation" in result.out
 
 
 def _pid_is_running(pid: int) -> bool:

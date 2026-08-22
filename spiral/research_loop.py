@@ -15,11 +15,11 @@ The research analogue of spiral's build Conductor. A round is:
             declare solved, or promote a *new* verified-open question
   persist → state is written so the loop resumes
 
-It repeats — unbounded by default — until a question is answered with verified claims, a
-genuinely new open question is found, or a round/token budget is hit. Then it writes a
-cited LaTeX paper. The invariant, carried from spiral: **the model proposes; tools
-decide.** A finding exists because a checker confirmed it, not because the model was
-fluent.
+It repeats without a fixed round count until a question is answered with verified
+claims, a genuinely new open question is found, or the finite joint wall/token/call
+budget is hit. Then it writes a cited LaTeX paper. The invariant, carried from spiral:
+**the model proposes; tools decide.** A finding exists because a checker confirmed it,
+not because the model was fluent.
 """
 
 from __future__ import annotations
@@ -217,6 +217,13 @@ class ResearchLoop:
         from spiral.research_corpus import Corpus
         self.cfg = cfg or Config.load()
         self.ol = ol or Ollama(self.cfg.base_url, providers=getattr(self.cfg, "providers", None))
+        if hasattr(self.ol, "configure_budget"):
+            self.ol.configure_budget(
+                wall_seconds=self.cfg.run_wall_budget_seconds,
+                total_tokens=self.cfg.run_token_budget,
+                model_calls=self.cfg.run_call_budget,
+                reset=ol is None,
+            )
         self.ui = ui
         self.resume_requested = bool(resume)
         self.refresh_requested = bool(refresh)
@@ -255,6 +262,9 @@ class ResearchLoop:
         from spiral.research_data import ScientificDataBroker
 
         self.data_broker = ScientificDataBroker(self.dir / "data", cfg=self.cfg)
+        from spiral.execution import TaskEvidenceDAG
+
+        self.evidence_dag = TaskEvidenceDAG.research_pipeline(self.state.topic)
         self._bootstrap_obligations()
 
     # -- persistence ---------------------------------------------------------
@@ -302,6 +312,59 @@ class ResearchLoop:
             pass
         _atomic_text(
             self._statefile(), json.dumps(asdict(self.state), indent=2))
+        self._save_evidence_handoff()
+
+    def _save_evidence_handoff(self) -> None:
+        """Persist what Research actually knows, including what remains uncertain."""
+        from spiral.execution import EvidenceLevel, EvidenceRecord, TaskState
+
+        dag = self.evidence_dag
+        papers = len(getattr(self.corpus, "papers", {}) or {})
+        if papers:
+            node = dag.nodes["research.sources"]
+            node.state = TaskState.COMPLETE
+            node.evidence = [EvidenceRecord(
+                EvidenceLevel.SOURCE, f"{papers} source record(s) retained in the corpus",
+                artifact="corpus/manifest.json", source="Research corpus",
+            )]
+        if str(self.state.question or "").strip():
+            node = dag.nodes["research.question"]
+            node.state = TaskState.COMPLETE
+            node.evidence = [EvidenceRecord(
+                EvidenceLevel.SOURCE, "research question is scoped against retained sources",
+                artifact="state.json", source="Research question and novelty boundary",
+            )]
+        confirmed = [row for row in self.state.findings if isinstance(row, dict) and row.get("ok")]
+        if confirmed:
+            node = dag.nodes["research.verify"]
+            node.state = TaskState.COMPLETE
+            node.evidence = [EvidenceRecord(
+                EvidenceLevel.BEHAVIOR,
+                f"{len(confirmed)} claim certificate(s) passed their declared verifier",
+                artifact="state.json", source="Research deterministic verifiers",
+            )]
+        if bool((self.state.completion or {}).get("ready")):
+            node = dag.nodes["research.handoff"]
+            node.state = TaskState.COMPLETE
+            node.evidence = [EvidenceRecord(
+                EvidenceLevel.SOURCE, "research completion obligations are recorded as ready",
+                artifact="state.json", source="Research completion gate",
+            )]
+        dag.save(self.dir / "task-evidence-dag.json")
+        unresolved = [] if (self.state.completion or {}).get("ready") else [
+            f"research status is {self.state.status}; completion evidence is not ready"
+        ]
+        evidence = dag.evidence_report(unresolved).to_dict()
+        budget = getattr(self.ol, "budget", None)
+        _atomic_text(self.dir / "evidence-handoff.json", json.dumps({
+            "schema_version": 1,
+            "kind": "spiral.research.handoff",
+            "status": self.state.status,
+            "question": self.state.question,
+            "evidence": evidence,
+            "budget": budget.snapshot() if budget is not None else {},
+            "task_graph": "task-evidence-dag.json",
+        }, indent=2))
 
     # -- shared epistemic kernel --------------------------------------------
     def _bootstrap_obligations(self) -> None:
@@ -949,6 +1012,20 @@ class ResearchLoop:
 
         last = ""
         for model, num_ctx, label in attempts:
+            if (
+                model not in getattr(self.ol, "providers", {})
+                and hasattr(self.ol, "free_foreign")
+            ):
+                # Research used to leave the 27B planner and 12B critic resident
+                # together. Default configuration now aliases the roles, and this
+                # boundary also evicts any unrelated local model before an explicit
+                # multi-model run so unified memory cannot be overcommitted.
+                self.ol.free_foreign(
+                    {model},
+                    log=lambda name: self._say(
+                        f"  model · unloaded {name} before {label} inference"
+                    ),
+                )
             variants = [("full", system, user)]
             compact = self._compact_user_prompt(user, max_chars=max_chars)
             if compact != user:
@@ -3939,6 +4016,7 @@ class ResearchLoop:
                 living = self._living_status()
                 if living.get("current"):
                     self._say("resume · living paper and evidence bundle are current")
+                    self._save_evidence_handoff()
                     return self.state
                 self._say("refresh · living paper is stale · reopening novelty obligations")
                 self.state.status = "open"
@@ -3954,13 +4032,16 @@ class ResearchLoop:
                             reason="living-paper refresh reopened the literature horizon")
             else:
                 self._say("resume · completion gate already green · retrying retained paper")
+                self._save_evidence_handoff()
                 return self.state
-        budget = token_budget or getattr(self.cfg, "run_token_budget", 500_000)
-        explicit_token_budget = token_budget is not None
-        metered_models = any(
-            spec.name in getattr(self.ol, "providers", {})
-            for spec in (self.cfg.planner, self.cfg.worker, self.cfg.critic, self.cfg.escalation)
-        )
+        budget = token_budget or getattr(self.cfg, "run_token_budget", 350_000)
+        if token_budget is not None and hasattr(self.ol, "configure_budget"):
+            self.ol.configure_budget(
+                wall_seconds=self.cfg.run_wall_budget_seconds,
+                total_tokens=max(1, int(token_budget)),
+                model_calls=self.cfg.run_call_budget,
+                reset=False,
+            )
         cats, queries = self.search_plan()           # the right categories + focused queries
         if getattr(self.cfg, "research_information_scheduler", True):
             ranked = self.scheduler.rank_queries(
@@ -3986,8 +4067,8 @@ class ResearchLoop:
         while True:
             if max_rounds is not None and self.state.round >= max_rounds:
                 self.state.status = "exhausted"; break
-            budget_used = self.state.tokens if explicit_token_budget else self.state.api_tokens
-            if (explicit_token_budget or metered_models) and budget_used >= budget:
+            budget_used = self.state.tokens
+            if budget_used >= budget:
                 self.state.status = "exhausted"; break
             self.state.round += 1
             self._say(f"── round {self.state.round} ──")

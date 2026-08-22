@@ -339,6 +339,27 @@ class TaskTransaction:
         return recovery
 
     def commit(self, message: str) -> tuple[str, bool]:
+        if self.managed:
+            from spiral.safety_kernel import (
+                protected_relative_path, protection_active, rejection_reason,
+            )
+
+            if protection_active(self.root):
+                baseline_root = (self.snapshot_dir or Path()) / "tree"
+                def signature(path: Path) -> str:
+                    return _file_signature(path) if path.exists() or path.is_symlink() else "missing"
+                baseline_paths = set(self.snapshot_paths or set())
+                current_paths = set(_managed_paths(self.root))
+                protected_candidates = [
+                    rel for rel in sorted(baseline_paths | current_paths)
+                    if protected_relative_path(self.root, self.root / rel)
+                ]
+                changed = [
+                    rel for rel in protected_candidates
+                    if signature(self.root / rel) != signature(baseline_root / rel)
+                ]
+                if changed:
+                    raise RuntimeError(rejection_reason(", ".join(changed)))
         escaping = _external_symlinks(self.root)
         if escaping:
             raise RuntimeError(
