@@ -777,14 +777,11 @@ class ResearchLoop:
         each a fresh arXiv request, none new information. Re-searching a family that
         already answered (or already failed) is not persistence, it is the loop
         confusing motion with progress."""
-        terms = self._query_terms(query)
-        if not terms:
-            return False
-        for tried in self._tried_queries():
-            held = self._query_terms(tried)
-            if held and len(terms & held) / len(terms | held) >= threshold:
-                return False
-        return True
+        from spiral.literature_builder import query_is_novel
+
+        return query_is_novel(
+            query, self._tried_queries(), threshold=threshold,
+        )
 
     def _instrument_health(self, *, window: int = 8) -> dict:
         """Observable health of the retrieval instruments over the recent record —
@@ -883,30 +880,12 @@ class ResearchLoop:
         covered across research rounds. A seed counts as closed only after a healthy,
         untruncated batch reported no unresolved co-citation holes.
         """
-        from spiral.research_quality import rank_papers_for_topic
+        from spiral.literature_builder import graph_seed_batch
 
-        ordered = [
-            str(getattr(p, "bare_id", getattr(p, "arxiv_id", "")))
-            for p in rank_papers_for_topic(
-                self.state.topic, self.corpus.papers.values())
-        ]
-        closed: set[str] = set()
-        for report in self.map.get("graph_rounds") or []:
-            health = report.get("health") or report.get("graph_health") or {}
-            if not (
-                health.get("coverage_valid") is True
-                and (report.get("batch_frontier_closed") is True
-                     or report.get("saturated") is True)
-                and not report.get("frontier_truncated")
-                and not (report.get("unresolved_holes_after_round") or [])
-            ):
-                continue
-            closed.update(
-                str(seed).replace("arXiv:", "").split("v")[0]
-                for seed in (health.get("successful_seeds") or [])
-            )
-        pending = [seed for seed in ordered if seed and seed not in closed]
-        return (pending or ordered)[:max(1, limit)]
+        return graph_seed_batch(
+            self.state.topic, self.corpus.papers.values(),
+            self.map.get("graph_rounds") or [], limit=limit,
+        )
 
     # -- llm -----------------------------------------------------------------
     def _model_error(self, res) -> str:

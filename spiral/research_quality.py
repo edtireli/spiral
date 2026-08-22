@@ -355,7 +355,7 @@ def corpus_quality_report(topic: str, papers, research_map: dict, *,
     primary = [
         p for p in paper_list
         if getattr(p, "tex_path", "") or getattr(p, "pdf_path", "")
-        or str(getattr(p, "body_source", "")) in {"tex", "pdf"}
+        or str(getattr(p, "body_source", "")) in {"tex", "jats", "pdf"}
     ]
     primary_ids = {id(p) for p in primary}
     usable_primary = [p for p in usable if id(p) in primary_ids]

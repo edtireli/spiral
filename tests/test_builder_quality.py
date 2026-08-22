@@ -130,6 +130,90 @@ def test_build_cli_reaches_config_without_local_scope_crash(tmp_path, monkeypatc
     assert seen == {"workspace": str(tmp_path), "goal": "make a tool"}
 
 
+def test_workspace_only_overrides_hostile_persistent_access_config(tmp_path, monkeypatch):
+    from spiral import cli, conductor
+    from spiral.config import Config
+
+    hostile = Config()
+    hostile.builder_full_access = True
+    hostile.builder_require_sandbox = False
+    hostile.builder_allow_install_scripts = True
+    hostile.builder_tool_auto = True
+    seen = {}
+
+    class FakeConductor:
+        def __init__(self, workspace, cfg):
+            seen["full_access"] = cfg.builder_full_access
+            seen["require_sandbox"] = cfg.builder_require_sandbox
+            seen["install_scripts"] = cfg.builder_allow_install_scripts
+            seen["tool_auto"] = cfg.builder_tool_auto
+
+        def build(self, goal, resume=False, approve=False):
+            seen["goal"] = goal
+
+    monkeypatch.setattr(cli.Config, "load", classmethod(lambda cls: hostile))
+    monkeypatch.setattr(conductor, "Conductor", FakeConductor)
+    monkeypatch.setattr(cli, "print_banner", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cli, "_info_line", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cli, "_free_foreign_models", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "spiral", "build", "make a tool", "--dir", str(tmp_path),
+            "--workspace-only",
+        ],
+    )
+
+    cli.main()
+
+    assert seen == {
+        "full_access": False,
+        "require_sandbox": True,
+        "install_scripts": False,
+        "tool_auto": False,
+        "goal": "make a tool",
+    }
+
+
+def test_build_cli_passes_repeatable_canonical_references(tmp_path, monkeypatch):
+    from spiral import cli, conductor
+
+    source = tmp_path / "source"
+    source.mkdir()
+    paper = tmp_path / "paper.pdf"
+    paper.write_bytes(b"%PDF")
+    target = tmp_path / "target"
+    target.mkdir()
+    seen = {}
+
+    class FakeConductor:
+        def __init__(self, workspace, cfg):
+            seen["references"] = cfg.builder_reference_roots
+            seen["repos"] = cfg.builder_repo_auto
+
+        def build(self, goal, resume=False, approve=False):
+            pass
+
+    monkeypatch.setattr(conductor, "Conductor", FakeConductor)
+    monkeypatch.setattr(cli, "print_banner", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cli, "_info_line", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cli, "_free_foreign_models", lambda *args, **kwargs: None)
+    monkeypatch.setenv("SPIRALCHAT_EXTERNAL_GIT_APPROVAL", "1")
+    monkeypatch.setattr(sys, "argv", [
+        "spiral", "build", "make a related project", "--dir", str(target),
+        "--reference", str(source), "--reference", str(paper),
+        "--auto-repos",
+    ])
+
+    cli.main()
+
+    assert seen == {
+        "references": [str(source.resolve()), str(paper.resolve())],
+        "repos": False,
+    }
+
+
 def test_detect_gate_covers_full_node_and_native_checks(tmp_path):
     from spiral.conductor import detect_gate
 

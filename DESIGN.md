@@ -23,8 +23,8 @@ The smartest local brain does both jobs; we don't waste it on a 4B planner.
 
 | Mode  | Model         | Thinking | Output            | Budget            |
 |-------|---------------|----------|-------------------|-------------------|
-| Plan  | qwen3.6:27b   | ON       | structured (JSON) | capped, must emit |
-| Build | qwen3.6:27b   | OFF      | tool calls        | hard num_predict  |
+| Plan  | qwen3.8:27b   | ON       | structured (JSON) | capped, must emit |
+| Build | qwen3.8:27b   | OFF      | tool calls        | hard num_predict  |
 
 Forcing plan-mode into a JSON schema is the fix for "thinks all its tokens away":
 it must emit the schema and stop. Build-mode runs `/no_think` with a hard cap,

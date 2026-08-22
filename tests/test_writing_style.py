@@ -6,6 +6,7 @@ rewrite actually moved toward the field's style.
 """
 from spiral.writing_style import (
     StyleTemplate, ai_score, ai_tells, measure, mine_template, score_against,
+    template_distance,
 )
 
 AI_PROSE = """Additionally, this framework stands as a testament to the enduring
@@ -40,6 +41,47 @@ def test_named_wikipedia_patterns_are_detected():
                      "copula-avoidance", "superficial-analysis",
                      "challenges-formula", "ai-vocabulary"):
         assert expected in found, f"missed {expected}"
+
+
+def test_formulaic_metadiscourse_and_future_work_are_detected():
+    text = (
+        "It is important to note that the protocol was fixed. The study provides a "
+        "clear milestone and suggests directions for future work. These findings "
+        "confirm the robustness of the method and highlight the need for continued "
+        "investigation."
+    )
+    found = {tell.id for tell in ai_tells(text, per_1k=False)}
+    assert {"formulaic-metadiscourse", "challenges-formula",
+            "formulaic-need-claim", "significance-inflation",
+            "formulaic-findings-claim", "ai-vocabulary"} <= found
+
+
+def test_formulaic_conclusions_left_by_a_live_rewrite_are_detected():
+    text = (
+        "The study marks a milestone and suggests directions for future work. "
+        "These results confirm the experimental paradigm’s reliability and highlight "
+        "the need for further investigation. Further work is required."
+    )
+    found = {tell.id for tell in ai_tells(text, per_1k=False)}
+    assert {"significance-inflation", "challenges-formula",
+            "formulaic-findings-claim", "formulaic-need-claim"} <= found
+
+
+def test_formulaic_conclusion_synonyms_do_not_evade_the_catalogue():
+    text = (
+        "The study provides a baseline for future research and outlines specific avenues for "
+        "subsequent analysis. These results indicate the paradigm functions reliably "
+        "while requiring further investigation. The experimental paradigm demonstrates "
+        "reliability."
+    )
+    found = {tell.id for tell in ai_tells(text, per_1k=False)}
+    assert {"significance-inflation", "challenges-formula",
+            "formulaic-findings-claim", "formulaic-need-claim"} <= found
+
+    later = {tell.id for tell in ai_tells(
+        "This study establishes a baseline and outlines next steps. "
+        "The experimental paradigm yields reliable data.", per_1k=False)}
+    assert {"significance-inflation", "formulaic-findings-claim"} <= later
 
 
 def test_detector_is_deterministic():
@@ -99,6 +141,25 @@ def test_score_against_reports_actionable_gaps():
     assert rep["ai_score"] > 0
     assert rep["missing_sections"], "AI prose has no sections; template expects them"
     assert all(("raise" in g or "lower" in g) for g in rep["gaps"])
+
+
+def test_template_distance_scores_vocabulary_and_section_arc_not_only_numbers():
+    tpl = StyleTemplate(
+        sample_size=5,
+        vocabulary=["cortical", "stimulus", "adaptation", "amplitude"],
+        section_order=["Introduction", "Methods", "Results"],
+        targets={},
+    )
+    matching = (
+        "# Introduction\n\nCortical stimulus adaptation was measured.\n\n"
+        "# Methods\n\nWe recorded response amplitude.\n\n# Results\n\nThe response changed."
+    )
+    unrelated = (
+        "# Discussion\n\nThe medieval manuscript contains several poems.\n\n"
+        "# Appendix\n\nWe list the catalogue entries."
+    )
+    assert template_distance(matching, tpl) < template_distance(unrelated, tpl)
+    assert template_distance(matching, tpl) == 0.0
 
 
 def test_template_markdown_renders():
@@ -165,12 +226,84 @@ def test_mined_phrase_tells_load_and_fire():
     assert any("notability" in i for i in ids)
 
 
+def test_words_box_parser_survives_nested_citation_templates():
+    """The live 2026 vocabulary box nests cite templates inside ``strong``.
+
+    Stopping at the first closing braces retained only the first few words and silently
+    dropped the rest of Wikipedia's list.
+    """
+    from spiral.ai_tells import mine_wikitext
+
+    source = """
+== Language ==
+Words to watch: {{strong|''delve'',<ref name="x">{{cite web|title=X}}</ref>
+''emphasizing'', {{citation needed|date=August 2026}} ''vibrant'' }}
+"""
+    mined = mine_wikitext(source)
+    assert mined["Language"]["words_to_watch"] == [
+        "delve", "emphasizing", "vibrant",
+    ]
+
+
+def test_wikipedia_placeholders_compile_to_real_patterns():
+    from spiral.ai_tells import _phrase_to_regex
+    import re
+
+    article = re.compile(_phrase_to_regex("represents [a] shift"), re.I)
+    date = re.compile(_phrase_to_regex("as of [date]"), re.I)
+    assert article.search("represents a shift")
+    assert article.search("represents the shift")
+    assert date.search("as of 2026")
+    assert date.search("as of August 13, 2026")
+
+
+def test_wikipedia_attached_ellipsis_and_end_boundaries_compile_correctly():
+    from spiral.ai_tells import _phrase_to_regex
+    import re
+
+    attached = re.compile(_phrase_to_regex("its... challenges... future"), re.I)
+    leading = re.compile(_phrase_to_regex("...in local media"), re.I)
+    key = re.compile(_phrase_to_regex("key"), re.I)
+    assert attached.search("Despite its age, it faces several challenges before future work")
+    assert leading.search("It has appeared widely in local media")
+    assert key.search("a key result")
+    assert not key.search("a keyboard result")
+
+
 def test_plain_human_prose_stays_clean():
     """The whole thing is worthless if ordinary writing trips it."""
     human = ("We measured the decay rate at three temperatures. The 40 K sample decayed "
              "with a time constant of 12.4 ms, about twice the 300 K value. We did not "
              "reproduce the anomaly reported earlier.")
     assert _tells(human) == []
+
+
+def test_docx_action_gate_ignores_typography_and_single_technical_word():
+    from spiral.style_tool import _docx_actionable_tells
+
+    assert not _docx_actionable_tells("The model used HC3-robust standard errors.")
+    assert not _docx_actionable_tells("The programme was called “danmark”.")
+    assert _docx_actionable_tells("Additionally, the response changed.")
+    assert _docx_actionable_tells("Studies have shown that the response changes.")
+
+
+def test_percentage_does_not_hide_tells_later_in_the_same_paragraph():
+    text = (
+        "Response amplitude decreased by 18.4% during the third block. "
+        "This finding underscores the importance of checking the complete paragraph."
+    )
+    ids = {tell.id for tell in _tells(text)}
+    assert "ai-vocabulary" in ids
+    assert "significance-inflation" in ids
+
+
+def test_high_density_vocabulary_is_not_a_one_word_blacklist():
+    assert "high-density-of-ai-vocabulary-words" not in {
+        t.id for t in _tells("The key estimate follows from the measured decay rate.")
+    }
+    dense = "The key result offers valuable context across the empirical landscape."
+    assert "high-density-of-ai-vocabulary-words" in {t.id for t in _tells(dense)}
+    assert "ai-vocabulary" in {t.id for t in _tells("We take a deep dive into the result.")}
 
 
 def test_mined_and_handwritten_tells_do_not_double_count():

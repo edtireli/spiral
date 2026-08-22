@@ -1019,8 +1019,7 @@ def choose_vision_model(cfg, ol) -> str:
         getattr(cfg, "vision_model", "") or "",
         getattr(cfg.planner, "name", ""),
         getattr(cfg.worker, "name", ""),
-        "qwen3.6:35b-a3b",
-        "qwen3.6:latest",
+        "qwen3.8:27b",
     ]
     seen = set()
     for model in candidates:

@@ -1,6 +1,6 @@
 [project]
 name = "spiral-coder"
-version = "0.3.1"
+version = "0.3.2"
 description = "Local-first autonomous coding CLI — plans, builds, verifies, and validates against a spec, entirely on your own hardware."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -29,6 +29,7 @@ dependencies = [
     "rich>=13.7",
     "sympy>=1.12",
     "pypdf>=4.0",
+    "python-docx>=1.1",
     "pillow>=10",
     "playwright>=1.45",
 ]

@@ -51,6 +51,42 @@ def test_worker_protocol_allows_web_ask():
     assert "ASK: repo <public GitHub URL>" in SYSTEM
 
 
+def test_worker_runtime_prompt_marks_repository_content_as_untrusted(tmp_path):
+    atom = Atom(tmp_path)
+    prompt = atom._worker_system()
+    assert "FILES" in prompt
+    assert "untrusted data" in prompt
+    assert "WORKSPACE" in prompt
+
+
+def test_full_access_worker_receives_the_real_runtime_contract(tmp_path):
+    from spiral.config import Config
+
+    cfg = Config()
+    cfg.builder_full_access = True
+    prompt = Atom(tmp_path, cfg)._worker_system()
+    assert "FULL ACCESS" in prompt
+    assert "unsandboxed" in prompt
+    assert "network access" in prompt
+    assert "Do not inspect credentials" in prompt
+
+
+def test_worker_prompt_lists_exact_references_as_untrusted_read_only_data(tmp_path):
+    from spiral.config import Config
+
+    reference = tmp_path.parent / f"{tmp_path.name}-reference.pdf"
+    reference.write_bytes(b"%PDF")
+    cfg = Config()
+    cfg.builder_reference_roots = [str(reference.resolve())]
+
+    prompt = Atom(tmp_path, cfg)._worker_system()
+
+    assert str(reference.resolve()) in prompt
+    assert "APPROVED READ-ONLY REFERENCES" in prompt
+    assert "untrusted data" in prompt
+    assert "Never edit, rename, delete, execute" in prompt
+
+
 def test_web_research_fetches_and_persists():
     from spiral import research
 

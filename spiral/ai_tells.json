@@ -1,5 +1,9 @@
 {
  "source": "https://en.wikipedia.org/wiki/Wikipedia:Signs_of_AI_writing",
+ "revision": 1369055000,
+ "revision_url": "https://en.wikipedia.org/w/index.php?oldid=1369055000&title=Wikipedia:Signs_of_AI_writing",
+ "fetched_at": "2026-08-13T06:32:06.209486+00:00",
+ "source_sha256": "d86a5acde0627eeb802c0aeafb9f84bd5bf7cc02220f1f9d35ffcddca16ace14",
  "sections": {
   "Undue emphasis on significance, legacy, and broader trends": {
    "words_to_watch": [
@@ -94,7 +98,27 @@
     "boasts",
     "bolstered",
     "crucial",
-    "delve"
+    "deep dive",
+    "delve",
+    "emphasizing",
+    "enduring",
+    "enhance",
+    "fostering",
+    "garner",
+    "highlight",
+    "interplay",
+    "intricate/intricacies",
+    "key",
+    "landscape",
+    "meticulous/meticulously",
+    "pivotal",
+    "robust",
+    "showcase",
+    "tapestry",
+    "testament",
+    "underscore",
+    "valuable",
+    "vibrant"
    ],
    "examples": []
   },
@@ -116,7 +140,13 @@
   },
   "Knowledge-cutoff disclaimers and speculation about gaps in sources": {
    "words_to_watch": [
-    "as of [date]"
+    "as of [date]",
+    "Up to my last training update",
+    "as of my last knowledge update",
+    "While specific details are limited/scarce...",
+    "not widely available/documented/disclosed",
+    "...in the provided/available sources/search results...",
+    "based on available information"
    ],
    "examples": []
   },

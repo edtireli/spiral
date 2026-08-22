@@ -22,6 +22,7 @@ temptation to let a model grade its own prose is strongest.
 """
 from __future__ import annotations
 
+import math
 import re
 from collections import Counter
 from dataclasses import dataclass, field, asdict
@@ -35,11 +36,16 @@ _TELLS: list[tuple[str, str, re.Pattern]] = [
      re.compile(r"\b(?:stands?|serves?)\s+as\b|\bis\s+a\s+testament\b|"
                 r"\b(?:crucial|pivotal|vital)\s+role\b|\bunderscor\w+\s+the\s+importance\b|"
                 r"\breflects?\s+(?:a\s+)?broader\b|\bmark(?:s|ing)?\s+a\s+(?:pivotal|key|significant)\b|"
+                r"\bmarks?\s+a\s+(?:(?:clear|major|important|key|significant)\s+)?milestone\b|"
+                r"\bprovides?\s+(?:a\s+)?(?:clear|major|important|key|significant)\s+milestone\b|"
+                r"\b(?:provides?|establishes?|defines?)\s+(?:a\s+)?"
+                r"(?:reference\s+point|foundation|basis|baseline)\b|"
+                r"\boutlines?\s+(?:the\s+)?next\s+steps?\b|"
                 r"\bkey\s+turning\s+point\b|\bevolving\s+landscape\b|\bsetting\s+the\s+stage\b", re.I)),
     ("ai-vocabulary",
      "words that cluster heavily in machine prose",
-     re.compile(r"\b(?:delve|delves|delving|tapestry|testament|pivotal|meticulous(?:ly)?|"
-                r"robust(?:ly)?|vibrant|showcas(?:e|es|ing)|underscor(?:e|es|ing)|"
+     re.compile(r"\b(?:deep\s+dive|delve|delves|delving|tapestry|testament|pivotal|meticulous(?:ly)?|"
+                r"robust(?:ly|ness)?|vibrant|showcas(?:e|es|ing)|underscor(?:e|es|ing)|"
                 r"foster(?:s|ing)?|garner(?:s|ed|ing)?|bolster(?:s|ed|ing)?|"
                 r"intricate(?:ly)?|interplay|realm|landscape\s+of|myriad|"
                 r"crucial(?:ly)?|enduring|holistic|nuanced|leverag(?:e|es|ing))\b", re.I)),
@@ -90,7 +96,30 @@ _TELLS: list[tuple[str, str, re.Pattern]] = [
      "the canned 'Despite challenges … future prospects' ending",
      re.compile(r"\bdespite\s+(?:these\s+|its\s+|the\s+)?challenges\b|"
                 r"\bchallenges\s+and\s+future\s+(?:prospects|directions)\b|"
-                r"\bfuture\s+outlook\b", re.I)),
+                r"\bfuture\s+outlook\b|\bopens?\s+(?:up\s+)?promising\s+avenues\b|"
+                r"\bsuggests?\s+(?:clear\s+)?directions?\s+for\s+(?:future|subsequent)\s+"
+                r"(?:work|research)\b|\boutlines?\s+(?:specific\s+)?(?:avenues|directions)\s+"
+                r"for\s+(?:future|subsequent|further)\s+(?:analysis|work|research|study)\b", re.I)),
+    ("formulaic-metadiscourse",
+     "announces that a point matters instead of stating it directly",
+     re.compile(r"\bit\s+is\s+(?:important|worthwhile|essential|crucial)\s+to\s+"
+                r"(?:note|remember|consider|recognize)\b|\bit\s+should\s+be\s+noted\b", re.I)),
+    ("formulaic-need-claim",
+     "canned statement that more work is needed",
+     re.compile(r"\b(?:highlights?|emphasizes?|underscores?)\s+the\s+"
+                r"(?:need|importance)\s+(?:for|of)\b|\bneed\s+for\s+continued\s+"
+                r"(?:investigation|research|study)\b|\b(?:further|additional|continued)\s+"
+                r"(?:work|research|investigation|study)\s+is\s+(?:needed|required)\b|"
+                r"\b(?:requiring|warranting)\s+(?:further|additional|continued)\s+"
+                r"(?:work|research|investigation|study)\b", re.I)),
+    ("formulaic-findings-claim",
+     "generic findings sentence claims contribution or reliability without analysis",
+     re.compile(r"\b(?:these|the)\s+(?:findings|results)\s+"
+                r"(?:contribute\s+to\s+(?:the\s+)?field|(?:confirm|demonstrate|establish)\s+"
+                r"(?:the\s+)?(?:[\w’'-]+\s+){0,5}(?:reliability|robustness|importance)|"
+                r"(?:indicate|show|suggest)\s+[^.!?]{0,70}?\bfunctions?\s+reliably)\b|"
+                r"\b(?:the\s+)?(?:experimental\s+)?paradigm\s+"
+                r"(?:demonstrates?\s+reliability|yields?\s+reliable\s+data)\b", re.I)),
     ("rule-of-three",
      "three-item adjective runs used for false comprehensiveness",
      re.compile(r"\b(\w+ly|\w+ive|\w+ic|\w+al|\w+ous)\s*,\s*(\w+ly|\w+ive|\w+ic|\w+al|\w+ous)\s*,"
@@ -161,7 +190,10 @@ _STOP = {
 
 def _strip_tex(text: str) -> str:
     """Prose only: drop math, commands and comments so counts describe writing."""
-    t = re.sub(r"(?<!\\)%.*", "", text or "")
+    # Only a line whose first non-space character is ``%`` is unambiguously a LaTeX
+    # comment here.  Treating every percent sign as a comment silently erased the rest
+    # of ordinary Markdown sentences after values such as ``18.4%``.
+    t = re.sub(r"(?m)^[ \t]*%(?!%).*$", "", text or "")
     t = re.sub(r"\\begin\{(equation|align|gather|multline|eqnarray)\*?\}.*?"
                r"\\end\{\1\*?\}", " ", t, flags=re.S)
     t = re.sub(r"\$\$.*?\$\$|\$[^$\n]*\$", " ", t, flags=re.S)
@@ -376,6 +408,13 @@ def ai_tells(text: str, *, per_1k: bool = True) -> list[Tell]:
         # hand-written pattern it duplicates found nothing.
         if slug in seen_ids or _MINED_ALIASES.get(slug) in seen_ids:
             continue
+        # Wikipedia calls this a HIGH-DENSITY signal and explicitly says one or two
+        # such words may be coincidental. Generic entries such as "key", "valuable",
+        # and "landscape" must not become a one-word blacklist. The hand-written
+        # high-signal vocabulary pattern above still catches a lone "delve", "deep
+        # dive", or "stands as a testament".
+        if slug == "high-density-of-ai-vocabulary-words" and len(list(rx.finditer(prose))) < 3:
+            continue
         got = _collect(rx, prose, words, per_1k)
         if got:
             out.append(Tell(slug, name.lower(), got[0], got[1]))
@@ -395,6 +434,18 @@ def ai_score(text: str) -> float:
     return round(sum(t.count for t in ai_tells(text)), 2)
 
 
+def ai_raw_score(text: str) -> int:
+    """Count matched tell occurrences without length normalisation.
+
+    Density is useful for reporting documents of different sizes, but it is unsafe as
+    a rewrite objective: a model can lower a per-1000-word score simply by padding the
+    paragraph.  Candidate selection therefore uses this raw count and reports density
+    only after the edit.
+    """
+
+    return int(round(sum(t.count for t in ai_tells(text, per_1k=False))))
+
+
 @dataclass
 class Gap:
     metric: str
@@ -407,6 +458,72 @@ class Gap:
         verb = "raise" if self.direction == "raise" else "lower"
         return (f"{self.metric}: {self.value} — {verb} toward the field band "
                 f"[{self.low}, {self.high}]")
+
+
+def template_distance(text: str, template: StyleTemplate | None) -> float:
+    """Normalised distance outside a corpus style band (zero means in-band).
+
+    Each metric contributes its distance to the nearest quartile boundary, scaled by
+    the observed band width.  Averaging prevents a template with more populated metrics
+    from receiving a larger score merely because it has more columns.
+    """
+
+    if template is None or not template.sample_size:
+        return 0.0
+    metrics = measure(text)
+    metric_distances: list[float] = []
+    for name, bounds in template.targets.items():
+        if not isinstance(bounds, (list, tuple)) or len(bounds) != 3:
+            continue
+        lo, median, hi = (float(bounds[0]), float(bounds[1]), float(bounds[2]))
+        value = getattr(metrics, name, None)
+        if value is None:
+            continue
+        # Degenerate corpora are common in tests and small manual samples.  Scale by
+        # the median (then one) rather than turning a zero-width band into infinity.
+        scale = max(abs(hi - lo), abs(median) * 0.25, 1.0)
+        if value < lo:
+            metric_distances.append((lo - value) / scale)
+        elif value > hi:
+            metric_distances.append((value - hi) / scale)
+        else:
+            metric_distances.append(0.0)
+
+    components: list[float] = []
+    if metric_distances:
+        components.append(sum(metric_distances) / len(metric_distances))
+
+    vocab = [str(word).lower() for word in (template.vocabulary or [])
+             if str(word).strip()][:24]
+    if vocab:
+        held = set(_WORD.findall(_strip_tex(text or "").lower()))
+        word_count = max(1, len(_WORD.findall(_strip_tex(text or ""))))
+        # A paragraph need not recite a field glossary; a full paper should use several
+        # of the corpus's highest-consensus terms.  Cap the target to prevent stuffing.
+        expected = min(len(vocab), min(4, max(1, int(math.log2(word_count / 80 + 1)) + 1)))
+        hits = sum(1 for word in vocab if word in held)
+        components.append(max(0.0, expected - hits) / expected)
+
+    expected_sections = [re.sub(r"\s+", " ", str(section)).strip().casefold()
+                         for section in (template.section_order or []) if str(section).strip()]
+    if expected_sections:
+        actual_sections = [
+            re.sub(r"\s+", " ", name).strip().casefold()
+            for name in (
+                _SECTION.findall(text or "")
+                + re.findall(r"(?m)^\s{0,3}#{1,6}\s+([^\n#].*?)\s*$", text or "")
+            )
+        ]
+        # Longest common subsequence measures both missing headings and the wrong arc.
+        row = [0] * (len(actual_sections) + 1)
+        for expected in expected_sections:
+            previous = row[:]
+            for j, actual in enumerate(actual_sections, 1):
+                row[j] = (previous[j - 1] + 1 if expected == actual
+                          else max(previous[j], row[j - 1]))
+        components.append(1.0 - row[-1] / len(expected_sections))
+
+    return round(sum(components) / max(1, len(components)), 6)
 
 
 def score_against(text: str, template: StyleTemplate) -> dict:
@@ -423,14 +540,30 @@ def score_against(text: str, template: StyleTemplate) -> dict:
         elif val > hi:
             gaps.append(Gap(name, val, lo, hi, "lower"))
     tells = ai_tells(text)
-    have = {re.sub(r"\s+", " ", s).strip().title() for s in _SECTION.findall(text or "")}
+    section_names = (_SECTION.findall(text or "")
+                     + re.findall(r"(?m)^\s{0,3}#{1,6}\s+([^\n#].*?)\s*$", text or ""))
+    have = {re.sub(r"\s+", " ", s).strip().title() for s in section_names}
     missing = [s for s in (template.section_order or []) if s not in have]
+    vocab = [str(word).lower() for word in (template.vocabulary or [])
+             if str(word).strip()][:24]
+    held = set(_WORD.findall(_strip_tex(text or "").lower()))
+    word_count = max(1, len(_WORD.findall(_strip_tex(text or ""))))
+    expected_vocab = min(len(vocab), min(4, max(1, int(math.log2(word_count / 80 + 1)) + 1)))
+    vocab_hits = [word for word in vocab if word in held]
+    gap_sentences = [g.sentence() for g in gaps]
+    if vocab and len(vocab_hits) < expected_vocab:
+        gap_sentences.append(
+            "field vocabulary: uses " + str(len(vocab_hits)) + " of the expected "
+            + str(expected_vocab) + " high-consensus terms — raise coverage with relevant "
+            "corpus terms only where the claims warrant them"
+        )
     return {
         "metrics": m.as_dict(),
-        "gaps": [g.sentence() for g in gaps],
+        "gaps": gap_sentences,
         "missing_sections": missing,
+        "field_vocabulary_hits": vocab_hits,
         "ai_tells": [{"id": t.id, "per_1k": t.count, "why": t.explanation,
                       "examples": t.examples} for t in tells],
         "ai_score": round(sum(t.count for t in tells), 2),
-        "in_band": not gaps,
+        "in_band": not gap_sentences and not missing,
     }

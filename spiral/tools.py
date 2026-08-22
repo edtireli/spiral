@@ -22,6 +22,47 @@ DENY = (
 _SKIP_DIRS = {".git", "__pycache__", ".venv", "venv", "node_modules", "dist", "build"}
 
 
+class WorkspacePathError(ValueError):
+    """A model-supplied path did not name an object inside the workspace."""
+
+
+def resolve_workspace_path(root: str | Path, path: str | Path) -> Path:
+    """Return a canonical workspace-contained path or raise WorkspacePathError.
+
+    Reject ``..`` even when it would happen to resolve back inside the workspace:
+    accepting it makes policy depend on surrounding path components.  Resolving
+    the joined path also follows every existing symlink component, which closes
+    both file and directory symlink escapes while still allowing symlinks whose
+    targets remain inside the workspace.
+    """
+    try:
+        base = Path(root).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise WorkspacePathError(f"invalid workspace root: {exc}") from exc
+    if not base.is_dir():
+        raise WorkspacePathError("workspace root is not a directory")
+
+    try:
+        raw = Path(path)
+    except (TypeError, ValueError) as exc:
+        raise WorkspacePathError(f"invalid path: {exc}") from exc
+    if not str(path):
+        raise WorkspacePathError("path is empty")
+    if raw.is_absolute():
+        raise WorkspacePathError("absolute paths are not allowed")
+    if any(part == ".." for part in raw.parts):
+        raise WorkspacePathError("parent traversal is not allowed")
+
+    try:
+        resolved = (base / raw).resolve(strict=False)
+        resolved.relative_to(base)
+    except ValueError as exc:
+        raise WorkspacePathError("path resolves outside the workspace") from exc
+    except (OSError, RuntimeError) as exc:
+        raise WorkspacePathError(f"path cannot be resolved safely: {exc}") from exc
+    return resolved
+
+
 @dataclass
 class RunResult:
     cmd: str
@@ -84,24 +125,38 @@ def run(cmd: str, cwd: str | Path, timeout: int = 120, on_line=None,
 
 
 def read_file(root: str | Path, path: str, start: int | None = None, end: int | None = None) -> str:
-    fp = Path(root) / path
+    try:
+        fp = resolve_workspace_path(root, path)
+    except WorkspacePathError as exc:
+        return f"(invalid path: {exc})"
     if not fp.is_file():
         return f"(no such file: {path})"
-    lines = fp.read_text(errors="replace").splitlines()
+    try:
+        lines = fp.read_text(errors="replace").splitlines()
+    except OSError as exc:
+        return f"(cannot read file: {path}: {exc})"
     s = (start - 1) if start else 0
     e = end if end else len(lines)
     return "\n".join(f"{s + 1 + i}\t{ln}" for i, ln in enumerate(lines[s:e]))
 
 
 def list_dir(root: str | Path, path: str = ".") -> str:
-    base = Path(root) / path
+    try:
+        base = resolve_workspace_path(root, path)
+    except WorkspacePathError as exc:
+        return f"(invalid path: {exc})"
     if not base.is_dir():
         return f"(no such dir: {path})"
     out = []
-    for p in sorted(base.iterdir()):
-        if p.name in _SKIP_DIRS or p.name.startswith("."):
-            continue
-        out.append(p.name + ("/" if p.is_dir() else ""))
+    try:
+        for p in sorted(base.iterdir()):
+            if p.name in _SKIP_DIRS or p.name.startswith("."):
+                continue
+            # Do not follow a child symlink merely to decorate it with '/'.  The
+            # entry may point outside the workspace; listing its name is enough.
+            out.append(p.name + ("/" if not p.is_symlink() and p.is_dir() else ""))
+    except OSError as exc:
+        return f"(cannot list dir: {path}: {exc})"
     return "\n".join(out) or "(empty)"
 
 

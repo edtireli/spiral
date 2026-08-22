@@ -22,9 +22,13 @@ from spiral.theme import CLAY, make_console
 
 # measured/estimated f16 KV bytes per token (both K and V, all layers)
 KV_CATALOG = {
-    "qwen3.6:latest": 100_000,   # 36B-A3B MoE
-    "qwen3:30b-a3b": 98_000,
-    "qwen3.6:27b": 245_000,      # dense
+    # hybrid attention: only 16 of 64 layers carry KV (4 KV heads × 256 dim),
+    # so the dense 27b costs ~4× less cache per token than the old 3.6 dense
+    "qwen3.8:27b": 66_000,
+    # the abliterated seat is the same architecture, so the same KV per token.
+    # Thinking is a per-request toggle on this one model, not a second model, so
+    # the high- and low-thinking lanes share this entry.
+    "qwen3.8:27b-uncensored": 66_000,
 }
 KV_DEFAULT = 160_000
 QFACTOR = {"f16": 1.0, "": 1.0, "q8_0": 0.5, "q4_0": 0.25}

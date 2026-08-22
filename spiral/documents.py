@@ -14,8 +14,13 @@ preamble, macros and math.
 from __future__ import annotations
 
 import re
+import shutil
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
+
+SPIRAL_CLAY_HEX = "D97757"
+SPIRAL_CLAY_RGB = (0xD9, 0x77, 0x57)
 
 # LaTeX constructs whose contents must never be handed to a prose rewriter
 _TEX_PROTECTED = re.compile(
@@ -58,6 +63,25 @@ class Document:
     def with_replacements(self, replacements: dict) -> str:
         """Full text with ``{index: new_text}`` applied — used for measuring the result
         before anything is written to disk."""
+        if self.kind == "tex" and isinstance(self._backing, str):
+            # TeX whitespace is usually harmless, until it is not: a blank line inside a
+            # multiline \title{...}, \caption{...}, macro argument, or moving argument
+            # creates a paragraph token and can make the project uncompilable. Splice
+            # replacements into the exact raw source instead of rejoining segments.
+            raw = self._backing
+            cursor = 0
+            chunks = []
+            for segment in self.segments:
+                position = raw.find(segment.text, cursor)
+                if position < 0:
+                    raise RuntimeError(
+                        f"cannot locate TeX segment {segment.index} in original source"
+                    )
+                chunks.append(raw[cursor:position])
+                chunks.append(replacements.get(segment.index, segment.text))
+                cursor = position + len(segment.text)
+            chunks.append(raw[cursor:])
+            return "".join(chunks)
         out = []
         for s in self.segments:
             out.append(replacements.get(s.index, s.text))
@@ -109,7 +133,7 @@ def _read_tex(path: Path) -> Document:
         idx += 1
         cursor = m.end()
     add_prose(raw[cursor:])
-    return Document(path, "tex", segments)
+    return Document(path, "tex", segments, _backing=raw)
 
 
 def _read_docx(path: Path) -> Document:
@@ -124,7 +148,18 @@ def _read_docx(path: Path) -> Document:
         style = (para.style.name if para.style is not None else "") or ""
         # headings and captions carry meaning in few words; rewriting them adds risk
         # without benefit, so they pass through untouched
-        editable = not re.match(r"(?i)heading|title|caption|toc|quote", style)
+        structural = bool(re.search(
+            r"(?i)(?:^|\s)(?:heading|title|caption|toc|quote)(?:\s|$)", style))
+        # python-docx exposes only part of Word's inline object model. Replacing a
+        # paragraph that contains fields, hyperlinks, review markup, bookmarks, or
+        # drawings can orphan relationships or silently erase reviewer intent. Such
+        # paragraphs remain measurable but are never handed to the rewriter.
+        complex_inline = any(para._p.xpath(f".//w:{tag}") for tag in (
+            "hyperlink", "fldChar", "instrText", "bookmarkStart", "bookmarkEnd",
+            "drawing", "object", "sdt", "commentRangeStart", "commentRangeEnd",
+            "commentReference", "ins", "del",
+        ))
+        editable = not structural and not complex_inline
         segments.append(Segment(i, para.text, editable=editable,
                                 kind=style.lower() or "paragraph"))
     return Document(path, "docx", segments, _backing=doc)
@@ -159,6 +194,29 @@ def read_document(path: str | Path) -> Document:
     return _read_flat(p, "markdown")
 
 
+def mark_tex_change(text: str) -> str:
+    """Mark substantive TeX edits with Spiral's clay accent."""
+
+    return "{\\color{SpiralClay}" + str(text) + "}"
+
+
+def ensure_tex_change_color(text: str) -> str:
+    """Declare the review color in a copied TeX document, never the source."""
+
+    if r"\definecolor{SpiralClay}" in text:
+        return text
+    definition = rf"\definecolor{{SpiralClay}}{{HTML}}{{{SPIRAL_CLAY_HEX}}}"
+    xcolor = re.search(r"(?m)^\s*\\usepackage(?:\[[^\]]*\])?\{xcolor\}\s*$", text)
+    if xcolor:
+        return text[:xcolor.end()] + "\n" + definition + text[xcolor.end():]
+    documentclass = re.search(r"(?m)^\s*\\documentclass(?:\[[^\]]*\])?\{[^}]+\}\s*$",
+                              text)
+    declaration = "\\usepackage{xcolor}\n" + definition
+    if documentclass:
+        return text[:documentclass.end()] + "\n\n" + declaration + text[documentclass.end():]
+    return declaration + "\n" + text
+
+
 # ── writing ──────────────────────────────────────────────────────────────────
 def write_document(doc: Document, replacements: dict, out_path: str | Path) -> Path:
     """Write the edited document, preserving its native structure.
@@ -167,10 +225,12 @@ def write_document(doc: Document, replacements: dict, out_path: str | Path) -> P
     rewriter never touched survive; a .tex is reassembled with its preamble and math
     exactly as they were. A PDF cannot be faithfully rewritten, so its edit is emitted
     as markdown and that is stated rather than pretended otherwise."""
-    out = Path(out_path)
+    out = require_distinct_output(doc.path, out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
 
     if doc.kind == "docx" and doc._backing is not None:
+        from docx.shared import RGBColor
+
         backing = doc._backing
         for seg_index, new_text in replacements.items():
             if seg_index >= len(backing.paragraphs):
@@ -178,22 +238,133 @@ def write_document(doc: Document, replacements: dict, out_path: str | Path) -> P
             para = backing.paragraphs[seg_index]
             if not para.runs:
                 para.text = new_text
+                if para.runs:
+                    para.runs[0].font.color.rgb = RGBColor(*SPIRAL_CLAY_RGB)
                 continue
             # keep the first run's formatting, drop the rest — the paragraph keeps its
             # font/style instead of reverting to document defaults
             para.runs[0].text = new_text
+            para.runs[0].font.color.rgb = RGBColor(*SPIRAL_CLAY_RGB)
             for run in para.runs[1:]:
                 run.text = ""
         backing.save(str(out))
         return out
 
-    out.write_text(doc.with_replacements(replacements))
+    marked = replacements
+    if doc.kind == "tex" and replacements:
+        marked = {index: mark_tex_change(value) for index, value in replacements.items()}
+        out.write_text(ensure_tex_change_color(doc.with_replacements(marked)))
+        return out
+    out.write_text(doc.with_replacements(marked))
     return out
+
+
+def require_distinct_output(source: str | Path, output: str | Path) -> Path:
+    """Reject every filesystem alias of the source, including symlinks/hard links.
+
+    This is the last line of defence beneath the CLI.  A caller may choose any output
+    name, but no rewrite operation is ever allowed to target the input inode.
+    """
+
+    source_path = Path(source)
+    output_path = Path(output)
+    if source_path.resolve() == output_path.resolve():
+        raise ValueError("output must be a copy; it cannot be the source document")
+    if output_path.exists():
+        try:
+            if source_path.samefile(output_path):
+                raise ValueError(
+                    "output must be a copy; it aliases the source document"
+                )
+        except FileNotFoundError:
+            pass
+    return output_path
+
+
+_PROJECT_CACHE_DIRS = {
+    ".git", ".lake", ".mypy_cache", ".pytest_cache", ".spiral", ".venv",
+    "__pycache__", "node_modules", "venv",
+}
+_LATEX_BUILD_SUFFIXES = {
+    ".aux", ".bbl", ".bcf", ".blg", ".fdb_latexmk", ".fls", ".log",
+    ".out", ".run.xml", ".synctex.gz", ".toc",
+}
+
+
+def _unique_project_copy_root(source_root: Path) -> Path:
+    base = source_root.with_name(source_root.name + "_spiral")
+    candidate = base
+    counter = 2
+    while candidate.exists():
+        candidate = base.with_name(f"{base.name}-{counter}")
+        counter += 1
+    return candidate
+
+
+def prepare_tex_project_copy(source: str | Path) -> Path:
+    """Copy a TeX source project and return the copied main-file path.
+
+    Generated dependency/cache trees are omitted, but source code, bibliography files,
+    figures, data, included TeX, and project documentation are copied.  The destination
+    is always new, so an earlier edited project is never silently overwritten.
+    """
+
+    source = Path(source).resolve()
+    source_root = source.parent
+    destination = _unique_project_copy_root(source_root)
+
+    def ignore(directory: str, names: list[str]) -> set[str]:
+        directory_path = Path(directory)
+        omitted = {name for name in names if name in _PROJECT_CACHE_DIRS}
+        if directory_path.resolve() == source_root:
+            for name in names:
+                candidate = directory_path / name
+                if candidate.is_file() and candidate.stem == source.stem:
+                    suffix = "".join(candidate.suffixes[-2:])
+                    if candidate.suffix in _LATEX_BUILD_SUFFIXES or suffix in _LATEX_BUILD_SUFFIXES:
+                        omitted.add(name)
+                if name == source.with_suffix(".pdf").name:
+                    omitted.add(name)
+        return omitted
+
+    shutil.copytree(source_root, destination, ignore=ignore, copy_function=shutil.copy2)
+    copied = destination / source.name
+    if not copied.is_file():
+        raise RuntimeError(f"TeX project copy is missing {source.name}")
+    return copied
+
+
+def compile_tex_copy(path: str | Path, *, timeout: int = 240) -> dict:
+    """Compile a copied TeX main file without shell escape and return an audit record."""
+
+    path = Path(path).resolve()
+    latexmk = shutil.which("latexmk")
+    if not latexmk:
+        return {"available": False, "ok": False, "error": "latexmk is unavailable"}
+    try:
+        result = subprocess.run(
+            [latexmk, "-pdf", "-interaction=nonstopmode", "-halt-on-error", path.name],
+            cwd=path.parent, text=True, capture_output=True, timeout=timeout,
+            check=False,
+        )
+    except Exception as exc:
+        return {
+            "available": True, "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    combined = (result.stdout or "") + "\n" + (result.stderr or "")
+    return {
+        "available": True, "ok": result.returncode == 0,
+        "returncode": result.returncode,
+        "pdf": str(path.with_suffix(".pdf")) if path.with_suffix(".pdf").is_file() else "",
+        "tail": combined[-5000:],
+        "error": "" if result.returncode == 0 else "LaTeX compilation failed",
+    }
 
 
 def default_output_path(path: str | Path) -> Path:
     """Where an edit lands by default: alongside the original, never over it."""
     p = Path(path)
     if p.suffix.lower() == ".pdf":
-        return p.with_suffix(".edited.md")       # a PDF edit is emitted as markdown
-    return p.with_name(f"{p.stem}.edited{p.suffix or '.txt'}")
+        return p.with_name(f"{p.stem}_spiral.md")  # a PDF edit is emitted as markdown
+    return p.with_name(f"{p.stem}_spiral{p.suffix or '.txt'}")
