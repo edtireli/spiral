@@ -109,6 +109,19 @@ _NODE_PACKAGE = re.compile(
 _BREW_FORMULA = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.+-]{0,100}$")
 
 
+def shell_executable() -> str:
+    """Return a real POSIX shell on this host.
+
+    macOS always ships zsh, while the Linux runner (and many minimal Linux
+    installations) does not.  Commands are deliberately limited to portable
+    shell syntax, so bash/sh are valid fallbacks instead of a hidden platform
+    dependency.
+    """
+    if sys.platform == "darwin" and Path("/bin/zsh").is_file():
+        return "/bin/zsh"
+    return shutil.which("bash") or shutil.which("sh") or "/bin/sh"
+
+
 def scrubbed_environment(
     workspace: str | Path,
     extra: dict | None = None,
@@ -393,7 +406,7 @@ class CommandBroker:
         # is the only thing standing. Reported as sandboxed=False so the run log
         # is honest about what it was.
         if full_access:
-            return ["/bin/zsh", "-lc", command], False
+            return [shell_executable(), "-lc", command], False
         # Workspace confinement is an enforcement mode, not a hint from a caller.
         # Older local-model call sites passed allow_host_read=True because prompts
         # stayed on-device; that still exposed SSH keys and every other home file to
@@ -474,7 +487,7 @@ class CommandBroker:
                 *[_reference_write_deny_rule(path) for path in self.reference_roots],
             ]
             return [
-                sandbox, "-p", " ".join(profile), "/bin/zsh", "-lc", command,
+                sandbox, "-p", " ".join(profile), shell_executable(), "-lc", command,
             ], True
         bwrap = shutil.which("bwrap")
         if bwrap and not allow_network:
