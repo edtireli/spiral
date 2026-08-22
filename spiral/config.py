@@ -1,11 +1,15 @@
 """Configuration — backend is a swappable seam; local-first defaults.
 
 Model strategy (32 GB unified memory, hardware-honest):
-  - ONE resident qwen3.6:35b-a3b model for planning, reading, writing, vision and
-    ordinary criticism. Thinking is toggled by role; sharing weights avoids a
-    23 GB ↔ 17 GB model swap in the middle of every research round.
-  - qwen3.6:27b (dense) is the ESCALATION model only: swapped in when a task
-    genuinely stalls, where slower-but-denser reasoning can earn its load time.
+  - ONE resident qwen3.8:27b (dense, hybrid-attention, vision-capable) for
+    planning, reading, writing and vision. Thinking is toggled by role — same
+    weights, so plan and build never pay a model swap. The hybrid layout (16 of
+    64 layers full attention) keeps KV tiny, so context is cheap on 32 GB.
+  - ESCALATION is the same model with thinking ON. Thinking is a per-request
+    flag, not another set of weights, so the lanes share one name and each
+    attempt records the lane it ran in for the route ledger to read.
+  - The judging seats (critic, research auditor) are gemma3:12b: a model will
+    not fail its own family's work, so criticism stays a different family.
 """
 from __future__ import annotations
 
@@ -25,32 +29,47 @@ class Config:
     provider: str = "ollama"
     base_url: str = "http://localhost:11434"
 
-    # Conductor/worker: qwen3.6:latest = the 3.6-gen 36B MoE (A3B class) — two
-    # generations newer than qwen3:30b-a3b at the same ~3B-active speed. RAM:
-    # 23GB weights + ~2.5GB KV @24k → ~25.5GB footprint; num_ctx trimmed from
-    # 32k to keep headroom for gradle + macOS on 32GB. If the first run swaps,
-    # fall back to qwen3:30b-a3b here.
+    # Conductor/worker: qwen3.8:27b = the 3.8-gen 27B dense VLM (Q4_K_M GGUF).
+    # RAM: ~17GB weights + mmproj + small hybrid KV @24k → ~19GB footprint,
+    # inside the Metal working set with headroom for gradle + macOS on 32GB.
+    # Slower per token than the old 3.6 MoE (~3B active), but a full generation
+    # stronger on coding benchmarks — verification, not speed, is the bottleneck.
     planner: ModelSpec = field(
-        default_factory=lambda: ModelSpec("qwen3.6:latest", num_ctx=24576, think=True)
+        default_factory=lambda: ModelSpec("qwen3.8:27b", num_ctx=24576, think=True)
     )
     worker: ModelSpec = field(
-        default_factory=lambda: ModelSpec("qwen3.6:latest", num_ctx=24576, think=False)
+        default_factory=lambda: ModelSpec("qwen3.8:27b", num_ctx=24576, think=False)
     )
+    # The retry lane is the SAME model thinking harder, because thinking is a
+    # per-request flag, not a different set of weights. A second ollama name for
+    # it would be one model wearing two hats — the ledger tells the lanes apart
+    # by the `lane` field it records, not by guessing from the model name.
     escalation: ModelSpec = field(
-        default_factory=lambda: ModelSpec("qwen3.6:27b", num_ctx=16384, think=False)
+        default_factory=lambda: ModelSpec("qwen3.8:27b", num_ctx=16384, think=True)
     )
-    # Ordinary critic shares the resident MoE weights. Model diversity comes from
-    # the optional API critic (--boost/--api) or the dense escalation lane, rather
-    # than paying a model swap for every corpus/proposal/referee call.
+    # Ordinary critic is a DIFFERENT FAMILY on purpose: the 2026-07-27 A/B showed
+    # a same-family critic rubber-stamps (six passes on a zero-mapping plan);
+    # gemma3:12b found 8 real defects on the identical input in less time.
+    # Thinking stays ON — llm.py retries without `think` for the models that
+    # reject the toggle, so the role keeps its intent and gemma still answers.
     critic: ModelSpec = field(
-        default_factory=lambda: ModelSpec("qwen3.6:latest", num_ctx=24576, think=True)
+        default_factory=lambda: ModelSpec("gemma3:12b", num_ctx=24576, think=True)
     )
-    # Independent research adjudicator. CLI API tiers intentionally do not remap
-    # this role: proposal/basis/scope reviews should not become self-review merely
-    # because planner, worker, and critic all use one frontier provider.
+    # Independent research adjudicator. Its contract is independence from the
+    # PROVIDER, not the family: CLI API tiers deliberately leave it local so a
+    # frontier worker never grades its own proposals. It must also stay a
+    # different model from `critic` — research_loop collapses the audit into
+    # the critic lane when the two names match, which silently costs the
+    # escalated re-check of basis and claim scope.
     research_auditor: ModelSpec = field(
-        default_factory=lambda: ModelSpec("qwen3.6:27b", num_ctx=16384, think=False)
+        default_factory=lambda: ModelSpec("qwen3.8:27b", num_ctx=16384, think=True)
     )
+
+    # The abliterated seat, used only when a run asks for it with --uncensored.
+    # Never a default: refusal removal costs some instruction-following precision,
+    # and the judging seats stay stock so a run is not graded by the model whose
+    # checks were removed.
+    uncensored_model: str = "qwen3.8:27b-uncensored"
 
     def spec_for(self, model_name: str) -> ModelSpec:
         """The ModelSpec whose name matches — so per-model num_ctx follows the
@@ -116,6 +135,16 @@ class Config:
     builder_browser_budget: int = 8
     builder_shell_timeout: int = 300
     builder_require_sandbox: bool = True
+    # Exact, user-approved files/directories that Builder may inspect as
+    # untrusted, read-only reference material.  This is deliberately runtime-only:
+    # Config.load() never grants persistent paths from config.json.
+    builder_reference_roots: list[str] = field(default_factory=list)
+    # Full-access build: the model's shell reaches the whole machine — writes any
+    # path, network on, may modify spiral's own installed source — with only the
+    # catastrophic backstop plus the separately approved Git-action boundary left
+    # standing.
+    # Off by default and never implied; a run turns it on with --full-access.
+    builder_full_access: bool = False
     vision_model: str = ""
     visual_review: bool = True
     visual_review_url: str = ""
@@ -236,6 +265,9 @@ class Config:
                 if spec.name in overlay.get("num_ctx", {}):
                     spec.num_ctx = int(overlay["num_ctx"][spec.name])
             cfg.base_url = os.environ.get("SPIRAL_BASE_URL", overlay.get("base_url", cfg.base_url))
+            cfg.uncensored_model = os.environ.get(
+                "SPIRAL_UNCENSORED_MODEL",
+                overlay.get("uncensored_model", cfg.uncensored_model))
             cfg.extra_gate = overlay.get("extra_gate", cfg.extra_gate)
             cfg.spiral_style = os.environ.get("SPIRAL_STYLE", overlay.get("style", cfg.spiral_style))
             cfg.worker_max_tokens = int(overlay.get("worker_max_tokens", cfg.worker_max_tokens))
@@ -270,6 +302,8 @@ class Config:
                 "builder_shell_timeout", cfg.builder_shell_timeout))
             cfg.builder_require_sandbox = bool(overlay.get(
                 "builder_require_sandbox", cfg.builder_require_sandbox))
+            cfg.builder_full_access = bool(overlay.get(
+                "builder_full_access", cfg.builder_full_access))
             cfg.vision_model = os.environ.get("SPIRAL_VISION", overlay.get("vision_model", cfg.vision_model))
             cfg.visual_review = bool(overlay.get("visual_review", cfg.visual_review))
             cfg.visual_review_url = os.environ.get(

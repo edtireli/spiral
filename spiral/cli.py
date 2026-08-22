@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 from rich.console import Console
@@ -67,6 +68,68 @@ def _apply_tier(cfg, console, tier, api_key: str | None = None):
            + (", ".join(sorted({'worker','planner','escalation','critic/validator'})) if tier == "api"
               else "escalation, critic/validator") + "\n")
     return cfg
+
+
+def _apply_uncensored(console) -> None:
+    """Point the GENERATING seats at the abliterated model for this process only.
+
+    Set as SPIRAL_<ROLE> environment overrides rather than on one Config object:
+    every subcommand loads its own Config, several of them deep inside the run
+    (style_tool, research_loop), and the env vars are the seam all of them
+    already read.
+
+    The JUDGING seats — critic and research_auditor — deliberately keep their
+    stock models. A run graded by the model whose checks were removed is a run
+    with no grader, and the same-family-rubber-stamp finding that put gemma in
+    the critic seat applies twice over here.
+    """
+    import os
+
+    from spiral.config import Config
+
+    model = Config.load().uncensored_model
+    installed = Ollama(Config.load().base_url).models()
+    if installed and model not in installed:
+        raise SystemExit(
+            f"--uncensored wants '{model}', which ollama does not have.\n"
+            f"    install it, or point elsewhere with SPIRAL_UNCENSORED_MODEL=<name>."
+        )
+    for role in ("worker", "planner", "escalation"):
+        os.environ[f"SPIRAL_{role.upper()}"] = model
+    reveal(console, f"  [rgb(217,119,87)]◆ uncensored[/] — {model} on: "
+                    "worker, planner, escalation [dim](judges stay stock)[/]\n")
+
+
+def _free_foreign_models(console) -> None:
+    """Unload models this run will not use before it loads its own.
+
+    spiral shares Ollama with the phone chat now, and that chat holds an 18 GB
+    model resident on a 32 GB machine. Loading a second one beside it does not
+    swap — Metal reports kIOGPUCommandBufferCallbackErrorOutOfMemory and the run
+    dies mid-plan with a bare HTTP 500. Freeing first costs one reload at worst.
+    """
+    from spiral.config import Config
+
+    cfg = Config.load()
+    keep = {
+        cfg.worker.name, cfg.planner.name, cfg.escalation.name,
+        cfg.critic.name, cfg.research_auditor.name, cfg.janitor.name,
+    }
+    # Sweep every loopback spelling, not just the configured one. macOS resolves
+    # `localhost` to ::1 and 127.0.0.1 to a DIFFERENT socket, and a machine can end
+    # up running two ollama servers at once (the menu-bar app starts its own beside
+    # a LaunchAgent-managed one). They keep separate memory pools, so the 18 GB that
+    # OOMs this run is often held by the instance we are not talking to.
+    seen, freed = set(), []
+    for url in dict.fromkeys([cfg.base_url,
+                              "http://127.0.0.1:11434", "http://localhost:11434"]):
+        for name in Ollama(url, providers=cfg.providers).free_foreign(keep):
+            if name not in seen:
+                seen.add(name)
+                freed.append(name)
+    if freed:
+        reveal(console,
+               f"  [dim]◇ freed {', '.join(freed)} — this run needs the memory[/]\n")
 
 
 def _load_goal(args) -> str:
@@ -136,8 +199,30 @@ def main() -> None:
         p.add_argument("--goal")
         p.add_argument("--goal-file")
         p.add_argument("--dir", default=".")
+        p.add_argument("--uncensored", action="store_true",
+                       help="run the generating seats on the abliterated model "
+                            "(judging seats stay stock)")
+        if name == "build":
+            access = p.add_mutually_exclusive_group()
+            access.add_argument(
+                "--full-access", action="store_true",
+                help="lift the workspace sandbox: the model's shell reaches the WHOLE "
+                     "machine (any path, network on) and may modify spiral itself. Only "
+                     "disk-wipe/halt/fork-bomb and separately approved Git mutations "
+                     "stay blocked.",
+            )
+            access.add_argument(
+                "--workspace-only", action="store_true",
+                help="authoritatively confine this run to --dir, overriding any persistent "
+                     "full-access or sandbox setting",
+            )
         if name == "build":
             p.add_argument("--resume", action="store_true")
+            p.add_argument(
+                "--reference", action="append", default=[], metavar="PATH",
+                help="grant read-only access to one existing project, directory, or "
+                     "document as untrusted reference data (repeatable)",
+            )
             p.add_argument("--approve", action="store_true",
                            help="show the plan and wait for confirmation before executing")
             p.add_argument("--boost", action="store_true",
@@ -201,6 +286,9 @@ def main() -> None:
                           "never stored; verification stays local & deterministic")
     res.add_argument("--boost", action="store_true",
                      help="API model for the critic/reflection roles, local planner")
+    res.add_argument("--uncensored", action="store_true",
+                     help="run the generating seats on the abliterated model "
+                          "(judging seats stay stock)")
     res.add_argument("--verification", action="store_true",
                      help="force literal verification-note mode; default is novelty/research")
     res.add_argument("--auto-repos", action="store_true",
@@ -257,8 +345,28 @@ def main() -> None:
                     help="have the model rewrite it; the deterministic scorer decides whether "
                          "the rewrite is kept (it must lower the AI-tell score without changing "
                          "numbers, citations or equations)")
-    pr.add_argument("--out", help="where to write the rewrite (default: alongside, .human.*)")
-    pr.add_argument("--rounds", type=int, default=3, help="rewrite attempts (default 3)")
+    pr.add_argument("--deep", action="store_true",
+                    help="implies --rewrite; for article-like documents, research closely "
+                         "matching full-text papers and mine their field style first")
+    pr.add_argument("--beef-up", action="store_true",
+                    help="implies --deep; add bounded corpus-supported academic detail with "
+                         "validated sentence-level citations")
+    pr.add_argument("--restructure", action="store_true",
+                    help="implies --deep; reorder intact sections toward the corpus-mined "
+                         "rhetorical arc without regenerating their content")
+    pr.add_argument("--audit", action="store_true",
+                    help="implies --deep; write a separate corpus-grounded high-level "
+                         "paper audit (structure, novelty, evidence, claims, reproducibility)")
+    pr.add_argument("--uncensored", action="store_true",
+                    help="run the generating seats on the abliterated model "
+                         "(judging seats stay stock)")
+    pr.add_argument("--field", default="", metavar="NAME",
+                    help="override the detected research field used by --deep")
+    pr.add_argument("--query", action="append", default=[], metavar="SEARCH",
+                    help="override automatic --deep literature queries (repeatable)")
+    pr.add_argument("--out", help="where to write the copy (default: alongside, *_spiral; "
+                                  "the source path and its aliases are always rejected)")
+    pr.add_argument("--rounds", type=int, default=5, help="rewrite attempts (default 5)")
     pr.add_argument("--model", default="", help="override the rewriting model")
     pr.add_argument("--api", metavar="API_KEY", default=None,
                     help="use the configured API model for the rewrite")
@@ -286,6 +394,11 @@ def main() -> None:
         print_banner(console, tagline="local autonomous researcher · on-device", research=True)
     else:
         print_banner(console)   # shows for every command, holds ~1s, then work follows
+
+    # Before any dispatch: every subcommand below loads its own Config, and this
+    # sets the env overrides they all read.
+    if getattr(args, "uncensored", False):
+        _apply_uncensored(console)
 
     if args.cmd == "tune":
         from spiral.tune import main as tune_main
@@ -627,18 +740,61 @@ def main() -> None:
 
         goal = _load_goal(args)
         _info_line(console, args.dir)
+        _free_foreign_models(console)
         cfg = _apply_tier(Config.load(), console,
                           "api" if getattr(args, "api", None) else ("boost" if getattr(args, "boost", False) else None),
                           api_key=getattr(args, "api", None))
+        if os.environ.get("SPIRALCHAT_EXTERNAL_GIT_APPROVAL") == "1":
+            # Clone/fetch/pull/commit/push are controller capabilities in a
+            # SpiralChat-managed run. The model may inspect Git, but it cannot
+            # acquire or mutate a repository through Builder's automatic lane.
+            cfg.builder_repo_auto = False
         if getattr(args, "visual_url", None):
             cfg.visual_review_url = args.visual_url
         if getattr(args, "vision_model", None):
             cfg.vision_model = args.vision_model
         if getattr(args, "no_visual_review", False):
             cfg.visual_review = False
+        if getattr(args, "workspace_only", False):
+            # A controller-approved project-only run must win over persistent user
+            # configuration. Merely omitting --full-access is not sufficient because
+            # Config.load() may have read builder_full_access=true or disabled the
+            # mandatory sandbox in ~/.config/spiral/config.json.
+            cfg.builder_full_access = False
+            cfg.builder_require_sandbox = True
+            cfg.builder_allow_install_scripts = False
+            cfg.builder_tool_auto = False
+        elif getattr(args, "full_access", False):
+            cfg.builder_full_access = True
+            reveal(console,
+                   "  [rgb(217,119,87)]◆ full access[/] — the model's shell reaches the whole "
+                   "machine: any path, network on, spiral's own source included.\n"
+                   "  [dim]disk-wipe · halt · fork-bomb · separately approved Git "
+                   "mutations stay blocked. "
+                   "runs unsandboxed by design.[/]\n")
         if getattr(args, "builder_auto_repos", None) is not None:
             cfg.builder_repo_auto = bool(args.builder_auto_repos)
+        if os.environ.get("SPIRALCHAT_EXTERNAL_GIT_APPROVAL") == "1":
+            cfg.builder_repo_auto = False
+        if args.cmd == "build":
+            from spiral.command_broker import (
+                canonical_reference_roots, require_reference_identities,
+            )
+
+            try:
+                cfg.builder_reference_roots = canonical_reference_roots(
+                    getattr(args, "reference", []) or [], workspace=args.dir,
+                )
+                encoded_identities = os.environ.get(
+                    "SPIRALCHAT_REFERENCE_IDENTITIES")
+                if encoded_identities is not None:
+                    require_reference_identities(
+                        cfg.builder_reference_roots, encoded_identities)
+            except ValueError as exc:
+                raise SystemExit(f"invalid --reference: {exc}") from exc
         if getattr(args, "allow_install_scripts", False):
+            if getattr(args, "workspace_only", False):
+                raise SystemExit("--allow-install-scripts requires --full-access")
             cfg.builder_allow_install_scripts = True
         if getattr(args, "token_budget", None) is not None:
             cfg.builder_token_budget = max(1, int(args.token_budget))

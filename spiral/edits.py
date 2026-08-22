@@ -26,6 +26,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from spiral.tools import WorkspacePathError, resolve_workspace_path
+
 HEAD = "<<<<<<<"
 DIVIDER = "======="
 TAIL = ">>>>>>>"
@@ -408,10 +410,20 @@ def _fuzzy(text: str, search: str, replace: str, threshold: float = 0.90) -> str
 
 
 def _apply_one(root: Path, b: EditBlock) -> EditResult:
+    try:
+        fp = resolve_workspace_path(root, b.path)
+    except WorkspacePathError as exc:
+        return EditResult(b.path, False, reason=f"invalid path: {exc}")
+    try:
+        if fp.exists() and not fp.is_file():
+            return EditResult(
+                b.path, False, reason="invalid path: target is not a regular file")
+    except OSError as exc:
+        return EditResult(b.path, False, reason=f"invalid path: {exc}")
     if b.search == b.replace:
         return EditResult(b.path, False, reason="SEARCH and REPLACE are identical — a no-op; make a real change")
     try:
-        return _apply_one_inner(root, b)
+        return _apply_one_inner(fp, b)
     except OSError as e:
         return EditResult(b.path, False, reason=f"invalid path: {e}")
 
@@ -447,8 +459,7 @@ def _apply_whole(fp: Path, b: EditBlock) -> EditResult:
     return EditResult(b.path, True, "created" if not existed else "whole")
 
 
-def _apply_one_inner(root: Path, b: EditBlock) -> EditResult:
-    fp = root / b.path
+def _apply_one_inner(fp: Path, b: EditBlock) -> EditResult:
     if b.mode == "whole":
         return _apply_whole(fp, b)
     # empty search = create a NEW file — never a silent overwrite

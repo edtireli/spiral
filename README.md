@@ -69,7 +69,7 @@ run ends:
 ╭──────────────────────────── ⠷ run summary ────────────────────────────╮
 │ 11/12 tasks green · 1 blocked · SPEC-GREEN                             │
 │ Σ 174,787 tok (141k in / 33k out) · 34 attempts · 2 escalations · 57m  │
-│ qwen3.6:latest · 28 gen · median 30 t/s                                │
+│ qwen3.8:27b · 28 gen · median 11 t/s                                   │
 │ ≈ $0.93 of equivalent cloud API · $0.00 spent                          │
 ╰────────────────────────────────────────────────────────────────────────╯
 ```
@@ -89,7 +89,7 @@ if a later attempt fails or the run is stopped:
 
 ```
 ━━ M0: bootstrap — make the build gate pass ━━
-  — attempt 1/12 · qwen3.6:latest —
+  — attempt 1/12 · qwen3.8:27b —
   ● edits: BigBrotherEyeView.kt(exact) · verify exit 1
      gate says: e: MainActivity.kt:116:21 Unresolved reference 'messageText'
   ⚑ progress banked ec7fbc2 · resolved 5, revealed 4, remaining 5
@@ -104,7 +104,7 @@ Requirements with an executable check are judged by exit code; the rest by a
 separate model. Unmet requirements become new tasks:
 
 ```
-━━ validation 1 · 27 requirements · 4 by execution · qwen3.6:27b judges the rest ━━
+━━ validation 1 · 27 requirements · 4 by execution · gemma3:12b judges the rest ━━
   ✓ R2  acceptance check passed: python -m pytest tests/test_timer.py -q
   ✓ R4  activity_login.xml binds et_name; LoginActivity validates input
   ◐ R10 btnSend calls sendMessage(), but the scan is never triggered
@@ -296,10 +296,10 @@ coverage report needed to state exactly what was and was not established.
 
 | role | default | purpose |
 |---|---|---|
-| worker / planner | `qwen3.6:latest` (MoE, ~3B active) | plans and implements tasks |
-| escalation | `qwen3.6:27b` (dense) | retries a task the worker could not finish |
-| critic / validator / designer | `qwen3.6:latest`, thinking | ordinary reviews without a model swap; difficult semantic audits escalate to the dense model |
-| research auditor | `qwen3.6:27b` (dense) | independent basis, claim-scope, and paper adjudication; remains local under `--boost`/`--api` |
+| worker / planner | `qwen3.8:27b` (dense, hybrid attention, vision) | plans and implements tasks |
+| escalation | `qwen3.8:27b`, thinking on | retries a task the worker could not finish |
+| critic / validator / designer | `gemma3:12b` | reviews stay a different family — a same-family critic rubber-stamps its relatives' work |
+| research auditor | `gemma3:12b` | independent basis, claim-scope, and paper adjudication; remains local under `--boost`/`--api` |
 | janitor | `llama3.2:1b` | summarizes attempt history to keep prompts short |
 
 ## <img src="https://raw.githubusercontent.com/edtireli/spiral/main/assets/mark.svg" width="21" alt=""/> Commands
@@ -347,6 +347,72 @@ coverage report needed to state exactly what was and was not established.
 | `spiral research --taste-dislike "angle"` | teach the machine-local taste profile a direction to de-emphasize |
 | `spiral chat ["message"]` | talk to the local thinking model; reasoning shown dimmed |
 | `spiral consult ["question"]` | send the whole project to a big-context API model for review |
+| `spiral prose FILE --rewrite` | rewrite passages against the packaged Signs-of-AI-writing catalogue, keeping only candidates that preserve content and reduce raw tells |
+| `spiral prose FILE --deep` | implies `--rewrite`; for an article, research closely matched full-text papers, mine their structure and language profile, then rewrite against both profiles |
+| `spiral prose FILE --beef-up` | implies `--deep`; add bounded academic detail only after the research-grade corpus gate passes and at least four close primary full texts supply exact evidence anchors |
+| `spiral prose FILE --restructure` | implies `--deep`; move intact native section blocks toward the corpus-observed rhetorical arc without regenerating their content |
+| `spiral prose FILE --audit` | implies `--deep`; write a separate corpus-grounded high-level paper audit without silently applying its recommendations |
+
+### Research-backed prose rewriting
+
+`spiral prose draft.md --deep` first checks whether the file is article-like. Long
+articles qualify even without headings or citations; short notes stay offline and use
+the packaged Wikipedia-derived tell catalogue. For an article, Spiral extracts bounded
+literature queries, searches the scholarly channels appropriate to the field, downloads
+available primary full text, deduplicates it, and keeps only topically close papers.
+Acquisition uses Spiral Research's loop: independent query families, per-source health
+telemetry, relevance-ranked citation snowballing, conceptual gap searches, and explicit
+coverage gates for corpus breadth, usable primary text, relevance, retrieval health, and
+topic-term coverage. A cache is reused only after that audit passes; merely having many
+old papers never suppresses the search. Use
+`--field "name"` or repeat `--query "search terms"` when you want to override that
+automatic search plan. An explicit `--corpus DIR` remains available for a local corpus.
+
+The rewrite is best-of-N (`--rounds`, default 5), not first-answer-wins. Every candidate
+must reduce the raw number of detected tells or move the complete draft toward the mined
+field band without regressing the other objective. Symmetric guards preserve numbers and
+their multiplicity, citations, references, labels, URLs, quotations, acronyms, math,
+negation, claim direction, and bounded length. A 14-word source-overlap check prevents a
+field corpus from becoming text to copy. The assembled document passes the same content,
+tell-density, and field-distance gates before anything is written; the original is never
+overwritten.
+
+Deep-run evidence is stored beside the article under
+`.spiral/prose/<document>-<content-hash>/`: `manifest.json` records the search plan,
+source health, selected papers, coverage verdict, and warnings; `research-map.json` and
+`coverage.json` retain the round-by-round acquisition audit; `style-template.json` and
+`style-guide.md` record the aggregate profile. If retrieval fails or yields no close
+usable full text, the manifest says so and rewriting falls back to the local tell catalogue.
+
+`--beef-up` is deliberately a separate evidence operation, not a relaxed rewrite gate.
+It runs only when the research coverage audit passes and at least four closely matched,
+usable primary full texts survive the stricter article-level relevance gate. It uses up
+to eight of those accepted sources instead of collapsing the packet to the top two.
+Every proposed sentence must name a held source and an exact evidence anchor, cite it inline,
+keep any added number inside its cited anchor, pass a second claim-entailment audit, and
+avoid 14-word source overlap. Accepted sources are rendered in a separate reference
+list. If no proposal passes, nothing is added. `--restructure` is similarly mechanical:
+it reorders complete Markdown, LaTeX, or Word section blocks toward a representative
+corpus arc, carrying nested content, tables, figures, and review markup with the block.
+The two flags can be combined; restructuring runs before evidence additions.
+
+For LaTeX, the default is a complete sibling project copy such as
+`project_spiral/main.tex` (with numbered suffixes on later runs), never a file inside the
+source project. Spiral refuses any `--out` that resolves to the source file, symlink, or
+hard link. Existing `\bibliography{...}` and `\addbibresource{...}` databases are copied
+but otherwise read-only: a DOI/title match reuses the held key; otherwise Spiral writes a
+copy-owned `main.spiral.bib`, attaches it only to the copied TeX, emits real
+`\cite{...}` commands, and audits every citation key. It then runs the copied project's
+real `latexmk` build; a compile failure is a failed run, not reported as success.
+Equations, theorem environments, preamble commands, labels, references, figures, and
+`\input`/`\include` lines remain protected from prose generation. `--audit` also writes
+`main.audit.md` and `main.audit.json` beside the copied entry point. Recommendations are
+advisory and must cite sources in the selected corpus.
+
+Substantive changes in LaTeX and Word copies are review-marked in Spiral clay
+`#D97757`: rewritten or added prose is colored, while section moves, heading renames,
+and other purely structural operations remain uncolored. LaTeX copies receive a local
+`SpiralClay` color declaration; Word copies color only the runs Spiral changed.
 
 ## <img src="https://raw.githubusercontent.com/edtireli/spiral/main/assets/mark.svg" width="21" alt=""/> Live controls
 
@@ -362,8 +428,8 @@ During a run:
 Models can be set per shell or persistently.
 
 ```bash
-export SPIRAL_WORKER=qwen3.6:latest
-export SPIRAL_ESCALATION=qwen3.6:27b
+export SPIRAL_WORKER=qwen3.8:27b
+export SPIRAL_ESCALATION=qwen3.8:27b
 export SPIRAL_BASE_URL=http://localhost:11434
 ```
 
@@ -372,13 +438,13 @@ and can be edited directly:
 
 ```json
 {
-  "models":     { "worker": "qwen3.6:latest", "critic": "qwen3.6:latest", "escalation": "qwen3.6:27b", "research_auditor": "qwen3.6:27b" },
-  "num_ctx":    { "qwen3.6:latest": 28672, "qwen3.6:27b": 57344 },
+  "models":     { "worker": "qwen3.8:27b", "critic": "gemma3:12b", "escalation": "qwen3.8:27b", "research_auditor": "qwen3.8:27b" },
+  "num_ctx":    { "qwen3.8:27b": 57344 },
   "extra_gate": "ktlint app/src",
   "diversity_samples": 3,
   "visual_review": true,
   "visual_review_url": "",
-  "vision_model": "qwen3.6:35b-a3b",
+  "vision_model": "qwen3.8:27b",
   "builder_repo_auto": true,
   "builder_repo_budget": 3,
   "builder_repo_max_mb": 500,
@@ -393,7 +459,7 @@ and can be edited directly:
   "research_data_reserve_gb": 8,
   "research_data_file_limit": 20000,
   "research_data_sources": ["openneuro", "allen", "neuromaps", "zenodo"],
-  "research_notes_model": "qwen3.6:latest",
+  "research_notes_model": "qwen3.8:27b",
   "research_search_results_per_query": 8,
   "research_reading_limit": 60,
   "research_deep_read_limit": 8,

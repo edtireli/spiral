@@ -10,7 +10,9 @@ from pathlib import Path
 import pytest
 
 from spiral.documents import (
-    default_output_path, read_document, write_document,
+    default_output_path, ensure_tex_change_color, mark_tex_change,
+    prepare_tex_project_copy, read_document, require_distinct_output,
+    write_document,
 )
 
 TEX = r"""\documentclass{article}
@@ -56,8 +58,38 @@ def test_tex_edit_replaces_only_the_targeted_paragraph():
                          src.with_name("p.edited.tex"))
     edited = out.read_text()
     assert "This framework links theory and practice." in edited
+    assert r"\definecolor{SpiralClay}{HTML}{D97757}" in edited
+    assert r"{\color{SpiralClay}This framework links theory and practice.}" in edited
     assert "stands as a testament" not in edited
     assert r"E = mc^2" in edited and r"\documentclass{article}" in edited
+
+
+def test_tex_writer_preserves_every_untouched_byte_around_multiline_commands(tmp_path):
+    raw = (
+        r"\documentclass{article}" "\n\n"
+        r"\begin{document}" "\n\n"
+        "\\title{A title split across\n"
+        "two source lines}\n\n"
+        r"\maketitle" "\n\n"
+        "Additionally, this sentence can change.\n\n"
+        r"\end{document}" "\n"
+    )
+    source = tmp_path / "main.tex"
+    source.write_text(raw)
+    document = read_document(source)
+    target = next(segment for segment in document.editable_segments
+                  if "Additionally" in segment.text)
+    output = write_document(
+        document, {target.index: "This sentence changed."},
+        tmp_path / "main.edited.tex",
+    )
+    expected = ensure_tex_change_color(raw.replace(
+        "Additionally, this sentence can change.",
+        mark_tex_change("This sentence changed."),
+    ))
+    assert output.read_text() == expected
+    assert "across\ntwo" in output.read_text()
+    assert "across\n\ntwo" not in output.read_text()
 
 
 def test_original_is_never_modified():
@@ -69,6 +101,54 @@ def test_original_is_never_modified():
     assert src.read_text() == before
 
 
+def test_writer_rejects_source_path_symlink_and_hardlink(tmp_path):
+    src = tmp_path / "paper.tex"
+    src.write_text(TEX)
+    doc = read_document(src)
+    replacement = {doc.editable_segments[0].index: "replacement"}
+    with pytest.raises(ValueError, match="cannot be the source"):
+        write_document(doc, replacement, src)
+
+    symlink = tmp_path / "alias.tex"
+    symlink.symlink_to(src)
+    with pytest.raises(ValueError, match="cannot be the source"):
+        write_document(doc, replacement, symlink)
+
+    hardlink = tmp_path / "hardlink.tex"
+    hardlink.hardlink_to(src)
+    with pytest.raises(ValueError, match="aliases the source"):
+        require_distinct_output(src, hardlink)
+    assert src.read_text() == TEX
+
+
+def test_tex_project_copy_preserves_sources_but_omits_dependency_caches(tmp_path):
+    project = tmp_path / "paper"
+    project.mkdir()
+    main = project / "main.tex"
+    main.write_text(TEX + "\n\\input{sections/result.tex}\n")
+    (project / "references.bib").write_text("@article{x,title={X}}\n")
+    (project / "sections").mkdir()
+    (project / "sections/result.tex").write_text("Result text.\n")
+    (project / "figures").mkdir()
+    (project / "figures/data.dat").write_text("x y\n1 2\n")
+    (project / ".spiral").mkdir()
+    (project / ".spiral/cache").write_text("large cache")
+    (project / "lean/.lake").mkdir(parents=True)
+    (project / "lean/.lake/dependency").write_text("large dependency")
+    before = main.read_bytes()
+
+    copied_main = prepare_tex_project_copy(main)
+
+    assert copied_main.parent.name == "paper_spiral"
+    assert copied_main.read_bytes() == before
+    assert (copied_main.parent / "references.bib").is_file()
+    assert (copied_main.parent / "sections/result.tex").is_file()
+    assert (copied_main.parent / "figures/data.dat").is_file()
+    assert not (copied_main.parent / ".spiral").exists()
+    assert not (copied_main.parent / "lean/.lake").exists()
+    assert main.read_bytes() == before
+
+
 def test_markdown_headings_are_not_rewritten():
     doc = read_document(_tmp("n.md", "# Title\n\nSome prose here that can change.\n"))
     assert any(s.kind == "heading" and not s.editable for s in doc.segments)
@@ -76,10 +156,10 @@ def test_markdown_headings_are_not_rewritten():
 
 
 def test_default_output_never_overwrites_the_source():
-    assert default_output_path(Path("a/paper.tex")).name == "paper.edited.tex"
-    assert default_output_path(Path("a/report.docx")).name == "report.edited.docx"
+    assert default_output_path(Path("a/paper.tex")).name == "paper_spiral.tex"
+    assert default_output_path(Path("a/report.docx")).name == "report_spiral.docx"
     # a PDF cannot be faithfully rewritten, so its edit is emitted as markdown
-    assert default_output_path(Path("a/scan.pdf")).name == "scan.edited.md"
+    assert default_output_path(Path("a/scan.pdf")).name == "scan_spiral.md"
 
 
 def test_with_replacements_does_not_mutate_the_document():
@@ -112,6 +192,26 @@ def test_docx_keeps_headings_and_styles_through_an_edit():
     assert back.paragraphs[0].style.name.lower().startswith("heading")
     assert "testament" not in back.paragraphs[1].text
     assert "This connects several ideas." == back.paragraphs[1].text
+    assert str(back.paragraphs[1].runs[0].font.color.rgb) == "D97757"
+
+
+def test_docx_protects_captions_and_review_markup():
+    from docx.enum.style import WD_STYLE_TYPE
+    from docx.oxml import OxmlElement
+
+    path = _tmp("reviewed.docx")
+    backing = docx.Document()
+    backing.styles.add_style("Image Caption", WD_STYLE_TYPE.PARAGRAPH)
+    backing.add_paragraph("Figure 1. A measured response.", style="Image Caption")
+    reviewed = backing.add_paragraph("Additionally, the measured response changed.")
+    reviewed._p.append(OxmlElement("w:ins"))
+    backing.add_paragraph("Additionally, this plain paragraph can be edited.")
+    backing.save(str(path))
+
+    parsed = read_document(path)
+    assert parsed.segments[0].editable is False
+    assert parsed.segments[1].editable is False
+    assert parsed.segments[2].editable is True
 
 
 def test_prose_plan_lists_only_the_stages_that_will_run():

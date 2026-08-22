@@ -47,7 +47,15 @@ class SigStat:
 def mine(ledger_path: str | Path, worker: str, escalation: str) -> dict[str, SigStat]:
     """Fold the ledger's attempt records into per-signature outcome stats.
     Attempts by models that are neither the current worker nor the current
-    escalation (old crews, API tiers) are skipped — conservative by design."""
+    escalation (old crews, API tiers) are skipped — conservative by design.
+
+    Which lane ran comes from the record's own ``lane`` field. It used to be
+    inferred by comparing the model name against the two configured lanes, which
+    silently mis-read every attempt once both lanes ran the SAME model thinking
+    differently: the name matched escalation first, so the worker appeared never
+    to fail and no signature could ever route. Records written before ``lane``
+    existed still fall back to the name, and that fallback refuses to guess when
+    the two names are identical."""
     path = Path(ledger_path)
     stats: dict[str, SigStat] = {}
     if not path.is_file():
@@ -61,9 +69,14 @@ def mine(ledger_path: str | Path, worker: str, escalation: str) -> dict[str, Sig
         model = rec.get("model", "")
         if rec.get("kind") != "attempt" or not sig or model not in (worker, escalation):
             continue
+        lane = rec.get("lane")
+        if lane not in ("worker", "escalation"):
+            if worker == escalation:
+                continue          # legacy record, ambiguous by name — don't guess
+            lane = "escalation" if model == escalation else "worker"
         st = stats.setdefault(sig, SigStat())
         green = rec.get("verify_exit") == 0
-        if model == escalation:
+        if lane == "escalation":
             st.esc_green += green
             st.esc_fail += not green
         else:

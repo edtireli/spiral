@@ -90,7 +90,7 @@ ANSWERED = {
 def test_a_thinking_overrun_is_retried_without_thinking():
     client = _Fake([THOUGHT_ONLY, ANSWERED])
 
-    got = client.chat("qwen3.6:latest", [{"role": "user", "content": "go"}],
+    got = client.chat("qwen3.8:27b", [{"role": "user", "content": "go"}],
                       think=True, num_predict=2048)
 
     assert got.text == '{"angle": "H^5 on S^5"}', "the retry's answer must come back"
@@ -105,7 +105,7 @@ def test_the_wasted_call_is_still_paid_for():
     or a run silently overspends its ceiling."""
     client = _Fake([THOUGHT_ONLY, ANSWERED])
 
-    got = client.chat("qwen3.6:latest", [{"role": "user", "content": "go"}],
+    got = client.chat("qwen3.8:27b", [{"role": "user", "content": "go"}],
                       think=True, num_predict=2048)
 
     assert got.completion_tokens == 2048 + 40

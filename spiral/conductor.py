@@ -391,6 +391,20 @@ class Conductor:
 
         self.command_broker = CommandBroker(self.ws, self.cfg)
 
+    def _external_git_approval(self) -> bool:
+        from spiral.transactions import external_git_approval
+
+        return external_git_approval()
+
+    def _revision(self) -> str:
+        """A durable tree identity without mutating Git in managed chat runs."""
+
+        if self._external_git_approval():
+            from spiral.transactions import workspace_fingerprint
+
+            return workspace_fingerprint(self.ws)
+        return tools.run("git rev-parse HEAD", self.ws).out.strip()
+
     def _refresh_gate(self) -> bool:
         """(Re)detect the build gate against the *current* workspace and rebuild the
         composed gate command. Spiral often starts on an empty repo and creates the
@@ -514,12 +528,14 @@ class Conductor:
                 )
         started = time.monotonic()
         self.command_broker.environment.update(deps.get("environment") or {})
+        _full = bool(getattr(self.cfg, "builder_full_access", False))
         result = self.command_broker.run(
             command, timeout=self.cfg.verify_timeout, on_line=on_line,
-            purpose="verification-gate", allow_network=False,
-            allow_host_read=not bool(self.cfg.providers),
+            purpose="verification-gate", allow_network=_full,
+            allow_host_read=_full,
             require_sandbox=bool(getattr(
                 self.cfg, "builder_require_sandbox", True)),
+            full_access=_full,
         ).result
         try:
             self.toolsmith.record(
@@ -584,6 +600,14 @@ class Conductor:
         untracked pre-existing files can never be swept by a revert. Work happens
         on a spiral/run-* BRANCH — never on the user's branch; they merge when
         they're happy."""
+        if self._external_git_approval():
+            self._dir()
+            if not resume:
+                self.c.print(
+                    "  [dim]Git approval boundary active — changes remain in the "
+                    "working tree until you approve an exact Git action[/]"
+                )
+            return
         if not (self.ws / ".git").is_dir():
             if resume:
                 raise RuntimeError(
@@ -668,6 +692,8 @@ class Conductor:
             return False
         if row.get("fingerprint") != self._task_fingerprint(task):
             return False
+        if self._external_git_approval():
+            return True
         commit = str(row.get("head") or "")
         return row.get("status") == "skipped" or is_ancestor(self.ws, commit)
 
@@ -1420,7 +1446,7 @@ class Conductor:
         through the same gated loop as any other work. Return whether HEAD moved."""
         from spiral.dash import Dash
 
-        before = tools.run("git rev-parse HEAD", self.ws).out.strip()
+        before = self._revision()
         try:
             spec_by_id = {
                 str(row.get("id")): str(row.get("text") or "")
@@ -1500,11 +1526,10 @@ class Conductor:
                 if atom.budget_exhausted:
                     dash.print("[red]■ token budget reached during remediation[/]")
                     break
-        changed = bool(before and tools.run("git rev-parse HEAD", self.ws).out.strip() != before)
+        changed = bool(before and self._revision() != before)
         if changed:
             updates = {"product_audit": "stale-after-remediation"}
-            updates["last_green_head"] = tools.run(
-                "git rev-parse HEAD", self.ws).out.strip()
+            updates["last_green_head"] = self._revision()
             if self.state.get("hygiene_gate"):
                 updates["hygiene_clean"] = False
             if (self._is_ui(self._project_kind(goal))
@@ -1791,7 +1816,10 @@ class Conductor:
             # syntax error flip-flopped for whole attempt budgets; the revert
             # costs zero tokens. Healed -> re-audit; refused -> remediation as
             # before (the healer is a fast path, never a gatekeeper).
-            if any(str(row.get("id", "")).startswith("runtime-") for row in issues):
+            if (
+                not self._external_git_approval()
+                and any(str(row.get("id", "")).startswith("runtime-") for row in issues)
+            ):
                 from spiral.regress import heal, runtime_predicate
 
                 try:
@@ -1802,8 +1830,7 @@ class Conductor:
                 if healing and healing.healed:
                     dash.print(
                         f"  [green]⟲ healed by revert[/] [dim]{healing.detail}[/]")
-                    self._write_state(last_green_head=tools.run(
-                        "git rev-parse HEAD", self.ws).out.strip())
+                    self._write_state(last_green_head=self._revision())
                     continue          # re-audit the healed tree
                 if healing and healing.guilty:
                     dash.print(f"  [yellow]○ healer declined:[/] [dim]{healing.detail}[/]")
@@ -1983,11 +2010,14 @@ class Conductor:
                 label = f"design tokens + favicon [bold]{glyph}[/]"
         except Exception:
             transaction.rollback(reason="foundation generation failed")
+            transaction.close()
             raise
         if not written:
+            transaction.close()
             return  # already wired — nothing to do
         if self.gate and not self._gate_green(dash):
             transaction.rollback(reason="foundation made the gate red")
+            transaction.close()
             dash.print("  [yellow]○ foundation reverted — gate went red[/]")
             return
         try:
@@ -1995,12 +2025,13 @@ class Conductor:
                 f"spiral: foundation - {kind} design ground truth")
         except Exception:
             transaction.rollback(reason="foundation commit failed")
+            transaction.close()
             raise
         if not moved:
+            transaction.close()
             return
-        self._write_state(
-            last_green_head=tools.run(
-                "git rev-parse HEAD", self.ws).out.strip())
+        self._write_state(last_green_head=self._revision())
+        transaction.close()
         dash.print(f"  [green]■ foundation:[/] {label} · {len(written)} files")
 
     def _gate_predicate(self):
@@ -2018,12 +2049,14 @@ class Conductor:
             gate = detect_gate(tree)
             if not gate:
                 return True
+            _full = bool(getattr(self.cfg, "builder_full_access", False))
             result = CommandBroker(tree, self.cfg).run(
                 gate, timeout=self.cfg.verify_timeout,
-                purpose="verification-gate", allow_network=False,
-                allow_host_read=not bool(self.cfg.providers),
+                purpose="verification-gate", allow_network=_full,
+                allow_host_read=_full,
                 require_sandbox=bool(getattr(
                     self.cfg, "builder_require_sandbox", True)),
+                full_access=_full,
             )
             return result.result.code == 0
         return gate_ok
@@ -2073,10 +2106,7 @@ class Conductor:
             self._resolve_capabilities(self._raw_goal(goal))
         self._snapshot(resume=resume)
         if not resume:
-            self.state = {
-                "last_green_head": tools.run(
-                    "git rev-parse HEAD", self.ws).out.strip(),
-            }
+            self.state = {"last_green_head": self._revision()}
 
         plan = self.load_plan() if resume else None
         if resume and not goal.strip():
@@ -2170,7 +2200,7 @@ class Conductor:
                         esc_attempts=self.cfg.bootstrap_attempts,
                         ratchet=True,
                     )
-                    if status == "blocked":
+                    if status == "blocked" and not self._external_git_approval():
                         # the models cannot fix it — but if some COMMIT broke the
                         # gate, reverting that commit is a computation. Bootstrap
                         # was the one termination path with no healer behind it,
@@ -2185,8 +2215,7 @@ class Conductor:
                             dash.print(f"  [yellow]○ gate healer unavailable[/] [dim]{exc}[/]")
                         if healing and healing.healed:
                             dash.print(f"  [green]⟲ gate healed by revert[/] [dim]{healing.detail}[/]")
-                            self._write_state(last_green_head=tools.run(
-                                "git rev-parse HEAD", self.ws).out.strip())
+                            self._write_state(last_green_head=self._revision())
                             status = "green" if self._gate_green(dash) else "blocked"
                         elif healing and healing.detail:
                             dash.print(f"  [yellow]○ gate healer declined:[/] [dim]{healing.detail}[/]")
@@ -2197,8 +2226,7 @@ class Conductor:
                         return
                     dash.task(0, 0, "done")
                     self._write_state(
-                        last_green_head=tools.run(
-                            "git rev-parse HEAD", self.ws).out.strip(),
+                        last_green_head=self._revision(),
                         blocked=[row for row in blocked if row != "M0 bootstrap"],
                     )
                     dash.print(f"  [green]■ gate is green — features begin ({status})[/]")
@@ -2237,7 +2265,7 @@ class Conductor:
                         records[task_key] = {
                             "status": "skipped",
                             "fingerprint": self._task_fingerprint(t),
-                            "head": tools.run("git rev-parse HEAD", self.ws).out.strip(),
+                            "head": self._revision(),
                         }
                         processed_count, _green_count = self._task_counts(plan, records)
                         self._write_state(
@@ -2272,7 +2300,11 @@ class Conductor:
                     status = self._run_task(atom, spec, dash)
                     if status != "blocked":
                         self._verify_new_gate(dash, atom, goal)   # this task may have created the gate
-                    if status == "blocked" and self.gate and not self._gate_green(dash):
+                    if (
+                        status == "blocked" and self.gate
+                        and not self._external_git_approval()
+                        and not self._gate_green(dash)
+                    ):
                         # the task did not fail on its own work — it inherited a
                         # RED GATE from an earlier commit (observed: a package
                         # manifest whose test script pointed at a file that never
@@ -2289,8 +2321,7 @@ class Conductor:
                             dash.print(f"  [yellow]○ gate healer unavailable[/] [dim]{exc}[/]")
                         if healing and healing.healed:
                             dash.print(f"  [green]⟲ gate healed by revert[/] [dim]{healing.detail}[/]")
-                            self._write_state(last_green_head=tools.run(
-                                "git rev-parse HEAD", self.ws).out.strip())
+                            self._write_state(last_green_head=self._revision())
                             status = self._run_task(atom, spec, dash)
                         elif healing and healing.detail:
                             dash.print(f"  [yellow]○ gate healer declined:[/] [dim]{healing.detail}[/]")
@@ -2302,7 +2333,7 @@ class Conductor:
                     else:
                         dash.task(mi, ti, "done")
                         self._hook("task_green", t.title)
-                    current_head = tools.run("git rev-parse HEAD", self.ws).out.strip()
+                    current_head = self._revision()
                     records = dict(self.state.get("task_records") or {})
                     records[task_key] = {
                         "status": status,
@@ -2408,7 +2439,7 @@ class Conductor:
             if spec_green:
                 break
             finish_signature = (
-                tools.run("git rev-parse HEAD", self.ws).out.strip(),
+                self._revision(),
                 self.state.get("product_audit"), self.state.get("visual_review"),
                 self.state.get("validation_status"), tuple(self.state.get("gaps") or []),
             )

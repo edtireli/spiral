@@ -17,26 +17,32 @@ from spiral.theme import CLAY, make_console
 
 CONFIG_PATH = Path.home() / ".config" / "spiral" / "config.json"
 
-# crews of real, widely-available Ollama models, keyed by the RAM ceiling they fit.
-# roles: worker/planner (fast) · escalation/critic (stronger) · janitor (tiny).
-# sizes are approximate GB for the download-budget preview.
+# Crews of real, currently-available Ollama models, keyed by the RAM ceiling they
+# fit. roles: worker/planner (thinking off) · escalation (thinking ON) · critic
+# (different family, deliberately) · janitor (tiny).
+#
+# worker and escalation are the SAME model on purpose. Thinking is a per-request
+# toggle, not a second set of weights, so the low-thinking and max-thinking lanes
+# share one resident model and never pay a swap — this is what replaced the old
+# two-model (qwen2.5-coder / qwen3:30b-a3b) crews, which no longer exist.
+#
+# The critic stays a DIFFERENT FAMILY at every tier: the 2026-07-27 A/B showed a
+# same-family critic rubber-stamps its own work (six passes on a zero-mapping plan).
 CREWS = [
-    (20, "starter", {
-        "worker": "qwen2.5-coder:7b", "escalation": "qwen2.5-coder:7b",
-        "critic": "qwen2.5-coder:7b", "janitor": "llama3.2:1b",
+    # Under ~24 GB the 27b will not fit beside a build. gemma carries the work and
+    # llama does the tidying; this tier is a trial crew, not the intended one.
+    (24, "compact", {
+        "worker": "gemma3:12b", "escalation": "gemma3:12b",
+        "critic": "llama3.2:1b", "janitor": "llama3.2:1b",
     }),
-    (40, "standard", {
-        "worker": "qwen2.5-coder:14b", "escalation": "qwen2.5-coder:32b",
-        "critic": "qwen2.5-coder:32b", "janitor": "llama3.2:1b",
-    }),
-    (9999, "pro", {
-        "worker": "qwen2.5-coder:32b", "escalation": "qwen2.5-coder:32b",
-        "critic": "qwen2.5-coder:32b", "janitor": "llama3.2:3b",
+    # The intended crew: one resident 27b for plan/build/escalate, gemma judging.
+    (9999, "standard", {
+        "worker": "qwen3.8:27b", "escalation": "qwen3.8:27b",
+        "critic": "gemma3:12b", "janitor": "llama3.2:1b",
     }),
 ]
 SIZE_GB = {
-    "qwen2.5-coder:7b": 4.7, "qwen2.5-coder:14b": 9.0, "qwen2.5-coder:32b": 20.0,
-    "llama3.2:1b": 1.3, "llama3.2:3b": 2.0,
+    "qwen3.8:27b": 18.0, "gemma3:12b": 8.1, "llama3.2:1b": 1.3,
 }
 
 

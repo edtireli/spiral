@@ -78,6 +78,30 @@ class Ollama:
         except Exception:
             pass
 
+    def resident(self) -> list[str]:
+        """Model names Ollama currently holds in memory (/api/ps), newest first.
+
+        Needed because spiral is no longer the only thing on this machine talking
+        to Ollama: the phone chat keeps its own model loaded, and a second 18 GB
+        model landing beside it is a Metal OOM, not a slow run."""
+        try:
+            r = self._client.get(f"{self.base_url}/api/ps")
+            r.raise_for_status()
+            return [m["name"] for m in r.json().get("models", []) if m.get("name")]
+        except Exception:
+            return []
+
+    def free_foreign(self, keep: set[str], log=None) -> list[str]:
+        """Unload every resident model this run will not use. Returns what it freed."""
+        freed = []
+        for name in self.resident():
+            if name not in keep:
+                self.evict(name)
+                freed.append(name)
+                if log:
+                    log(name)
+        return freed
+
     def health(self) -> str | None:
         """Return the server version, or None if unreachable."""
         try:
@@ -86,6 +110,16 @@ class Ollama:
             return r.json().get("version")
         except Exception:
             return None
+
+    def models(self) -> list[str]:
+        """Installed model names, or [] if unreachable — callers treat an empty
+        list as 'could not check' rather than 'nothing installed'."""
+        try:
+            r = self._client.get(f"{self.base_url}/api/tags")
+            r.raise_for_status()
+            return [m["name"] for m in r.json().get("models", []) if m.get("name")]
+        except Exception:
+            return []
 
     def _payload(
         self,
