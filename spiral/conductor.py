@@ -482,9 +482,12 @@ class Conductor:
         # fault to the harness.
         if gate:
             import subprocess
+            from spiral.command_broker import shell_executable
 
             parse = subprocess.run(
-                ["/bin/zsh", "-n", "-c", gate], capture_output=True, text=True)
+                [shell_executable(), "-n", "-c", gate],
+                capture_output=True, text=True,
+            )
             if parse.returncode != 0:
                 raise RuntimeError(
                     "the composed build gate does not parse as shell — this is a "

@@ -19,6 +19,24 @@ from spiral.edits import EditBlock, apply_edits
 from spiral.tools import list_dir, read_file
 
 
+def test_full_access_uses_an_available_shell_on_linux(tmp_path, monkeypatch):
+    import spiral.command_broker as broker_module
+
+    monkeypatch.setattr(broker_module.sys, "platform", "linux")
+    monkeypatch.setattr(
+        broker_module.shutil, "which",
+        lambda name: "/usr/bin/bash" if name == "bash" else None,
+    )
+
+    argv, sandboxed = CommandBroker(tmp_path)._argv(
+        "true", tmp_path, allow_network=True, allow_host_read=True,
+        full_access=True,
+    )
+
+    assert argv == ["/usr/bin/bash", "-lc", "true"]
+    assert sandboxed is False
+
+
 def test_workspace_broker_cannot_be_tricked_into_host_reads(tmp_path, monkeypatch):
     """Even a stale/hostile local-model caller cannot widen project-only access."""
     import spiral.command_broker as broker_module
@@ -90,8 +108,9 @@ def test_reference_validation_rejects_target_overlap_and_identity_replacement(tm
         [reference], workspace=target,
     )
     broker = CommandBroker(target, cfg)
-    reference.unlink()
-    reference.write_text("replacement")
+    replacement = tmp_path / "replacement.txt"
+    replacement.write_text("replacement")
+    os.replace(replacement, reference)
 
     result = broker.run("true", require_sandbox=False).result
     assert result.blocked
@@ -116,8 +135,9 @@ def test_controller_reference_identity_closes_prelaunch_path_swap(tmp_path):
     }])
     require_reference_identities(paths, encoded)
 
-    reference.unlink()
-    reference.write_bytes(b"other")
+    replacement = tmp_path / "replacement.pdf"
+    replacement.write_bytes(b"other")
+    os.replace(replacement, reference)
     with pytest.raises(ValueError, match="identity changed"):
         require_reference_identities(paths, encoded)
 

@@ -33,7 +33,13 @@ Predicate = Callable[[Path], bool]      # True = this tree is healthy
 
 
 def _git(root: Path, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", *args], cwd=root, capture_output=True,
+    # Revert creates a commit. CI and fresh machines intentionally have no global
+    # Git identity, so give Spiral's mechanical commits a stable local identity
+    # without reading or changing the user's Git configuration.
+    return subprocess.run([
+        "git", "-c", "user.name=Spiral", "-c",
+        "user.email=spiral@localhost", *args,
+    ], cwd=root, capture_output=True,
                           text=True, stdin=subprocess.DEVNULL)
 
 
