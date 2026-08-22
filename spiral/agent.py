@@ -139,10 +139,17 @@ def _auto_files(
 
 
 class Atom:
-    def __init__(self, workspace: str | Path = ".", cfg: Config | None = None, console: Console | None = None):
+    def __init__(self, workspace: str | Path = ".", cfg: Config | None = None,
+                 console: Console | None = None, ol: Ollama | None = None):
         self.cfg = cfg or Config.load()
         self.ws = Path(workspace).resolve()
-        self.ol = Ollama(self.cfg.base_url)
+        self.ol = ol or Ollama(self.cfg.base_url, providers=self.cfg.providers)
+        if ol is None and hasattr(self.ol, "configure_budget"):
+            self.ol.configure_budget(
+                wall_seconds=self.cfg.run_wall_budget_seconds,
+                total_tokens=self.cfg.run_token_budget,
+                model_calls=self.cfg.run_call_budget,
+            )
         self.c = console or make_console()
         self.tokens = 0  # cumulative, for the conductor's budget
         self.run_stats: dict = {"attempts": 0, "green": 0, "ptok": 0, "ctok": 0,
@@ -228,16 +235,12 @@ class Atom:
 
     @property
     def budget_exhausted(self) -> bool:
+        joint = getattr(self.ol, "budget", None)
+        if joint is not None and joint.exhausted:
+            return True
         explicit = int(getattr(self.cfg, "builder_token_budget", 0) or 0)
-        metered = any(
-            spec.name in self.cfg.providers
-            for spec in (
-                self.cfg.worker, self.cfg.planner,
-                self.cfg.escalation, self.cfg.critic,
-            )
-        )
-        limit = explicit or (int(self.cfg.run_token_budget) if metered else 0)
-        return limit > 0 and self.tokens >= limit
+        limit = explicit if explicit > 0 else int(self.cfg.run_token_budget)
+        return self.tokens >= max(1, limit)
 
     def _record_generation(self, model: str, res, seconds: float) -> None:
         """Account for every model call, including malformed/no-edit replies."""
@@ -1294,7 +1297,7 @@ class Atom:
         seen: set[str] = set()
         for i, temp in enumerate(temps, 1):
             if self.budget_exhausted:
-                ui.print("  [red]■ run token budget reached before diversity sampling[/]")
+                ui.print("  [red]■ run execution budget reached before diversity sampling[/]")
                 break
             ui.phase("sampling", model=model_name)
             started = time.time()
@@ -1518,7 +1521,7 @@ class Atom:
         attempt = 0
         while attempt < budget:
             if self.budget_exhausted:
-                ui.print("  [red]■ run token budget reached before next model attempt[/]")
+                ui.print("  [red]■ run execution budget reached before next model attempt[/]")
                 break
             attempt += 1
             ui.print(f"  [dim]— attempt {attempt}/{budget} · {model_name} —[/]")

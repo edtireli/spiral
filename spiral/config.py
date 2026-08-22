@@ -8,8 +8,10 @@ Model strategy (32 GB unified memory, hardware-honest):
   - ESCALATION is the same model with thinking ON. Thinking is a per-request
     flag, not another set of weights, so the lanes share one name and each
     attempt records the lane it ran in for the route ledger to read.
-  - The judging seats (critic, research auditor) are gemma3:12b: a model will
-    not fail its own family's work, so criticism stays a different family.
+  - Different-family judges remain available, but are an explicit opt-in. The
+    default loaded configuration reuses the resident 27B with different role
+    prompts because correlated model opinions do not justify hidden RAM pressure.
+    Deterministic evidence, not a second persona, is the normal judge.
 """
 from __future__ import annotations
 
@@ -28,6 +30,10 @@ class Config:
     # backend seam — local-first. "ollama" today; another provider could slot in.
     provider: str = "ollama"
     base_url: str = "http://localhost:11434"
+    # Complexity chooses a finite JOINT wall/token/call envelope. It is a policy
+    # tier, not a promise to spend the allowance.
+    complexity_tier: str = "standard"
+    prefer_single_resident_model: bool = True
 
     # Conductor/worker: qwen3.8:27b = the 3.8-gen 27B dense VLM (Q4_K_M GGUF).
     # RAM: ~17GB weights + mmproj + small hybrid KV @24k → ~19GB footprint,
@@ -47,7 +53,10 @@ class Config:
     escalation: ModelSpec = field(
         default_factory=lambda: ModelSpec("qwen3.8:27b", num_ctx=16384, think=True)
     )
-    # Ordinary critic is a DIFFERENT FAMILY on purpose: the 2026-07-27 A/B showed
+    # Raw alternative critic for users who explicitly set
+    # prefer_single_resident_model=false. The normal Config.load path aliases local
+    # judging roles to the worker model so a default run never loads both models.
+    # The 2026-07-27 A/B showed
     # a same-family critic rubber-stamps (six passes on a zero-mapping plan);
     # gemma3:12b found 8 real defects on the identical input in less time.
     # Thinking stays ON — llm.py retries without `think` for the models that
@@ -102,17 +111,18 @@ class Config:
     bootstrap_attempts: int = 12       # first-green repair gets a longer leash
     plan_rounds: int = 3               # lint→critic→repair cycles before execution
     validate_rounds: int = 8           # max validate→remediate cycles; stops early on a true plateau
-    # Applied automatically when any main role is metered. Purely local research has
-    # no implicit token stop; the CLI's explicit --token-budget still applies.
-    run_token_budget: int = 4_000_000
-    # Explicit Builder ceiling. Zero means unlimited when all active roles are local;
-    # metered roles still inherit run_token_budget.
-    builder_token_budget: int = 0
+    # Joint orchestration ceilings include every role and every provider. Local
+    # inference consumes time, energy, and attention; it is never treated as free.
+    run_wall_budget_seconds: int = 2 * 60 * 60
+    run_token_budget: int = 350_000
+    run_call_budget: int = 96
+    # Optional Builder-specific stop, finite by default and never interpreted as
+    # "unlimited" when set to zero by an old configuration.
+    builder_token_budget: int = 350_000
     verify_timeout: int = 900          # seconds; real build gates (gradle) are slow
-    # best-of-N at the worker lane's exit: sampled candidates judged by the gate.
-    # Local tokens are free and the gate is a deterministic judge — brute force
-    # is spent exactly where a metered agent would economize. 0 disables.
-    diversity_samples: int = 3
+    # Best-of-N is opt-in. Deterministic evidence and a focused repair beat routine
+    # brute-force sampling on a single-machine 27B deployment. 0 disables.
+    diversity_samples: int = 0
 
     # Worker research: repo/file/web/browser ASKs do not consume edit attempts.
     # For all action-count limits in this section, zero means unlimited. Web is
@@ -265,16 +275,43 @@ class Config:
                 if spec.name in overlay.get("num_ctx", {}):
                     spec.num_ctx = int(overlay["num_ctx"][spec.name])
             cfg.base_url = os.environ.get("SPIRAL_BASE_URL", overlay.get("base_url", cfg.base_url))
+            cfg.complexity_tier = str(os.environ.get(
+                "SPIRAL_COMPLEXITY", overlay.get("complexity_tier", cfg.complexity_tier)
+            )).lower()
+            from spiral.execution import BudgetLimits
+
+            tier_limits = BudgetLimits.for_tier(cfg.complexity_tier)
+            cfg.run_wall_budget_seconds = int(os.environ.get(
+                "SPIRAL_RUN_WALL_SECONDS",
+                overlay.get("run_wall_budget_seconds", tier_limits.wall_seconds),
+            ))
+            cfg.run_token_budget = int(os.environ.get(
+                "SPIRAL_RUN_TOKEN_BUDGET",
+                overlay.get("run_token_budget", tier_limits.total_tokens),
+            ))
+            cfg.run_call_budget = int(os.environ.get(
+                "SPIRAL_RUN_CALL_BUDGET",
+                overlay.get("run_call_budget", tier_limits.model_calls),
+            ))
+            # Old zero/unlimited values are migrated to the joint finite ceiling.
+            if cfg.run_wall_budget_seconds <= 0:
+                cfg.run_wall_budget_seconds = tier_limits.wall_seconds
+            if cfg.run_token_budget <= 0:
+                cfg.run_token_budget = tier_limits.total_tokens
+            if cfg.run_call_budget <= 0:
+                cfg.run_call_budget = tier_limits.model_calls
+            cfg.prefer_single_resident_model = bool(overlay.get(
+                "prefer_single_resident_model", cfg.prefer_single_resident_model))
             cfg.uncensored_model = os.environ.get(
                 "SPIRAL_UNCENSORED_MODEL",
                 overlay.get("uncensored_model", cfg.uncensored_model))
             cfg.extra_gate = overlay.get("extra_gate", cfg.extra_gate)
             cfg.spiral_style = os.environ.get("SPIRAL_STYLE", overlay.get("style", cfg.spiral_style))
             cfg.worker_max_tokens = int(overlay.get("worker_max_tokens", cfg.worker_max_tokens))
-            cfg.run_token_budget = int(
-                overlay.get("run_token_budget", cfg.run_token_budget))
             cfg.builder_token_budget = int(
-                overlay.get("builder_token_budget", cfg.builder_token_budget))
+                overlay.get("builder_token_budget", cfg.run_token_budget))
+            if cfg.builder_token_budget <= 0:
+                cfg.builder_token_budget = cfg.run_token_budget
             cfg.diversity_samples = int(overlay.get("diversity_samples", cfg.diversity_samples))
             cfg.ask_budget = int(overlay.get("ask_budget", cfg.ask_budget))
             cfg.web_research = bool(overlay.get("web_research", cfg.web_research))
@@ -416,4 +453,22 @@ class Config:
             cfg.providers = overlay.get("providers", cfg.providers)
         except Exception:
             pass  # a broken overlay must never break spiral
+        # This safety policy deliberately runs *after* the broad compatibility
+        # catch. A malformed config must fall back to one resident local model,
+        # not silently restore the historical qwen+gemma+llama RAM pile-up.
+        if cfg.prefer_single_resident_model:
+            providers = cfg.providers if isinstance(cfg.providers, dict) else {}
+            local_specs = [
+                spec for spec in (
+                    cfg.worker, cfg.planner, cfg.escalation, cfg.critic,
+                    cfg.research_auditor, cfg.janitor,
+                ) if spec.name not in providers
+            ]
+            if local_specs:
+                preferred = (
+                    cfg.worker.name if cfg.worker.name not in providers
+                    else local_specs[0].name
+                )
+                for spec in local_specs:
+                    spec.name = preferred
         return cfg

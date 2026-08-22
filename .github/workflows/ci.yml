@@ -40,12 +40,19 @@ jobs:
           set -euo pipefail
           if [ "$RUNNER_OS" = "macOS" ]; then
             asset="tectonic-0.15.0-aarch64-apple-darwin.tar.gz"
+            expected_sha256="24bd46566fa30d41101848405e9cbc4645edb92d8f857c9d21262174fb70cd33"
           else
             asset="tectonic-0.15.0-x86_64-unknown-linux-musl.tar.gz"
+            expected_sha256="dfb82876f2986862996e564fa507a9e576e0c1e3bee63c2c1bd677c2543e6407"
           fi
           curl -fsSL --retry 3 --retry-delay 5 \
             "https://github.com/tectonic-typesetting/tectonic/releases/download/tectonic%400.15.0/${asset}" \
             -o tectonic.tar.gz
+          if command -v sha256sum >/dev/null; then
+            printf '%s  %s\n' "$expected_sha256" tectonic.tar.gz | sha256sum -c -
+          else
+            printf '%s  %s\n' "$expected_sha256" tectonic.tar.gz | shasum -a 256 -c -
+          fi
           tar -xzf tectonic.tar.gz tectonic
           sudo mv tectonic /usr/local/bin/tectonic
           rm tectonic.tar.gz

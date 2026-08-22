@@ -1543,7 +1543,10 @@ def test_proposal_iterates_against_prior_art(monkeypatch):
     prop = loop.propose(refine_rounds=2)
     assert prop["question"] == "sharper novel Q" and prop.get("_vetted") is True
     assert prop["_basis_audit"]["grounded"] is True
-    assert roles == ["critic", "planner", "critic", "research_auditor"]
+    # Single-resident mode deliberately collapses the final adjudicator onto the
+    # same loaded model; independence comes from source/evidence gates, not a hidden
+    # second local model. Users can opt out to restore the research_auditor seat.
+    assert roles == ["critic", "planner", "critic", "critic"]
 
 
 def test_prior_art_protocol_rejects_paraphrased_query_routes(monkeypatch, tmp_path):

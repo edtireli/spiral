@@ -108,6 +108,11 @@ def _free_foreign_models(console) -> None:
     swap — Metal reports kIOGPUCommandBufferCallbackErrorOutOfMemory and the run
     dies mid-plan with a bare HTTP 500. Freeing first costs one reload at worst.
     """
+    # Unit/offline verification is not allowed to wake, inspect, or evict a
+    # user's resident models. This guard also avoids even a loopback probe.
+    if os.environ.get("SPIRAL_OFFLINE_TESTS"):
+        return
+
     from spiral.config import Config
 
     cfg = Config.load()
@@ -123,10 +128,14 @@ def _free_foreign_models(console) -> None:
     seen, freed = set(), []
     for url in dict.fromkeys([cfg.base_url,
                               "http://127.0.0.1:11434", "http://localhost:11434"]):
-        for name in Ollama(url, providers=cfg.providers).free_foreign(keep):
-            if name not in seen:
-                seen.add(name)
-                freed.append(name)
+        client = Ollama(url, providers=cfg.providers)
+        try:
+            for name in client.free_foreign(keep):
+                if name not in seen:
+                    seen.add(name)
+                    freed.append(name)
+        finally:
+            client.close()
     if freed:
         reveal(console,
                f"  [dim]◇ freed {', '.join(freed)} — this run needs the memory[/]\n")
@@ -247,8 +256,7 @@ def main() -> None:
             )
             p.add_argument(
                 "--token-budget", type=int, default=None,
-                help="explicit Builder model-token ceiling; all-local runs otherwise "
-                     "continue until completion or an evidence plateau",
+                help="override the finite complexity-tier Builder token ceiling",
             )
 
     srch = sub.add_parser("search", help="fast web search — ranked results, no synthesis")
@@ -277,8 +285,7 @@ def main() -> None:
     res.add_argument("--rounds", type=int, default=None,
                      help="max research rounds with --solve (default: until solved/exhausted)")
     res.add_argument("--token-budget", type=int, default=None,
-                     help="explicit total model-token ceiling; local runs have no implicit "
-                          "token ceiling, API runs otherwise use run_token_budget")
+                     help="override the finite complexity-tier total model-token ceiling")
     res.add_argument("--api", metavar="API_KEY", default=None,
                      help="run the research reasoning (proposals, novelty critique, reflection, "
                           "write-up) on the API model; takes the provider API key "

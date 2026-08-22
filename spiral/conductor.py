@@ -36,6 +36,10 @@ from spiral.appicon import TOKEN_COLORS, write_android_icon, write_android_token
 from spiral.banner import Spinner
 from spiral.config import Config
 from spiral.contracts import lint_contracts
+from spiral.execution import (
+    EvidenceLevel, EvidenceRecord, OrchestrationPolicy, TaskEvidenceDAG, TaskState,
+    evidence_level_for_command,
+)
 from spiral.ladder import is_python_gate, venv_prefix
 from spiral.llm import Ollama
 from spiral.planner import (
@@ -371,7 +375,14 @@ class Conductor:
     def __init__(self, workspace: str | Path = ".", cfg: Config | None = None):
         self.cfg = cfg or Config.load()
         self.ws = Path(workspace).resolve()
-        self.ol = Ollama(self.cfg.base_url)
+        self.ol = Ollama(self.cfg.base_url, providers=self.cfg.providers)
+        self.ol.configure_budget(
+            wall_seconds=self.cfg.run_wall_budget_seconds,
+            total_tokens=self.cfg.run_token_budget,
+            model_calls=self.cfg.run_call_budget,
+        )
+        self.orchestration_policy = OrchestrationPolicy.from_values(
+            self.cfg.complexity_tier, self.cfg.prefer_single_resident_model)
         self.c = make_console()
         self._base_gate = ""
         self.gates: list[GateSpec] = []
@@ -973,17 +984,27 @@ class Conductor:
         else:
             design = design_f.read_text() if design_f.is_file() else ""
             if not design:
-                self.ol.evict(self.cfg.planner.name)  # designer runs on the critic
+                design_model = (
+                    self.cfg.planner.name if self.cfg.prefer_single_resident_model
+                    else self.cfg.critic.name
+                )
+                if design_model != self.cfg.planner.name:
+                    self.ol.evict(self.cfg.planner.name)
                 with Spinner("designing") as sp:
                     design, dres = design_brief(goal, spec, self.cfg, self.ol,
                                                 progress=lambda k: sp.tick())
+                used_design_model = str(
+                    (getattr(dres, "raw", {}) or {}).get("spiral_role_model")
+                    or design_model
+                )
                 if design:
                     design_f.write_text(design)
-                    self.ledger.log("plan", phase="design", model=self.cfg.critic.name,
+                    self.ledger.log("plan", phase="design", model=used_design_model,
                                     ptok=dres.prompt_tokens, ctok=dres.completion_tokens)
                     self.ledger.thinking("design", dres.thinking)
                     c.print(f"  [green]●[/] design brief · {len(design)} chars → .spiral/design.md · [dim]{dres.total_tokens} tok[/]")
-                self.ol.evict(self.cfg.critic.name)  # planner takes the lane back
+                if used_design_model != self.cfg.planner.name:
+                    self.ol.evict(used_design_model)
             # distill the brief into concrete tokens the harness can materialize
             if not tokens_f.is_file():
                 with Spinner("design tokens") as sp:
@@ -1010,14 +1031,28 @@ class Conductor:
         self.ledger.thinking("draft", res.thinking)
         c.print(f"  [green]●[/] draft plan · {plan.task_count} tasks · [dim]{res.total_tokens} tok[/]")
 
+        normalize_plan_requirements(spec, plan)
+        initial_lint = (lint_plan(plan, existing) + coverage_gaps(spec, plan)
+                        + lint_contracts(plan, self.ws))
+        critic_rounds = self.orchestration_policy.critic_rounds(
+            deterministic_defects=len(initial_lint), task_count=plan.task_count,
+            requested_rounds=self.cfg.plan_rounds,
+        )
         reviews = []
-        for rnd in range(1, self.cfg.plan_rounds + 1):
+        if critic_rounds == 0:
+            reviews.append({
+                "round": 0, "verdict": "not_warranted", "defects": [],
+                "policy": "single resident model; deterministic checks found no elevated risk",
+            })
+            c.print("  [dim]○ independent critic not warranted by current risk/evidence policy[/]")
+        for rnd in range(1, critic_rounds + 1):
             normalize_plan_requirements(spec, plan)
             lint = (lint_plan(plan, existing) + coverage_gaps(spec, plan)
                     + lint_contracts(plan, self.ws))
             for d in lint:
                 c.print(f"     [yellow]lint:[/] {d}")
-            self.ol.evict(self.cfg.planner.name)  # make room for the critic
+            if self.cfg.critic.name != self.cfg.planner.name:
+                self.ol.evict(self.cfg.planner.name)  # warranted independent-family swap
             with Spinner(f"critic round {rnd}") as sp:
                 try:
                     verdict, defects, res = critique_plan(
@@ -1045,7 +1080,8 @@ class Conductor:
                    delay=0.06)
             if verdict == "pass" or not defects:
                 break
-            self.ol.evict(self.cfg.critic.name)  # planner returns
+            if self.cfg.critic.name != self.cfg.planner.name:
+                self.ol.evict(self.cfg.critic.name)  # planner returns
             with Spinner("repairing plan") as sp:
                 try:
                     plan, res = repair_plan(goal, plan, defects, self.gate, self.cfg, self.ol, progress=lambda k: sp.tick())
@@ -1107,6 +1143,48 @@ class Conductor:
             pass  # distillation must never break the run
 
     # -- the victory lap: one card that tells the whole run ------------------------
+    def _write_evidence_result(self, *, outcome: str, blocked: list[str], atom: Atom) -> dict:
+        dag = getattr(self, "_evidence_dag", TaskEvidenceDAG())
+        extra: list[EvidenceRecord] = []
+        if self.state.get("hygiene_clean") and self.state.get("hygiene_gate"):
+            command = str(self.state.get("hygiene_gate") or self.gate)
+            extra.append(EvidenceRecord(
+                evidence_level_for_command(command),
+                "clean, non-incremental project gate passed", command=command,
+                artifact=self._revision(), source="Spiral deterministic gate",
+            ))
+        if self.state.get("spec_green"):
+            extra.append(EvidenceRecord(
+                EvidenceLevel.BEHAVIOR,
+                "declared requirements passed the final validation fixed point",
+                artifact=".spiral/validation.json", source="Spiral validation gate",
+            ))
+        report = dag.evidence_report([
+            *blocked,
+            *(str(gap) for gap in (self.state.get("gaps") or [])),
+        ])
+        report.records.extend(extra)
+        evidence = report.to_dict()
+        payload = {
+            "schema_version": 1,
+            "kind": "spiral.build.handoff",
+            "outcome": outcome,
+            "revision": self._revision(),
+            "evidence": evidence,
+            "budget": getattr(getattr(atom, "ol", None), "budget", None).snapshot()
+            if getattr(getattr(atom, "ol", None), "budget", None) is not None else {},
+            "task_graph": ".spiral/task-evidence-dag.json",
+        }
+        target = self._dir() / "result.json"
+        temporary = target.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        temporary.replace(target)
+        self._write_state(
+            result_handoff=str(target), evidence_levels=evidence["levels"],
+            uncertainty=evidence["uncertainty"],
+        )
+        return payload
+
     def _summary_card(self, atom: Atom, t0: float, green: int, blocked: list, total: int) -> None:
         st = atom.run_stats
         mins = (time.time() - t0) / 60
@@ -1118,12 +1196,18 @@ class Conductor:
                    else f"[yellow]{len(self.state.get('gaps', []))} spec gap(s) remain[/]" if spec_green is False
                    else "[dim]spec not validated[/]")
         lines.append(f"[bold]{green}/{total}[/] tasks green · {len(blocked)} blocked · {verdict}")
-        lines.append(f"Σ [bold]{atom.tokens:,}[/] tok ({st['ptok'] // 1000}k in / {st['ctok'] // 1000}k out) "
-                     f"· {st['attempts']} attempts · {st['esc_lanes']} escalation(s) · {mins:.0f}m wall")
+        joint = getattr(atom.ol, "budget", None)
+        joint_tokens = joint.total_tokens if joint is not None else atom.tokens
+        lines.append(f"Σ [bold]{joint_tokens:,}[/] joint tok "
+                     f"· {getattr(joint, 'calls', st['attempts'])} model call(s) "
+                     f"· {st['esc_lanes']} escalation(s) · {mins:.0f}m wall")
         for m, tps in sorted(st["tps"].items()):
             med = sorted(tps)[len(tps) // 2]
             lines.append(f"[dim]{m}[/] · {len(tps)} gen · median {med:.0f} t/s")
-        lines.append(f"≈ [bold]${cloud:.2f}[/] of cloud API · spent [bold green]$0.00[/] · your hardware, your tokens")
+        evidence = self.state.get("evidence_levels") or []
+        uncertainty = (self.state.get("uncertainty") or {}).get("level", "unknown")
+        lines.append(f"evidence: {', '.join(evidence) or 'none'} · uncertainty: [bold]{uncertainty}[/]")
+        lines.append(f"≈ [bold]${cloud:.2f}[/] cloud-equivalent worker traffic · local compute is finite and budgeted")
         self.c.print(Panel("\n".join(lines), title=f"[{CLAY}]⠷ run summary[/]",
                            border_style=CLAY, padding=(0, 1)))
 
@@ -1355,7 +1439,8 @@ class Conductor:
                             "files": []},
                 })
 
-        self.ol.evict(self.cfg.planner.name)
+        if opined and self.cfg.critic.name != self.cfg.planner.name:
+            self.ol.evict(self.cfg.planner.name)
         for i in range(0, len(opined), self.VALIDATE_CHUNK):
             batch = opined[i:i + self.VALIDATE_CHUNK]
             label = f"validating {batch[0]['id']}–{batch[-1]['id']}"
@@ -1497,13 +1582,14 @@ class Conductor:
                 f"  [dim]remediation batch: {len(tasks)} now · {deferred} deferred "
                 "until evidence is refreshed[/]"
             )
-        self.ol.evict(self.cfg.critic.name)  # workers take the lane back
+        if self.cfg.critic.name != self.cfg.planner.name:
+            self.ol.evict(self.cfg.critic.name)  # workers take the lane back
         plan = Plan("close validation gaps", [Milestone("validation gaps", tasks)])
         with Dash(console=self.c, plan=plan, gate=self.gate,
                   thought_log=self._dir() / "thoughts.jsonl") as dash:
             for ti, t in enumerate(tasks, 1):
                 if atom.budget_exhausted:
-                    dash.print("[red]■ token budget reached before next remediation task[/]")
+                    dash.print("[red]■ execution budget reached before next remediation task[/]")
                     break
                 dash.task(1, ti, "run")
                 dash.print(f"[bold]▶ V.{ti} {t.title}[/]")
@@ -1529,7 +1615,7 @@ class Conductor:
                     self._verify_new_gate(dash, atom, goal)
                 dash.task(1, ti, "blocked" if status == "blocked" else "done")
                 if atom.budget_exhausted:
-                    dash.print("[red]■ token budget reached during remediation[/]")
+                    dash.print("[red]■ execution budget reached during remediation[/]")
                     break
         changed = bool(before and self._revision() != before)
         if changed:
@@ -1926,13 +2012,13 @@ class Conductor:
         (remediation of validator-proven gaps)."""
         strict = not ratchet
         if atom.budget_exhausted:
-            ui.print("  [red]■ run token budget reached; task was not started[/]")
+            ui.print("  [red]■ run execution budget reached; task was not started[/]")
             return "blocked"
         if atom.run(spec, attempts=attempts, strict_green=strict, ratchet=ratchet,
                     allow_done=allow_done, ui=ui, route=getattr(self, "_route", None)):
             return "green"
         if atom.budget_exhausted:
-            ui.print("  [red]■ run token budget reached; escalation suppressed[/]")
+            ui.print("  [red]■ run execution budget reached; escalation suppressed[/]")
             return "blocked"
         ui.print(f"  [rgb(217,119,87)]⇑ escalating to {self.cfg.escalation.name}[/]")
         atom.run_stats["esc_lanes"] += 1
@@ -2134,7 +2220,9 @@ class Conductor:
                     c.print("  [dim]aborted — plan is saved; rerun with --resume to use it[/]")
                     return
 
-        atom = Atom(self.ws, self.cfg, console=c)
+        # Planning and execution share one client so role prompts reuse residency
+        # and every token/call/wall second lands in the same finite run ledger.
+        atom = Atom(self.ws, self.cfg, console=c, ol=self.ol)
 
         # the router: fold prior runs' ledger into per-signature verdicts, so
         # error classes the worker has never beaten skip its lane entirely
@@ -2148,6 +2236,8 @@ class Conductor:
         self._route = (lambda sig: _route.decide(sig, sig_stats)) if hard else None
 
         prior_records = dict(self.state.get("task_records") or {}) if resume else {}
+        self._evidence_dag = TaskEvidenceDAG.from_plan(plan)
+        dag_path = self._dir() / "task-evidence-dag.json"
         current_tasks = {
             f"{mi}.{ti}": task
             for mi, milestone in enumerate(plan.milestones, 1)
@@ -2165,6 +2255,31 @@ class Conductor:
             for mi, milestone in enumerate(plan.milestones, 1)
             for ti, task in enumerate(milestone.tasks, 1)
         )
+        for key, task in current_tasks.items():
+            row = prior_records.get(key) or {}
+            status = str(row.get("status") or "")
+            # Blocked records are retried on resume, so they stay pending in the
+            # fresh graph. Completed/skipped work is terminal and unlocks ordering.
+            if status not in {"green", "escalated", "skipped"}:
+                continue
+            if not self._task_is_resumably_done(key, task):
+                continue
+            evidence = []
+            command = str(getattr(task, "verify", "") or self.gate)
+            if status in {"green", "escalated"} and command:
+                evidence.append(EvidenceRecord(
+                    evidence_level_for_command(command),
+                    f"resumed task {key} retains a recorded passing gate",
+                    artifact=str(row.get("head") or ""), command=command,
+                    source=".spiral/state.json",
+                ))
+            self._evidence_dag.finish(
+                key,
+                TaskState.COMPLETE if status in {"green", "escalated"}
+                else TaskState.SKIPPED,
+                evidence,
+            )
+        self._evidence_dag.save(dag_path)
         self._write_state(
             goal=raw_goal, gate=self.gate, tasks_total=total,
             tasks_done=resumed_done,
@@ -2228,6 +2343,8 @@ class Conductor:
                         dash.task(0, 0, "blocked")
                         dash.print("[red]■ bootstrap could not reach green — aborting run (nothing can be verified).[/]")
                         self._write_state(blocked=["M0 bootstrap"], tokens=atom.tokens, outcome="bootstrap_failed")
+                        self._write_evidence_result(
+                            outcome="bootstrap_failed", blocked=["M0 bootstrap"], atom=atom)
                         return
                     dash.task(0, 0, "done")
                     self._write_state(
@@ -2277,13 +2394,19 @@ class Conductor:
                             task_records=records, blocked=blocked,
                             tasks_done=processed_count,
                         )
+                        self._evidence_dag.finish(task_key, TaskState.SKIPPED)
+                        self._evidence_dag.save(dag_path)
                         continue
                     if decision == "quit":
                         dash.print("  [yellow]■ stopped by you — green work is committed; --resume continues[/]")
                         watcher.stop()
                         self._write_state(outcome="user_stop", tokens=atom.tokens)
+                        self._write_evidence_result(
+                            outcome="user_stop", blocked=blocked, atom=atom)
                         return
                     dash.task(mi, ti, "run")
+                    self._evidence_dag.start(task_key)
+                    self._evidence_dag.save(dag_path)
                     self._write_state(
                         active_task=task_key,
                         active_task_fingerprint=self._task_fingerprint(t),
@@ -2339,6 +2462,20 @@ class Conductor:
                         dash.task(mi, ti, "done")
                         self._hook("task_green", t.title)
                     current_head = self._revision()
+                    task_evidence = []
+                    if status != "blocked" and verify:
+                        task_evidence.append(EvidenceRecord(
+                            evidence_level_for_command(verify),
+                            f"task {task_key} verification passed",
+                            artifact=current_head, command=verify,
+                            source="Spiral task transaction",
+                        ))
+                    self._evidence_dag.finish(
+                        task_key,
+                        TaskState.BLOCKED if status == "blocked" else TaskState.COMPLETE,
+                        task_evidence,
+                    )
+                    self._evidence_dag.save(dag_path)
                     records = dict(self.state.get("task_records") or {})
                     records[task_key] = {
                         "status": status,
@@ -2357,8 +2494,14 @@ class Conductor:
                         update["last_green_head"] = current_head
                     self._write_state(**update)
                     if atom.budget_exhausted:
-                        dash.print(f"[red]■ run token budget reached[/] ({atom.tokens}) — stopping; resume with --resume")
+                        dimension = getattr(atom.ol, "budget", None)
+                        dimension = dimension.exhausted_dimension() if dimension is not None else "token"
+                        dash.print(
+                            f"[red]■ run {dimension or 'execution'} budget reached[/] "
+                            "— stopping; resume with --resume")
                         self._write_state(outcome="budget_stop")
+                        self._write_evidence_result(
+                            outcome="budget_stop", blocked=blocked, atom=atom)
                         return
 
             # ---- report ---------------------------------------------------------
@@ -2465,4 +2608,5 @@ class Conductor:
             f"{green_count}/{total} tasks green · "
             + ("spec green" if spec_green else "finish gaps remain"),
         )
+        self._write_evidence_result(outcome=outcome, blocked=blocked, atom=atom)
         self._summary_card(atom, t0, green_count, blocked, total)

@@ -414,6 +414,11 @@ def _apply_one(root: Path, b: EditBlock) -> EditResult:
         fp = resolve_workspace_path(root, b.path)
     except WorkspacePathError as exc:
         return EditResult(b.path, False, reason=f"invalid path: {exc}")
+    from spiral.safety_kernel import protected_relative_path, rejection_reason
+
+    protected = protected_relative_path(root, fp)
+    if protected:
+        return EditResult(b.path, False, reason=rejection_reason(protected))
     try:
         if fp.exists() and not fp.is_file():
             return EditResult(

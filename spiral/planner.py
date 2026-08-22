@@ -695,8 +695,12 @@ def design_tokens(goal: str, spec: list[dict], brief: str = "", cfg: Config | No
 
 def design_brief(goal: str, spec: list[dict], cfg: Config | None = None,
                  ol: Ollama | None = None, progress=None) -> tuple[str, ChatResult]:
-    """One-time concrete design spec (critic thinking, fallback ladder). Free-form
-    markdown — no JSON constraint, so the ladder checks length not parse."""
+    """One-time concrete design spec using a role prompt on the resident model.
+
+    An independent family is only the recovery rung when the resident model fails
+    to produce a usable brief; visual taste alone is not evidence that a model swap
+    is worth the RAM and latency.
+    """
     cfg = cfg or Config.load()
     ol = ol or Ollama(cfg.base_url)
     reqs = "\n".join(f"{r['id']}: {r['text']}" for r in spec)
@@ -705,10 +709,27 @@ def design_brief(goal: str, spec: list[dict], cfg: Config | None = None,
         {"role": "user", "content": f"GOAL:\n{goal}\n\nREQUIREMENTS:\n{reqs}\n\nWrite the design specification."},
     ]
     res = None
-    for m, th in ((cfg.critic.name, cfg.critic.think), (cfg.critic.name, False), (cfg.planner.name, False)):
+    if getattr(cfg, "prefer_single_resident_model", True):
+        ladder = [
+            (cfg.planner.name, cfg.planner.think),
+            (cfg.planner.name, False),
+            (cfg.critic.name, cfg.critic.think),
+        ]
+    else:
+        ladder = [
+            (cfg.critic.name, cfg.critic.think),
+            (cfg.critic.name, False),
+            (cfg.planner.name, False),
+        ]
+    for m, th in ladder:
+        if (getattr(cfg, "prefer_single_resident_model", True)
+                and m != cfg.planner.name):
+            ol.evict(cfg.planner.name)
         res = ol.chat(m, msgs, think=th, num_predict=cfg.planner_max_tokens, temperature=0.6,
                       num_ctx=cfg.spec_for(m).num_ctx, keep_alive=cfg.keep_alive,
                       on_delta=(lambda kind, piece: progress(kind)) if progress else None)
+        if isinstance(res.raw, dict):
+            res.raw.setdefault("spiral_role_model", m)
         if len(res.text.strip()) > 400:
             return res.text.strip(), res
     return (res.text.strip() if res else ""), res

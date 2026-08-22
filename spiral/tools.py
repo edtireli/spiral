@@ -120,7 +120,14 @@ def run(cmd: str, cwd: str | Path, timeout: int = 120, on_line=None,
         code = proc.wait(timeout=30)
     except Exception as e:
         proc.kill()
+        try:
+            proc.wait(timeout=30)
+        except Exception:
+            pass
         return RunResult(cmd, 124, "".join(lines) + f"\n(stream error: {e})")
+    finally:
+        if proc.stdout is not None:
+            proc.stdout.close()
     return RunResult(cmd, code, "".join(lines).strip())
 
 
