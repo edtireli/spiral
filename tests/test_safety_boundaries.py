@@ -37,6 +37,55 @@ def test_full_access_uses_an_available_shell_on_linux(tmp_path, monkeypatch):
     assert sandboxed is False
 
 
+def test_linux_workspace_profile_uses_bwrap_with_network_and_reference_isolation(
+    tmp_path, monkeypatch,
+):
+    import spiral.command_broker as broker_module
+
+    target = tmp_path / "target"
+    target.mkdir()
+    reference = tmp_path / "reference"
+    reference.mkdir()
+    cfg = Config()
+    cfg.builder_reference_roots = [str(reference)]
+    broker = CommandBroker(target, cfg)
+    monkeypatch.setattr(broker_module.sys, "platform", "linux")
+    monkeypatch.setattr(
+        broker_module.shutil, "which",
+        lambda name: "/usr/bin/bwrap" if name == "bwrap" else None,
+    )
+
+    argv, sandboxed = broker._argv(
+        "true", target, allow_network=False, allow_host_read=False,
+    )
+
+    assert sandboxed is True
+    assert argv[0] == "/usr/bin/bwrap"
+    assert "--unshare-net" in argv
+    assert ["--bind", str(target), str(target)] == argv[
+        argv.index("--bind"):argv.index("--bind") + 3
+    ]
+    ref_at = next(
+        index for index in range(len(argv) - 2)
+        if argv[index:index + 3] == ["--ro-bind", str(reference), str(reference)]
+    )
+    assert ref_at > 0
+
+
+def test_workspace_mode_fails_closed_when_linux_sandbox_is_unavailable(
+    tmp_path, monkeypatch,
+):
+    import spiral.command_broker as broker_module
+
+    monkeypatch.setattr(broker_module.sys, "platform", "linux")
+    monkeypatch.setattr(broker_module.shutil, "which", lambda _name: None)
+
+    result = CommandBroker(tmp_path).run("true", require_sandbox=True).result
+
+    assert result.blocked and result.code == 126
+    assert "no network/filesystem sandbox" in result.out
+
+
 def test_workspace_broker_cannot_be_tricked_into_host_reads(tmp_path, monkeypatch):
     """Even a stale/hostile local-model caller cannot widen project-only access."""
     import spiral.command_broker as broker_module

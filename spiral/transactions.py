@@ -147,7 +147,10 @@ def _restore_snapshot(root: Path, directory: Path, baseline: set[str]) -> None:
 
 def _git(root: Path, *args: str, check: bool = False) -> subprocess.CompletedProcess:
     return subprocess.run(
-        ["git", *args], cwd=root, capture_output=True, text=True,
+        [
+            "git", "-c", "user.name=Spiral", "-c",
+            "user.email=spiral@localhost", *args,
+        ], cwd=root, capture_output=True, text=True,
         stdin=subprocess.DEVNULL, check=check,
     )
 

@@ -660,7 +660,9 @@ class Conductor:
                 lines.append(want)
         gi.write_text("\n".join(lines) + "\n")
         snap = tools.run(
-            "git add -A && git commit -q -m 'spiral: pre-run snapshot' --allow-empty",
+            "git add -A && git -c user.name=Spiral "
+            "-c user.email=spiral@localhost commit -q "
+            "-m 'spiral: pre-run snapshot' --allow-empty",
             self.ws,
         )
         if not snap.ok:

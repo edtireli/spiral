@@ -266,7 +266,12 @@ class Atom:
         if external_git_approval():
             return
         if not (self.ws / ".git").is_dir():
-            tools.run("git init -q && git add -A && git commit -q -m 'spiral: baseline' --allow-empty", self.ws)
+            tools.run(
+                "git init -q && git add -A && git -c user.name=Spiral "
+                "-c user.email=spiral@localhost commit -q "
+                "-m 'spiral: baseline' --allow-empty",
+                self.ws,
+            )
 
     def _checkpoint_label(self) -> str:
         if self._transaction is not None and self._transaction.managed:
@@ -280,7 +285,11 @@ class Atom:
             return self._transaction.commit(msg)
         prev = tools.run("git rev-parse --short HEAD", self.ws).out.strip()
         tools.run("git add -A", self.ws)
-        tools.run(f"git commit -q -m {shlex.quote(msg)}", self.ws)
+        tools.run(
+            "git -c user.name=Spiral -c user.email=spiral@localhost "
+            f"commit -q -m {shlex.quote(msg)}",
+            self.ws,
+        )
         head = tools.run("git rev-parse --short HEAD", self.ws).out.strip()
         return head, head != prev
 
