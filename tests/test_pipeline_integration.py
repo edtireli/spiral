@@ -27,6 +27,7 @@ sys.path.insert(0, str(_REPO))
 
 import os  # noqa: E402
 
+from spiral.config import Config  # noqa: E402
 from spiral.conductor import Conductor  # noqa: E402
 
 
@@ -40,7 +41,7 @@ def _conductor(root: Path) -> Conductor:
     environment hook reproduces the production condition without weakening the
     scrubbing.
     """
-    conductor = Conductor(root)
+    conductor = Conductor(root, cfg=Config())
     conductor.command_broker.environment["PYTHONPATH"] = str(_REPO)
     return conductor
 
