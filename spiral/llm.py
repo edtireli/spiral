@@ -20,6 +20,81 @@ from pathlib import Path
 from spiral.execution import BudgetExceeded, BudgetLimits, RunBudget
 
 
+# One CLI process is one admitted Spiral run.  Track only exact local model names
+# that process actually sends to Ollama; terminal cleanup must never discover and
+# sweep somebody else's resident set.
+_owned_local_models_lock = threading.Lock()
+_owned_local_models: set[tuple[str, str]] = set()
+_track_owned_local_models = False
+
+
+def begin_owned_local_model_run() -> None:
+    """Start one process-wide ownership receipt at the shared CLI boundary."""
+    global _track_owned_local_models
+    with _owned_local_models_lock:
+        _owned_local_models.clear()
+        _track_owned_local_models = True
+
+
+def _remember_owned_local_model(base_url: str, model: str) -> None:
+    if not model:
+        return
+    with _owned_local_models_lock:
+        if _track_owned_local_models:
+            _owned_local_models.add((base_url.rstrip("/"), model))
+
+
+def release_owned_local_models(
+    *, client_factory=None, timeout_seconds: float = 3.0,
+) -> list[tuple[str, str]]:
+    """Unload only the exact Ollama models used by the current CLI run.
+
+    Long orchestration keeps its configured residency between steps.  This cleanup
+    happens once, after success, failure, or interruption, while the process can still
+    acquire the shared inference lease.  Hard-offline tests clear the receipt without
+    constructing a client or opening a socket.
+    """
+    global _track_owned_local_models
+    with _owned_local_models_lock:
+        owned = sorted(_owned_local_models)
+        _owned_local_models.clear()
+        _track_owned_local_models = False
+    if os.environ.get("SPIRAL_OFFLINE_TESTS"):
+        return []
+    factory = client_factory or Ollama
+    deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+    released: list[tuple[str, str]] = []
+    by_endpoint: dict[str, list[str]] = {}
+    for base_url, model in owned:
+        by_endpoint.setdefault(base_url, []).append(model)
+    for base_url, models in by_endpoint.items():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            client = factory(base_url, timeout=max(0.001, remaining), providers={})
+        except Exception:
+            continue
+        try:
+            for model in models:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    if client.evict(model, timeout=remaining):
+                        released.append((base_url, model))
+                except Exception:
+                    # Terminal cleanup is best-effort and must never replace the
+                    # run's real success/failure with a secondary unload error.
+                    continue
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
+    return released
+
+
 class OfflineModelAccess(RuntimeError):
     """A test attempted to reach an inference service in hard-offline mode."""
 
@@ -338,7 +413,7 @@ class Ollama:
             raise BudgetExceeded("wall", self.budget.snapshot())
         return max(0.001, min(float(getattr(self, "_timeout", 1200.0)), remaining))
 
-    def evict(self, model: str) -> None:
+    def evict(self, model: str, *, timeout: float | None = None) -> bool:
         """Explicitly unload a model (keep_alive=0 on an empty generate) — swap
         discipline beats letting two 20GB models thrash under RAM pressure."""
         try:
@@ -348,15 +423,75 @@ class Ollama:
                 budget.snapshot()["remaining"]["wall_seconds"]
                 if budget is not None else None
             )
-            scope = (lease.hold(model=model, operation="evict", timeout=remaining)
+            deadline = (
+                time.monotonic() + max(0.0, float(timeout))
+                if timeout is not None else None
+            )
+            lease_timeout = remaining
+            if deadline is not None:
+                lease_timeout = max(0.0, deadline - time.monotonic())
+                if remaining is not None:
+                    lease_timeout = min(float(remaining), lease_timeout)
+            scope = (lease.hold(model=model, operation="evict", timeout=lease_timeout)
                      if lease is not None else contextlib.nullcontext())
             with scope:
-                self._client.post(
+                request_timeout = (
+                    max(0.001, deadline - time.monotonic())
+                    if deadline is not None else None
+                )
+                if deadline is not None and request_timeout <= 0.001:
+                    return False
+                response = self._client.post(
                     f"{self.base_url}/api/generate",
                     json={"model": model, "prompt": "", "keep_alive": 0},
+                    **({"timeout": request_timeout} if request_timeout is not None else {}),
                 )
+                response.raise_for_status()
+            return True
         except Exception:
-            pass
+            return False
+
+    def evict_owned_local_models_except(
+        self, keep: set[str], log=None,
+    ) -> list[str]:
+        """Evict only prior local models receipted by this CLI run.
+
+        This is the safe role-switch seam for an intentional multi-model run.  It
+        never asks Ollama what else is resident, so another app's model cannot be
+        mistaken for memory owned by Spiral.  Without an active run receipt it is
+        deliberately a no-op.
+        """
+        endpoint = self.base_url.rstrip("/")
+        with _owned_local_models_lock:
+            claimed = {
+                (base_url, model) for base_url, model in _owned_local_models
+                if _track_owned_local_models
+                and base_url == endpoint
+                and model not in keep
+            }
+            # Claim each receipt before the POST.  A successful A→B switch must
+            # not send another empty generate for A on every later B call (which
+            # some Ollama versions satisfy by loading A just to unload it again).
+            _owned_local_models.difference_update(claimed)
+        evicted: list[str] = []
+        for receipt in sorted(claimed):
+            _, model = receipt
+            try:
+                released = self.evict(model)
+            except BaseException:
+                with _owned_local_models_lock:
+                    if _track_owned_local_models:
+                        _owned_local_models.add(receipt)
+                raise
+            if not released:
+                with _owned_local_models_lock:
+                    if _track_owned_local_models:
+                        _owned_local_models.add(receipt)
+                continue
+            evicted.append(model)
+            if log:
+                log(model)
+        return evicted
 
     def resident(self) -> list[str]:
         """Model names Ollama currently holds in memory (/api/ps), newest first.
@@ -365,22 +500,31 @@ class Ollama:
         to Ollama: the phone chat keeps its own model loaded, and a second 18 GB
         model landing beside it is a Metal OOM, not a slow run."""
         try:
-            r = self._client.get(f"{self.base_url}/api/ps")
-            r.raise_for_status()
-            return [m["name"] for m in r.json().get("models", []) if m.get("name")]
+            return self.resident_strict()
         except Exception:
             return []
 
-    def free_foreign(self, keep: set[str], log=None) -> list[str]:
-        """Unload every resident model this run will not use. Returns what it freed."""
-        freed = []
-        for name in self.resident():
-            if name not in keep:
-                self.evict(name)
-                freed.append(name)
-                if log:
-                    log(name)
-        return freed
+    def resident_strict(self) -> list[str]:
+        """Return resident names or fail if admission cannot prove the state.
+
+        UI/health callers may use ``resident()`` as a best-effort display.  Model
+        admission must use this strict variant: timeout, HTTP error, TLS failure,
+        or an unknown response shape cannot safely mean "no models resident".
+        """
+        response = self._client.get(f"{self.base_url}/api/ps")
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict) or not isinstance(payload.get("models"), list):
+            raise ValueError("Ollama /api/ps returned an unknown response shape")
+        names: list[str] = []
+        for item in payload["models"]:
+            if not isinstance(item, dict):
+                raise ValueError("Ollama /api/ps returned a malformed model entry")
+            name = item.get("name")
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("Ollama /api/ps returned a model without a name")
+            names.append(name)
+        return names
 
     def health(self) -> str | None:
         """Return the server version, or None if unreachable."""
@@ -525,9 +669,11 @@ class Ollama:
             scope = (lease.hold(model=model, timeout=remaining_wall)
                      if lease is not None else contextlib.nullcontext())
             with scope:
+                request_timeout = self._remaining_request_timeout()
+                _remember_owned_local_model(self.base_url, model)
                 r = self._client.post(
                     f"{self.base_url}/api/chat", json=payload,
-                    timeout=self._remaining_request_timeout(),
+                    timeout=request_timeout,
                 )
                 if r.status_code == 400 and payload.pop("think", None) is not None:
                     # Rejected before inference: retrying the transport shape stays
@@ -565,11 +711,13 @@ class Ollama:
         scope = (lease.hold(model=model, timeout=remaining_wall)
                  if lease is not None else contextlib.nullcontext())
         with scope:
+            request_timeout = self._remaining_request_timeout()
+            _remember_owned_local_model(self.base_url, model)
             for attempt in (1, 2):
                 response = self._client.send(
                     self._client.build_request(
                         "POST", f"{self.base_url}/api/chat", json=payload,
-                        timeout=self._remaining_request_timeout()),
+                        timeout=request_timeout),
                     stream=True)
                 if (response.status_code == 400 and attempt == 1
                         and payload.get("think") is not None):
@@ -948,9 +1096,11 @@ class Ollama:
         last: dict[str, Any] = {}
         try:
             with scope:
+                request_timeout = self._remaining_request_timeout()
+                _remember_owned_local_model(self.base_url, model)
                 with self._client.stream(
                         "POST", f"{self.base_url}/api/chat", json=payload,
-                        timeout=self._remaining_request_timeout()) as r:
+                        timeout=request_timeout) as r:
                     r.raise_for_status()
                     for line in r.iter_lines():
                         if not line:

@@ -409,8 +409,8 @@ def _run_style(ui, args, path: Path, *, rewriting: bool) -> int:
             ui.stage(mi, 1, phase="researching the nearest literature",
                      idea="Diversified scholarly searches fetch primary full text; only the "
                           "closest usable papers enter the style sample.")
-            cfg = Config.load()
-            if getattr(args, "api", None):
+            cfg = getattr(args, "_spiral_model_cfg", None) or Config.load()
+            if getattr(args, "api", None) and not getattr(args, "_spiral_model_cfg", None):
                 _apply_tier(cfg, ui.dash.c, "api", api_key=args.api)
             ol = Ollama(cfg.base_url, providers=cfg.providers)
             query_override = [" ".join(str(query).split()) for query in
@@ -535,8 +535,8 @@ def _rewrite(ui, args, path: Path, doc, template, before: dict, mi: int, *,
     from spiral.config import Config
     from spiral.llm import Ollama
 
-    cfg = Config.load()
-    if getattr(args, "api", None):
+    cfg = getattr(args, "_spiral_model_cfg", None) or Config.load()
+    if getattr(args, "api", None) and not getattr(args, "_spiral_model_cfg", None):
         _apply_tier(cfg, ui.dash.c, "api", api_key=args.api)
     ol = Ollama(cfg.base_url, providers=cfg.providers)
     # rewriting prose is a reasoning job — take the strongest configured model, not the

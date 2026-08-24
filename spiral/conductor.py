@@ -402,6 +402,13 @@ class Conductor:
 
         self.command_broker = CommandBroker(self.ws, self.cfg)
 
+    def _prepare_owned_local_model(self, model: str) -> list[str]:
+        """Make a deliberate local role switch using this run's exact receipts."""
+        if not model or model in getattr(self.ol, "providers", {}):
+            return []
+        switch = getattr(self.ol, "evict_owned_local_models_except", None)
+        return switch({model}) if callable(switch) else []
+
     def _external_git_approval(self) -> bool:
         from spiral.transactions import external_git_approval
 
@@ -988,8 +995,7 @@ class Conductor:
                     self.cfg.planner.name if self.cfg.prefer_single_resident_model
                     else self.cfg.critic.name
                 )
-                if design_model != self.cfg.planner.name:
-                    self.ol.evict(self.cfg.planner.name)
+                self._prepare_owned_local_model(design_model)
                 with Spinner("designing") as sp:
                     design, dres = design_brief(goal, spec, self.cfg, self.ol,
                                                 progress=lambda k: sp.tick())
@@ -1004,7 +1010,7 @@ class Conductor:
                     self.ledger.thinking("design", dres.thinking)
                     c.print(f"  [green]●[/] design brief · {len(design)} chars → .spiral/design.md · [dim]{dres.total_tokens} tok[/]")
                 if used_design_model != self.cfg.planner.name:
-                    self.ol.evict(used_design_model)
+                    self._prepare_owned_local_model(self.cfg.planner.name)
             # distill the brief into concrete tokens the harness can materialize
             if not tokens_f.is_file():
                 with Spinner("design tokens") as sp:
@@ -1052,7 +1058,7 @@ class Conductor:
             for d in lint:
                 c.print(f"     [yellow]lint:[/] {d}")
             if self.cfg.critic.name != self.cfg.planner.name:
-                self.ol.evict(self.cfg.planner.name)  # warranted independent-family swap
+                self._prepare_owned_local_model(self.cfg.critic.name)
             with Spinner(f"critic round {rnd}") as sp:
                 try:
                     verdict, defects, res = critique_plan(
@@ -1081,7 +1087,7 @@ class Conductor:
             if verdict == "pass" or not defects:
                 break
             if self.cfg.critic.name != self.cfg.planner.name:
-                self.ol.evict(self.cfg.critic.name)  # planner returns
+                self._prepare_owned_local_model(self.cfg.planner.name)
             with Spinner("repairing plan") as sp:
                 try:
                     plan, res = repair_plan(goal, plan, defects, self.gate, self.cfg, self.ol, progress=lambda k: sp.tick())
@@ -1440,7 +1446,7 @@ class Conductor:
                 })
 
         if opined and self.cfg.critic.name != self.cfg.planner.name:
-            self.ol.evict(self.cfg.planner.name)
+            self._prepare_owned_local_model(self.cfg.critic.name)
         for i in range(0, len(opined), self.VALIDATE_CHUNK):
             batch = opined[i:i + self.VALIDATE_CHUNK]
             label = f"validating {batch[0]['id']}–{batch[-1]['id']}"
@@ -1583,7 +1589,7 @@ class Conductor:
                 "until evidence is refreshed[/]"
             )
         if self.cfg.critic.name != self.cfg.planner.name:
-            self.ol.evict(self.cfg.critic.name)  # workers take the lane back
+            self._prepare_owned_local_model(self.cfg.worker.name)
         plan = Plan("close validation gaps", [Milestone("validation gaps", tasks)])
         with Dash(console=self.c, plan=plan, gate=self.gate,
                   thought_log=self._dir() / "thoughts.jsonl") as dash:

@@ -29,8 +29,8 @@ def _fit(history: list[dict], budget_chars: int) -> list[dict]:
     return history
 
 
-def chat(first: str = "", model: str | None = None) -> None:
-    cfg = Config.load()
+def chat(first: str = "", model: str | None = None, cfg: Config | None = None) -> None:
+    cfg = cfg or Config.load()
     ol = Ollama(cfg.base_url, providers=cfg.providers)
     model = model or cfg.planner.name
     c = make_console()
