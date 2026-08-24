@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
+import threading
 from pathlib import Path
 
 from rich.console import Console
@@ -16,7 +18,11 @@ from rich.console import Console
 from spiral.banner import print_banner
 from spiral.theme import make_console, reveal
 from spiral.config import Config
-from spiral.llm import Ollama
+from spiral.llm import (
+    Ollama,
+    begin_owned_local_model_run,
+    release_owned_local_models,
+)
 
 
 def _health(console: Console) -> None:
@@ -100,45 +106,80 @@ def _apply_uncensored(console) -> None:
                     "worker, planner, escalation [dim](judges stay stock)[/]\n")
 
 
-def _free_foreign_models(console) -> None:
-    """Unload models this run will not use before it loads its own.
+def _free_foreign_models(console, cfg=None) -> None:
+    """Read-only residency preflight; never evict a model this run does not own.
 
-    spiral shares Ollama with the phone chat now, and that chat holds an 18 GB
-    model resident on a 32 GB machine. Loading a second one beside it does not
-    swap — Metal reports kIOGPUCommandBufferCallbackErrorOutOfMemory and the run
-    dies mid-plan with a bare HTTP 500. Freeing first costs one reload at worst.
+    The historical name is retained for callers, but the destructive sweep is
+    intentionally gone.  A foreign resident can make a second large model fail
+    with Metal OOM on a 32 GB Mac; stopping with an actionable message preserves
+    ownership and is safer than silently unloading another app's model.
     """
-    # Unit/offline verification is not allowed to wake, inspect, or evict a
-    # user's resident models. This guard also avoids even a loopback probe.
+    # Unit/offline verification is not allowed to wake or inspect a user's
+    # resident models. This guard avoids even a loopback probe.
     if os.environ.get("SPIRAL_OFFLINE_TESTS"):
         return
 
-    from spiral.config import Config
+    cfg = cfg or Config.load()
 
-    cfg = Config.load()
-    keep = {
-        cfg.worker.name, cfg.planner.name, cfg.escalation.name,
-        cfg.critic.name, cfg.research_auditor.name, cfg.janitor.name,
-    }
-    # Sweep every loopback spelling, not just the configured one. macOS resolves
+    def connection_refused(error: BaseException) -> bool:
+        """Recognise only a definitive empty auxiliary socket, not ambiguity."""
+        seen: set[int] = set()
+        current: BaseException | None = error
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if isinstance(current, ConnectionRefusedError) or (
+                getattr(current, "errno", None) in {61, 111}
+            ):
+                return True
+            current = current.__cause__ or current.__context__
+        text = str(error).lower()
+        return "connection refused" in text and ("errno 61" in text or "errno 111" in text)
+    # Inspect every loopback spelling, without mutating any of them. macOS resolves
     # `localhost` to ::1 and 127.0.0.1 to a DIFFERENT socket, and a machine can end
     # up running two ollama servers at once (the menu-bar app starts its own beside
-    # a LaunchAgent-managed one). They keep separate memory pools, so the 18 GB that
-    # OOMs this run is often held by the instance we are not talking to.
-    seen, freed = set(), []
+    # a LaunchAgent-managed one). They keep separate memory pools.
+    preexisting: list[tuple[str, str]] = []
+    failures: list[tuple[str, str]] = []
     for url in dict.fromkeys([cfg.base_url,
                               "http://127.0.0.1:11434", "http://localhost:11434"]):
         client = Ollama(url, providers=cfg.providers)
         try:
-            for name in client.free_foreign(keep):
-                if name not in seen:
-                    seen.add(name)
-                    freed.append(name)
+            try:
+                names = client.resident_strict()
+            except Exception as exc:
+                # A refused auxiliary loopback address proves no Ollama process is
+                # listening there. Every other failure is ambiguous and admission
+                # must stop rather than pretending the resident set is empty.
+                is_auxiliary = url.rstrip("/") != cfg.base_url.rstrip("/")
+                if is_auxiliary and connection_refused(exc):
+                    names = []
+                else:
+                    failures.append((url.rstrip("/"),
+                                     f"{type(exc).__name__}: {exc}"))
+                    names = []
+            preexisting.extend((url.rstrip("/"), name) for name in names)
         finally:
             client.close()
-    if freed:
-        reveal(console,
-               f"  [dim]◇ freed {', '.join(freed)} — this run needs the memory[/]\n")
+    if failures:
+        details = "\n".join(
+            f"    - {url}: {error}" for url, error in sorted(set(failures))
+        )
+        raise SystemExit(
+            "Spiral could not prove Ollama residency is safe:\n"
+            f"{details}\n"
+            "No model was unloaded. Restore the endpoint, then retry."
+        )
+    if preexisting:
+        details = "\n".join(
+            f"    - {name} at {url}" for url, name in sorted(set(preexisting))
+        )
+        raise SystemExit(
+            "Spiral found model(s) resident before this run began:\n"
+            f"{details}\n"
+            "Even a configured name may belong to the phone or another app, so Spiral "
+            "will not claim or evict it. Finish that work or unload the named model "
+            "explicitly, then retry."
+        )
 
 
 def _load_goal(args) -> str:
@@ -158,6 +199,44 @@ def _load_goal(args) -> str:
             make_console().print("  [dim]▸ reusing the goal from the last run (.spiral/plan.json)[/]\n")
             return goal
     raise SystemExit('give spiral a goal:  spiral build "make me a …"  (or --goal-file F)')
+
+
+def _admit_model_command(args, console):
+    """Apply one strict local-residency gate before any model-bearing branch."""
+    command = getattr(args, "cmd", None)
+    model_bearing = command in {"chat", "do", "plan", "build", "validate"}
+    if command == "prose":
+        model_bearing = bool(
+            getattr(args, "rewrite", False)
+            or getattr(args, "deep", False)
+            or getattr(args, "beef_up", False)
+            or getattr(args, "restructure", False)
+            or getattr(args, "audit", False)
+        )
+    if command == "research":
+        non_model_view = bool(
+            getattr(args, "taste_like", None)
+            or getattr(args, "taste_dislike", None)
+            or getattr(args, "history", False)
+            or getattr(args, "audit", False)
+            or getattr(args, "graph", False)
+        )
+        model_bearing = not non_model_view
+    if not model_bearing:
+        return None
+
+    cfg = Config.load()
+    tier = None
+    if command in {"build", "research"}:
+        tier = ("api" if getattr(args, "api", None)
+                else "boost" if getattr(args, "boost", False) else None)
+    elif command == "prose" and getattr(args, "api", None):
+        tier = "api"
+    cfg = _apply_tier(
+        cfg, console, tier, api_key=getattr(args, "api", None),
+    )
+    _free_foreign_models(console, cfg)
+    return cfg
 
 
 def _load_research_topic(args, console: Console) -> str:
@@ -407,6 +486,12 @@ def main() -> None:
     if getattr(args, "uncensored", False):
         _apply_uncensored(console)
 
+    # This is the single admission boundary for every branch that can dispatch a
+    # model. Read-only/status/help commands never touch Ollama residency.
+    model_cfg = _admit_model_command(args, console)
+    if model_cfg is not None:
+        setattr(args, "_spiral_model_cfg", model_cfg)
+
     if args.cmd == "tune":
         from spiral.tune import main as tune_main
 
@@ -432,7 +517,7 @@ def main() -> None:
     if args.cmd == "chat":
         from spiral.chat import chat
 
-        chat(args.message, model=args.model)
+        chat(args.message, model=args.model, cfg=model_cfg)
         return
 
     if args.cmd == "style":
@@ -596,10 +681,7 @@ def main() -> None:
 
     if args.cmd == "research" and getattr(args, "refine", None):
         from spiral.research_refine import RefineError, RefineRun
-        cfg = Config.load()
-        _apply_tier(cfg, console, "api" if getattr(args, "api", None)
-                    else "boost" if getattr(args, "boost", False) else None,
-                    api_key=getattr(args, "api", None))
+        cfg = model_cfg
         target = Path(args.refine).resolve()
         console.print(f"  [dim]refine · {target}[/]")
         run = RefineRun(target, cfg=cfg,
@@ -631,10 +713,7 @@ def main() -> None:
         label = ("refresh · " if getattr(args, "refresh", False)
                  else "resume · " if getattr(args, "resume", False) else "")
         console.print(f"  [dim]{label}{query[:100]}{'…' if len(query) > 100 else ''}[/]")
-        cfg = Config.load()
-        _apply_tier(cfg, console, "api" if getattr(args, "api", None)
-                    else "boost" if getattr(args, "boost", False) else None,
-                    api_key=getattr(args, "api", None))
+        cfg = model_cfg
         if getattr(args, "auto_repos", False):
             cfg.research_repo_auto = True
         if getattr(args, "no_blind_replication", False):
@@ -723,7 +802,9 @@ def main() -> None:
             return
         console.print(f"  [green]●[/] {len(hits)} sources")
         with Spinner("synthesizing" + (" · thinking" if args.deep else "")) as sp:
-            answer, used, res = synthesize(query, hits, deep=args.deep, on=lambda: sp.tick())
+            answer, used, res = synthesize(
+                query, hits, cfg=model_cfg, deep=args.deep, on=lambda: sp.tick(),
+            )
         console.print(Panel(answer.strip() or "(no answer)", title="[rgb(217,119,87)]⭷ research[/]",
                             border_style="rgb(217,119,87)", padding=(0, 1)))
         slug = _re.sub(r"[^a-z0-9]+", "-", query.lower())[:40].strip("-") or "answer"
@@ -739,7 +820,9 @@ def main() -> None:
         _info_line(console, args.dir,
                    f"  goal   [bold]{args.goal}[/]",
                    f"  verify [dim]{args.verify}[/]\n")
-        ok = Atom(workspace=args.dir).run(TaskSpec(args.goal, args.verify, args.file))
+        ok = Atom(workspace=args.dir, cfg=model_cfg).run(
+            TaskSpec(args.goal, args.verify, args.file),
+        )
         raise SystemExit(0 if ok else 1)
 
     if args.cmd in ("plan", "build", "validate"):
@@ -747,10 +830,7 @@ def main() -> None:
 
         goal = _load_goal(args)
         _info_line(console, args.dir)
-        _free_foreign_models(console)
-        cfg = _apply_tier(Config.load(), console,
-                          "api" if getattr(args, "api", None) else ("boost" if getattr(args, "boost", False) else None),
-                          api_key=getattr(args, "api", None))
+        cfg = model_cfg
         if os.environ.get("SPIRALCHAT_EXTERNAL_GIT_APPROVAL") == "1":
             # Clone/fetch/pull/commit/push are controller capabilities in a
             # SpiralChat-managed run. The model may inspect Git, but it cannot
@@ -821,24 +901,43 @@ def main() -> None:
 def entry() -> None:
     from spiral.harness_check import HarnessFault
 
+    # The host stops detached jobs with SIGTERM. Translate that request into a
+    # normal Python unwind so the same exact-owned-model cleanup used for Ctrl-C
+    # runs before process exit. SIGKILL remains intentionally uncatchable.
+    previous_sigterm = None
+    if threading.current_thread() is threading.main_thread():
+        previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+        def terminate(signum, _frame):
+            raise SystemExit(128 + signum)
+
+        signal.signal(signal.SIGTERM, terminate)
+    begin_owned_local_model_run()
     try:
-        main()
-    except HarnessFault as fault:
-        # Not a build failure. The gate could not measure anything, so stopping and
-        # saying why is the honest outcome — reporting the code as red would be a lie
-        # about work that was never tested.
-        make_console().print(
-            f"\n  [red]■ stopped: the build gate is not usable[/]\n\n{fault}\n\n"
-            "  [dim]Nothing here is a verdict on your code. Fix the gate or its "
-            "environment, then resume with the same command + --resume[/]\n"
-        )
-        raise SystemExit(3)
-    except KeyboardInterrupt:
-        make_console().print(
-            "\n  [rgb(217,119,87)]⠿ interrupted[/] — green work is committed, banked "
-            "checkpoints kept. [dim]Resume with the same command + --resume[/]\n"
-        )
-        raise SystemExit(130)
+        try:
+            main()
+        except HarnessFault as fault:
+            # Not a build failure. The gate could not measure anything, so stopping and
+            # saying why is the honest outcome — reporting the code as red would be a lie
+            # about work that was never tested.
+            make_console().print(
+                f"\n  [red]■ stopped: the build gate is not usable[/]\n\n{fault}\n\n"
+                "  [dim]Nothing here is a verdict on your code. Fix the gate or its "
+                "environment, then resume with the same command + --resume[/]\n"
+            )
+            raise SystemExit(3)
+        except KeyboardInterrupt:
+            make_console().print(
+                "\n  [rgb(217,119,87)]⠿ interrupted[/] — green work is committed, banked "
+                "checkpoints kept. [dim]Resume with the same command + --resume[/]\n"
+            )
+            raise SystemExit(130)
+    finally:
+        try:
+            release_owned_local_models()
+        finally:
+            if previous_sigterm is not None:
+                signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 if __name__ == "__main__":

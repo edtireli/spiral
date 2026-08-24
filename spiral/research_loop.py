@@ -992,6 +992,20 @@ class ResearchLoop:
         half = max_chars // 2
         return user[:half].rstrip() + "\n\n[... compacted retry ...]\n\n" + user[-half:].lstrip()
 
+    def _prepare_owned_local_model(self, model: str, label: str) -> list[str]:
+        """Switch local research roles without discovering another app's models."""
+        if not model or model in getattr(self.ol, "providers", {}):
+            return []
+        switch = getattr(self.ol, "evict_owned_local_models_except", None)
+        if not callable(switch):
+            return []
+        return switch(
+            {model},
+            log=lambda name: self._say(
+                f"  model · unloaded {name} before {label} inference"
+            ),
+        )
+
     def _think(self, system: str, user: str, think: bool | None = None, *, role: str = "planner",
                fmt=None, max_chars: int = 18_000, temperature: float = 0.4,
                num_predict: int | None = None,
@@ -1012,20 +1026,9 @@ class ResearchLoop:
 
         last = ""
         for model, num_ctx, label in attempts:
-            if (
-                model not in getattr(self.ol, "providers", {})
-                and hasattr(self.ol, "free_foreign")
-            ):
-                # Research used to leave the 27B planner and 12B critic resident
-                # together. Default configuration now aliases the roles, and this
-                # boundary also evicts any unrelated local model before an explicit
-                # multi-model run so unified memory cannot be overcommitted.
-                self.ol.free_foreign(
-                    {model},
-                    log=lambda name: self._say(
-                        f"  model · unloaded {name} before {label} inference"
-                    ),
-                )
+            # Default configuration aliases these roles. An explicit multi-model
+            # run may unload only exact prior models receipted by this same run.
+            self._prepare_owned_local_model(model, label)
             variants = [("full", system, user)]
             compact = self._compact_user_prompt(user, max_chars=max_chars)
             if compact != user:
@@ -1147,6 +1150,7 @@ class ResearchLoop:
                 "images": images,
             },
         ]
+        self._prepare_owned_local_model(model, "local vision")
         for variant, reasoning in (("full", True), ("concise-retry", False)):
             try:
                 res = self.ol.chat(
@@ -1238,6 +1242,7 @@ class ResearchLoop:
 
     def _think_json_model(self, model: str, num_ctx: int, system: str, user: str,
                           *, max_tokens: int = 2048, max_chars: int = 12_000) -> dict:
+        self._prepare_owned_local_model(model, "notes")
         try:
             res = self.ol.chat(
                 model,

@@ -722,9 +722,10 @@ def design_brief(goal: str, spec: list[dict], cfg: Config | None = None,
             (cfg.planner.name, False),
         ]
     for m, th in ladder:
-        if (getattr(cfg, "prefer_single_resident_model", True)
-                and m != cfg.planner.name):
-            ol.evict(cfg.planner.name)
+        if m not in getattr(ol, "providers", {}):
+            switch = getattr(ol, "evict_owned_local_models_except", None)
+            if callable(switch):
+                switch({m})
         res = ol.chat(m, msgs, think=th, num_predict=cfg.planner_max_tokens, temperature=0.6,
                       num_ctx=cfg.spec_for(m).num_ctx, keep_alive=cfg.keep_alive,
                       on_delta=(lambda kind, piece: progress(kind)) if progress else None)
