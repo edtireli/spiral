@@ -123,6 +123,7 @@ def test_build_cli_reaches_config_without_local_scope_crash(tmp_path, monkeypatc
     monkeypatch.setattr(conductor, "Conductor", FakeConductor)
     monkeypatch.setattr(cli, "print_banner", lambda *args, **kwargs: None)
     monkeypatch.setattr(cli, "_info_line", lambda *args, **kwargs: None)
+    monkeypatch.setenv("SPIRAL_OFFLINE_TESTS", "1")
     monkeypatch.setattr(sys, "argv", ["spiral", "build", "make a tool", "--dir", str(tmp_path)])
 
     cli.main()
