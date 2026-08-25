@@ -224,13 +224,23 @@ def _prose_ratio(value: str) -> float:
 
 
 _ABBREVIATIONS = {"e.g.", "i.e.", "et al.", "fig.", "eq.", "dr.", "prof.", "vs."}
+_SENTENCE_BOUNDARY = re.compile(
+    r"[.!?](?:[\"'’”)]*)"
+    r"(?:\s*\[[0-9,;\-– ]+\](?:\s*[,;]\s*\[[0-9,;\-– ]+\])*)?"
+    r"\s+(?=[A-Z0-9])"
+)
 
 
 def sentences(paragraph: str) -> list[str]:
     result: list[str] = []
     start = 0
-    for match in re.finditer(r"[.!?](?:[\"'’”)]*)\s+(?=[A-Z0-9])", paragraph):
-        prefix = paragraph[max(start, match.start() - 8) : match.end()].lower().strip()
+    for match in _SENTENCE_BOUNDARY.finditer(paragraph):
+        # Test the lexical material ending at the punctuation, not the optional
+        # trailing citation block.  Otherwise ``et al. [1] However`` would lose
+        # its abbreviation protection merely because the match ends in ``[1]``.
+        prefix = paragraph[
+            max(start, match.start() - 8) : match.start() + 1
+        ].lower().strip()
         if any(prefix.endswith(abbreviation) for abbreviation in _ABBREVIATIONS):
             continue
         candidate = paragraph[start : match.end()].strip()

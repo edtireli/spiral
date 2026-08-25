@@ -17,7 +17,7 @@ from rich.console import Console
 
 from spiral.banner import print_banner
 from spiral.theme import make_console, reveal
-from spiral.config import Config
+from spiral.config import Config, general_api_providers
 from spiral.llm import (
     Ollama,
     begin_owned_local_model_run,
@@ -58,13 +58,10 @@ def _apply_tier(cfg, console, tier, api_key: str | None = None):
     ``api_key_env`` for THIS process only — never written to any file."""
     if not tier:
         return cfg
-    general_providers = {
-        name: provider for name, provider in (cfg.providers or {}).items()
-        if not (isinstance(provider, dict) and provider.get("academic_writer_only"))
-    }
+    general_providers = general_api_providers(cfg.providers)
     if not general_providers:
         raise SystemExit(f"--{tier} needs an API provider in ~/.config/spiral/config.json "
-                         "(the publication-only academic writer does not count). "
+                         "(planner-only/publication-only academic routes do not count). "
                          "Also export its api_key_env.")
     model = next(iter(general_providers))
     if api_key:

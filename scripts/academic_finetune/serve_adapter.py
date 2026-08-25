@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import importlib.metadata
 import json
 import math
 import os
@@ -22,11 +21,26 @@ import threading
 import time
 import urllib.parse
 import uuid
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any
+
+# The authenticated parent intentionally launches this file directly in the
+# selected MLX runtime.  Direct execution places only this script's directory on
+# sys.path, while both the worker and its helpers import the shared ``spiral``
+# package from the repository root.
+if __package__ in {None, ""}:
+    project_root = Path(__file__).resolve().parents[2]
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
+
+from spiral.academic_structure_contract import (
+    STRUCTURE_REQUEST_SYSTEM_MARKER,
+    StructurePromptError,
+    parse_brief_to_blueprint_prompt,
+)
 
 try:
     from .training_support import (
@@ -40,6 +54,8 @@ try:
         PROFILE_ID,
         PROMPT_CONTRACT,
         REQUIRED_STRATA,
+        STRUCTURE_PROFILE_ID,
+        STRUCTURE_PROMPT_CONTRACT,
         HarnessError,
         TrainingComputeLease,
         atomic_write_json,
@@ -50,7 +66,7 @@ try:
         verify_ollama_empty,
     )
 except ImportError:  # direct script execution
-    from training_support import (  # type: ignore
+    from scripts.academic_finetune.training_support import (  # type: ignore
         ADAPTER_SCHEMA,
         DATASET_SCHEMA,
         EXPECTED_ARCHITECTURE,
@@ -61,6 +77,8 @@ except ImportError:  # direct script execution
         PROFILE_ID,
         PROMPT_CONTRACT,
         REQUIRED_STRATA,
+        STRUCTURE_PROFILE_ID,
+        STRUCTURE_PROMPT_CONTRACT,
         HarnessError,
         TrainingComputeLease,
         atomic_write_json,
@@ -77,7 +95,10 @@ CORPUS_MANIFEST_SCHEMA = "spiral.academic-corpus-manifest.v1"
 MODEL_VIEW_SCHEMA = "spiral.qwen35-text-training-view.v1"
 EXPECTED_PROVIDER = "mlx_lm"
 EXPECTED_RUNTIME_MODEL = "qwen3.8-27b-academic"
+EXPECTED_STRUCTURE_RUNTIME_MODEL = "qwen3.8-27b-academic-structure"
 EXPECTED_TRANSPORT = "openai-compatible"
+STRUCTURE_RUNTIME_SCOPE = "spiral_paper_planner_only"
+STRUCTURE_SPIRALCHAT_ELIGIBLE = False
 DEFAULT_ADAPTER_STRENGTH = 1.0
 MIN_ADAPTER_STRENGTH = 0.0
 MAX_ADAPTER_STRENGTH = 2.0
@@ -107,6 +128,38 @@ class RequestError(HarnessError):
         super().__init__(message)
         self.status = status
         self.code = code
+
+
+@dataclass(frozen=True)
+class AcademicRuntimeContract:
+    """Immutable serving identity selected by an adapter's training contract."""
+
+    profile_id: str
+    prompt_contract: str
+    runtime_model: str
+    strength_env: str
+    scope: str | None = None
+    spiralchat_eligible: bool | None = None
+
+
+PROSE_RUNTIME_CONTRACT = AcademicRuntimeContract(
+    profile_id=PROFILE_ID,
+    prompt_contract=PROMPT_CONTRACT,
+    runtime_model=EXPECTED_RUNTIME_MODEL,
+    strength_env="SPIRAL_ACADEMIC_WRITER_STRENGTH",
+)
+STRUCTURE_RUNTIME_CONTRACT = AcademicRuntimeContract(
+    profile_id=STRUCTURE_PROFILE_ID,
+    prompt_contract=STRUCTURE_PROMPT_CONTRACT,
+    runtime_model=EXPECTED_STRUCTURE_RUNTIME_MODEL,
+    strength_env="SPIRAL_ACADEMIC_PLANNER_STRENGTH",
+    scope=STRUCTURE_RUNTIME_SCOPE,
+    spiralchat_eligible=STRUCTURE_SPIRALCHAT_ELIGIBLE,
+)
+RUNTIME_CONTRACTS = {
+    (contract.profile_id, contract.prompt_contract): contract
+    for contract in (PROSE_RUNTIME_CONTRACT, STRUCTURE_RUNTIME_CONTRACT)
+}
 
 
 def canonical_adapter_strength(value: Any, *, request: bool = False) -> float:
@@ -157,6 +210,41 @@ def _section(value: Mapping[str, Any], name: str) -> dict[str, Any]:
     if not isinstance(section, dict):
         raise HarnessError(f"academic adapter manifest is missing object {name!r}")
     return section
+
+
+def _runtime_contract(manifest: Mapping[str, Any]) -> AcademicRuntimeContract:
+    profile_id = manifest.get("profile_id")
+    prompt_contract = manifest.get("prompt_contract")
+    contract = RUNTIME_CONTRACTS.get((profile_id, prompt_contract))
+    if contract is None:
+        supported = ", ".join(
+            f"{item.profile_id!r}/{item.prompt_contract!r}"
+            for item in (PROSE_RUNTIME_CONTRACT, STRUCTURE_RUNTIME_CONTRACT)
+        )
+        raise HarnessError(
+            "academic adapter profile/prompt contract is incompatible; "
+            f"expected one of {supported}"
+        )
+    return contract
+
+
+def _validate_runtime_contract(
+    runtime: Mapping[str, Any], contract: AcademicRuntimeContract,
+) -> None:
+    expected_runtime = {
+        "provider": EXPECTED_PROVIDER,
+        "model": contract.runtime_model,
+        "transport_adapter": EXPECTED_TRANSPORT,
+    }
+    if any(runtime.get(key) != value for key, value in expected_runtime.items()):
+        raise HarnessError("academic adapter runtime provider identity is incompatible")
+    if contract.scope is not None and (
+        runtime.get("scope") != contract.scope
+        or runtime.get("spiralchat_eligible") is not contract.spiralchat_eligible
+    ):
+        raise HarnessError(
+            "academic structure runtime must be planner-only and SpiralChat-excluded"
+        )
 
 
 def _manifest_relative(manifest_path: Path, value: Any, label: str) -> Path:
@@ -359,8 +447,7 @@ def validate_runtime_assets(manifest_path: Path, model_view: Path) -> RuntimeAss
     manifest_raw, manifest = _read_object(manifest_path, "academic adapter manifest")
     if manifest.get("schema_version") != ADAPTER_SCHEMA:
         raise HarnessError(f"academic adapter manifest schema must be {ADAPTER_SCHEMA}")
-    if manifest.get("profile_id") != PROFILE_ID or manifest.get("prompt_contract") != PROMPT_CONTRACT:
-        raise HarnessError("academic adapter profile/prompt contract is incompatible")
+    contract = _runtime_contract(manifest)
     base = _section(manifest, "base_model")
     adapter = _section(manifest, "adapter")
     runtime = _section(manifest, "runtime")
@@ -377,13 +464,7 @@ def validate_runtime_assets(manifest_path: Path, model_view: Path) -> RuntimeAss
         raise HarnessError("academic adapter base must be 4-bit/group-64 MLX")
     if adapter.get("format") != "mlx_lm_lora" or adapter.get("sha256_semantics") != ADAPTER_DIGEST_SEMANTICS:
         raise HarnessError("academic adapter bundle format/digest semantics are incompatible")
-    expected_runtime = {
-        "provider": EXPECTED_PROVIDER,
-        "model": EXPECTED_RUNTIME_MODEL,
-        "transport_adapter": EXPECTED_TRANSPORT,
-    }
-    if any(runtime.get(key) != value for key, value in expected_runtime.items()):
-        raise HarnessError("academic adapter runtime provider identity is incompatible")
+    _validate_runtime_contract(runtime, contract)
     # The published artifact pins only the default. Request strength is dynamic
     # and echoed separately from this immutable base/runtime identity.
     manifest_default = canonical_adapter_strength(runtime.get(
@@ -391,7 +472,7 @@ def validate_runtime_assets(manifest_path: Path, model_view: Path) -> RuntimeAss
     if manifest_default != DEFAULT_ADAPTER_STRENGTH:
         raise HarnessError("academic adapter manifest default strength must be 1.0")
     canonical_adapter_strength(os.environ.get(
-        "SPIRAL_ACADEMIC_WRITER_STRENGTH", DEFAULT_ADAPTER_STRENGTH))
+        contract.strength_env, DEFAULT_ADAPTER_STRENGTH))
     adapter_dir = _manifest_relative(manifest_path, adapter.get("path"), "adapter.path")
     digest, _ = _strict_adapter_digest(adapter_dir, adapter.get("required_files"))
     if digest != adapter.get("sha256"):
@@ -412,6 +493,11 @@ def validate_runtime_assets(manifest_path: Path, model_view: Path) -> RuntimeAss
         "transport_adapter": str(runtime["transport_adapter"]),
         **SERVER_LIFECYCLE_IDENTITY,
     }
+    if contract.scope is not None:
+        identity.update({
+            "scope": contract.scope,
+            "spiralchat_eligible": contract.spiralchat_eligible,
+        })
     if any(value is None or value == "" for value in identity.values()):
         raise HarnessError("academic runtime identity contains an empty field")
     return RuntimeAssets(
@@ -515,7 +601,9 @@ def validate_bind_address(host: str, port: int, runtime_base_url: str) -> None:
         raise HarnessError("manifest runtime.base_url must end in /v1")
 
 
-def validate_chat_request(value: Any, *, expected_model: str) -> dict[str, Any]:
+def validate_chat_request(
+    value: Any, *, expected_model: str, runtime_scope: str | None = None,
+) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise RequestError("request body must be a JSON object")
     if value.get("model") != expected_model:
@@ -524,7 +612,16 @@ def validate_chat_request(value: Any, *, expected_model: str) -> dict[str, Any]:
         raise RequestError("streaming is not supported by this unload-after-response runtime")
     requested_strength = canonical_adapter_strength(
         value.get("adapter_strength", DEFAULT_ADAPTER_STRENGTH), request=True)
-    if value.get("tools") or value.get("response_format"):
+    planner_only = runtime_scope == STRUCTURE_RUNTIME_SCOPE
+    response_format = value.get("response_format")
+    if value.get("tools"):
+        raise RequestError("academic runtime does not accept tools")
+    if planner_only:
+        if response_format != {"type": "json_object"}:
+            raise RequestError(
+                "academic structure runtime requires response_format json_object"
+            )
+    elif response_format:
         raise RequestError("academic prose runtime accepts text chat only")
     messages = value.get("messages")
     if not isinstance(messages, list) or not 1 <= len(messages) <= MAX_MESSAGES:
@@ -539,6 +636,28 @@ def validate_chat_request(value: Any, *, expected_model: str) -> dict[str, Any]:
             raise RequestError("multimodal or structured message content is not supported")
         total_chars += len(content)
         clean_messages.append({"role": str(message["role"]), "content": content})
+    model_messages = clean_messages
+    if planner_only:
+        if (
+            len(clean_messages) != 2
+            or clean_messages[0]["role"] != "system"
+            or STRUCTURE_REQUEST_SYSTEM_MARKER not in clean_messages[0]["content"]
+            or clean_messages[1]["role"] != "user"
+        ):
+            raise RequestError(
+                "academic structure runtime accepts one authorized planner "
+                "outline/budget request only"
+            )
+        try:
+            parse_brief_to_blueprint_prompt(clean_messages[1]["content"])
+        except StructurePromptError as exc:
+            raise RequestError(
+                f"academic structure runtime prompt contract mismatch: {exc}"
+            ) from exc
+        # The first message is admission metadata, not learned task context.
+        # Stage-two completion rows were chat-templated as exactly one user
+        # message containing the canonical brief_to_blueprint envelope.
+        model_messages = [dict(clean_messages[1])]
     if total_chars > MAX_MESSAGE_CHARS:
         raise RequestError(f"message content exceeds {MAX_MESSAGE_CHARS:,} characters")
     max_tokens = value.get("max_completion_tokens", value.get("max_tokens", 1024))
@@ -564,9 +683,10 @@ def validate_chat_request(value: Any, *, expected_model: str) -> dict[str, Any]:
     seed = value.get("seed")
     if seed is not None and (not isinstance(seed, int) or isinstance(seed, bool)):
         raise RequestError("seed must be an integer")
-    return {
+    clean = {
         "model": expected_model,
         "messages": clean_messages,
+        "model_messages": model_messages,
         "max_tokens": max_tokens,
         "temperature": float(temperature),
         "top_p": float(top_p),
@@ -574,6 +694,9 @@ def validate_chat_request(value: Any, *, expected_model: str) -> dict[str, Any]:
         "seed": seed,
         "adapter_strength": requested_strength,
     }
+    if planner_only:
+        clean["response_format"] = {"type": "json_object"}
+    return clean
 
 
 def identity_health_response(identity: Mapping[str, Any]) -> dict[str, Any]:
@@ -638,7 +761,7 @@ def apply_adapter_strength(
         "adapter_strength": selected,
         "lora_module_count": len(trained_scales),
         "trained_scales": sorted(set(trained_scales)),
-        "effective_scales": sorted(set(scale * selected for scale in trained_scales)),
+        "effective_scales": sorted({scale * selected for scale in trained_scales}),
     }
 
 
@@ -648,7 +771,11 @@ def _worker_generate(
     assets = validate_runtime_assets(manifest_path, model_view)
     validate_runtime_environment(assets, sys.executable)
     request = json.loads(request_path.read_text(encoding="utf-8"))
-    clean = validate_chat_request(request, expected_model=assets.identity["model"])
+    clean = validate_chat_request(
+        request,
+        expected_model=assets.identity["model"],
+        runtime_scope=assets.identity.get("scope"),
+    )
     try:
         import mlx.core as mx
         from mlx_lm import load
@@ -668,11 +795,11 @@ def _worker_generate(
     strength_receipt = apply_adapter_strength(model, clean["adapter_strength"])
     try:
         prompt = tokenizer.apply_chat_template(
-            clean["messages"], tokenize=False, add_generation_prompt=True,
+            clean["model_messages"], tokenize=False, add_generation_prompt=True,
             enable_thinking=False)
     except TypeError:
         prompt = tokenizer.apply_chat_template(
-            clean["messages"], tokenize=False, add_generation_prompt=True)
+            clean["model_messages"], tokenize=False, add_generation_prompt=True)
     sampler = make_sampler(temp=clean["temperature"], top_p=clean["top_p"])
     segments: list[str] = []
     final = None
@@ -725,7 +852,11 @@ class AcademicAdapterService:
         return self.identity
 
     def complete(self, request: Any) -> dict[str, Any]:
-        clean = validate_chat_request(request, expected_model=self.identity["model"])
+        clean = validate_chat_request(
+            request,
+            expected_model=self.identity["model"],
+            runtime_scope=self.identity.get("scope"),
+        )
         if not self._request_lock.acquire(blocking=False):
             raise RequestError(
                 "academic runtime is serving another completion", status=503,
@@ -758,6 +889,7 @@ class AcademicAdapterService:
                     command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     timeout=self.request_timeout,
                     pass_fds=(lease.descriptor,) if lease.descriptor is not None else (),
+                    check=False,
                 )
                 if completed.returncode:
                     raise HarnessError(
@@ -812,7 +944,7 @@ class AcademicRequestHandler(BaseHTTPRequestHandler):
             status, code = 500, "internal_error"
         self._json(status, {"error": {"message": str(exc), "type": code, "code": code}})
 
-    def do_GET(self) -> None:  # noqa: N802
+    def do_GET(self) -> None:
         if self.path.rstrip("/") != "/v1/spiral/identity":
             self._json(404, {"error": {"message": "not found", "type": "not_found"}})
             return
@@ -821,10 +953,10 @@ class AcademicRequestHandler(BaseHTTPRequestHandler):
                 200,
                 identity_health_response(self.server.service.readiness_identity()),
             )
-        except BaseException as exc:
+        except Exception as exc:  # noqa: BLE001 - serialize handler failures
             self._error(exc)
 
-    def do_POST(self) -> None:  # noqa: N802
+    def do_POST(self) -> None:
         if self.path.rstrip("/") != "/v1/chat/completions":
             self._json(404, {"error": {"message": "not found", "type": "not_found"}})
             return
@@ -842,7 +974,7 @@ class AcademicRequestHandler(BaseHTTPRequestHandler):
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
                 raise RequestError("request body is not valid UTF-8 JSON") from exc
             self._json(200, self.server.service.complete(request))
-        except BaseException as exc:
+        except Exception as exc:  # noqa: BLE001 - serialize handler failures
             self._error(exc)
 
 

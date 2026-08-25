@@ -16,6 +16,7 @@ import os
 import platform
 import queue
 import re
+import signal
 import shutil
 import struct
 import subprocess
@@ -32,6 +33,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+from spiral.academic_structure_contract import (
+    format_structure_prompt as format_structure_task_prompt,
+)
+
 try:
     import fcntl
 except ImportError:  # pragma: no cover - MLX production is macOS-only
@@ -39,6 +44,7 @@ except ImportError:  # pragma: no cover - MLX production is macOS-only
 
 
 CORPUS_SCHEMA = "spiral.academic-plan-prose.v1"
+STRUCTURE_CORPUS_SCHEMA = "spiral.academic-paper-structure.v1"
 DATASET_SCHEMA = "spiral.academic-mlx-dataset.v1"
 ADAPTER_SCHEMA = "spiral.academic-adapter.v1"
 PREFLIGHT_SCHEMA = "spiral.academic-preflight.v1"
@@ -47,8 +53,47 @@ TRAINING_RUN_SCHEMA = "spiral.academic-training-run.v1"
 TRAINING_DATA_VIEW_SCHEMA = "spiral.academic-training-data-view.v1"
 CHECKPOINT_SCHEMA = "spiral.academic-checkpoint.v2"
 CHECKPOINT_POINTER_SCHEMA = "spiral.academic-checkpoint-pointer.v2"
+TRAINING_SUPERVISOR_EVENT_SCHEMA = "spiral.academic-training-supervisor-event.v1"
+TRAINING_SUPERVISOR_STATUS_SCHEMA = "spiral.academic-training-supervisor-status.v1"
 PROFILE_ID = "academic-hep-pubmed-v1"
 PROMPT_CONTRACT = CORPUS_SCHEMA
+STRUCTURE_PROFILE_ID = "academic-hep-pubmed-structure-v1"
+STRUCTURE_PROMPT_CONTRACT = "spiral.academic-paper-blueprint.v1"
+STRUCTURE_CORPUS_MANIFEST_SCHEMA = "spiral.academic-structure-corpus-manifest.v1"
+STRUCTURE_EXACT_TOKEN_GATE_METHOD = (
+    "mlx_lm.CompletionsDataset.apply_chat_template parity"
+)
+STRUCTURE_EXACT_TOKEN_OVERFLOW_POLICY = (
+    "reject_candidate_never_truncate_or_partition"
+)
+PARENT_ADAPTER_SCHEMA = "spiral.academic-parent-adapter.v1"
+ADAPTER_LINEAGE_SCHEMA = "spiral.academic-adapter-lineage.v1"
+STRUCTURE_TASK_TYPES = frozenset({
+    "recognize_role",
+    "order_structure",
+    "budget_structure",
+    "restore_section",
+    "repair_structure",
+    "brief_to_blueprint",
+})
+STRUCTURE_REPLAY_TASK = "prose_replay"
+STRUCTURE_LORA_KEYS = (
+    "self_attn.q_proj",
+    "self_attn.v_proj",
+    "linear_attn.in_proj_qkv",
+    "linear_attn.out_proj",
+    "mlp.gate_proj",
+    "mlp.up_proj",
+    "mlp.down_proj",
+)
+SUPPORTED_PROFILE_CONTRACTS = {
+    PROFILE_ID: PROMPT_CONTRACT,
+    STRUCTURE_PROFILE_ID: STRUCTURE_PROMPT_CONTRACT,
+}
+CORPUS_SCHEMA_BY_PROMPT_CONTRACT = {
+    PROMPT_CONTRACT: CORPUS_SCHEMA,
+    STRUCTURE_PROMPT_CONTRACT: STRUCTURE_CORPUS_SCHEMA,
+}
 EXPECTED_MODEL_TYPE = "qwen3_5"
 EXPECTED_ARCHITECTURE = "Qwen3_5ForConditionalGeneration"
 EXPECTED_LAYER_COUNT = 64
@@ -158,6 +203,22 @@ def validate_training_config(config: Mapping[str, Any]) -> None:
     errors: list[str] = []
     if config.get("schema_version") != "spiral.academic-qlora-config.v1":
         errors.append("unsupported or missing config schema_version")
+    profile = config.get("profile", {})
+    profile_id = profile.get("id") if isinstance(profile, Mapping) else None
+    prompt_contract = (
+        profile.get("prompt_contract") if isinstance(profile, Mapping) else None
+    )
+    expected_prompt = SUPPORTED_PROFILE_CONTRACTS.get(str(profile_id))
+    if expected_prompt is None:
+        errors.append(
+            "profile.id must be academic-hep-pubmed-v1 or "
+            "academic-hep-pubmed-structure-v1"
+        )
+    elif prompt_contract != expected_prompt:
+        errors.append(
+            f"profile.prompt_contract must be {expected_prompt!r} for {profile_id!r}"
+        )
+
     base = config.get("base_model", {})
     if base.get("model_id") != EXPECTED_MODEL_ID:
         errors.append(f"base_model.model_id must be immutable {EXPECTED_MODEL_ID!r}")
@@ -267,6 +328,30 @@ def validate_training_config(config: Mapping[str, Any]) -> None:
         if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(float(value)):
             errors.append(f"lora.{name} must be finite")
 
+    if profile_id == STRUCTURE_PROFILE_ID:
+        exact_training = {
+            "iterations": 1200,
+            "learning_rate": 0.000002,
+            "max_seq_length": 448,
+            "num_layers": 4,
+            "seed": 25082026,
+        }
+        for field_name, expected in exact_training.items():
+            if training.get(field_name) != expected:
+                errors.append(
+                    f"structure profile training.{field_name} must be {expected!r}")
+        if tuple(keys) != STRUCTURE_LORA_KEYS:
+            errors.append(
+                "structure profile lora.keys must preserve the stage-one topology")
+        if (
+            lora.get("rank") != 16
+            or lora.get("scale") != 32.0
+            or lora.get("dropout") != 0.0
+        ):
+            errors.append(
+                "structure profile LoRA topology must remain rank 16, scale 32, "
+                "dropout 0")
+
     if errors:
         raise HarnessError("invalid academic QLoRA config:\n- " + "\n- ".join(errors))
 
@@ -278,7 +363,25 @@ def _positive_int(value: Any, name: str, errors: list[str]) -> int:
     return value
 
 
-def read_corpus_records(path: Path) -> list[dict[str, Any]]:
+def _prompt_contract(config: Mapping[str, Any] | None) -> str:
+    if config is None:
+        return PROMPT_CONTRACT
+    profile = config.get("profile")
+    if not isinstance(profile, Mapping):
+        raise HarnessError("academic QLoRA config has no profile contract")
+    selected = str(profile.get("prompt_contract", ""))
+    if selected not in CORPUS_SCHEMA_BY_PROMPT_CONTRACT:
+        raise HarnessError(f"unsupported academic prompt contract {selected!r}")
+    return selected
+
+
+def _corpus_schema(config: Mapping[str, Any] | None) -> str:
+    return CORPUS_SCHEMA_BY_PROMPT_CONTRACT[_prompt_contract(config)]
+
+
+def read_corpus_records(
+    path: Path, *, config: Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     if path.is_dir():
         candidates = sorted(path.glob("*.jsonl"))
     else:
@@ -301,11 +404,429 @@ def read_corpus_records(path: Path) -> list[dict[str, Any]]:
                     records.append(row)
         except OSError as exc:
             raise HarnessError(f"cannot read corpus {candidate}: {exc}") from exc
-    validate_corpus_records(records)
+    validate_corpus_records(records, config=config)
     return records
 
 
-def validate_corpus_records(records: Sequence[Mapping[str, Any]], *, require_all_strata: bool = False) -> None:
+def _normalised_author(value: str) -> str:
+    return " ".join(
+        "".join(
+            character if character.isalnum() else " "
+            for character in unicodedata.normalize("NFKC", value).casefold()
+        ).split()
+    )
+
+
+def _validate_json_tree(
+    value: Any, *, label: str, errors: list[str], depth: int = 0,
+    nodes: list[int] | None = None,
+) -> None:
+    """Reject non-JSON, non-finite, or pathologically large structure values."""
+
+    if nodes is None:
+        nodes = [0]
+    nodes[0] += 1
+    if nodes[0] > 2_048:
+        errors.append(f"{label}: JSON value exceeds 2,048 nodes")
+        return
+    if depth > 12:
+        errors.append(f"{label}: JSON nesting exceeds 12 levels")
+        return
+    if value is None or isinstance(value, (str, bool, int)):
+        if isinstance(value, str):
+            if not value.strip():
+                errors.append(f"{label}: JSON strings must be non-empty")
+            elif any(ord(character) < 32 and character not in "\n\t" for character in value):
+                errors.append(f"{label}: JSON strings contain control characters")
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            errors.append(f"{label}: JSON numbers must be finite")
+        return
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            _validate_json_tree(
+                item, label=f"{label}[{index}]", errors=errors,
+                depth=depth + 1, nodes=nodes)
+        return
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if not isinstance(key, str) or not key.strip():
+                errors.append(f"{label}: JSON object keys must be non-empty strings")
+                continue
+            _validate_json_tree(
+                item, label=f"{label}.{key}", errors=errors,
+                depth=depth + 1, nodes=nodes)
+        return
+    errors.append(f"{label}: value of type {type(value).__name__} is not JSON")
+
+
+def _validate_json_schema_instance(
+    value: Any, schema: Mapping[str, Any], *, label: str, errors: list[str],
+) -> None:
+    """Validate the deterministic JSON-Schema subset emitted by the compiler."""
+
+    supported_keywords = {
+        "type", "const", "enum", "required", "properties",
+        "additionalProperties", "items", "minItems", "minLength", "minimum",
+    }
+    unsupported = sorted(set(schema) - supported_keywords)
+    if unsupported:
+        errors.append(
+            f"{label}: response_schema contains unsupported keyword(s): "
+            + ", ".join(unsupported))
+        return
+    selected_type = schema.get("type")
+    type_matches = {
+        "object": isinstance(value, Mapping),
+        "array": isinstance(value, list),
+        "string": isinstance(value, str),
+        "integer": isinstance(value, int) and not isinstance(value, bool),
+        "number": isinstance(value, (int, float)) and not isinstance(value, bool),
+        "boolean": isinstance(value, bool),
+        "null": value is None,
+    }
+    if selected_type is not None:
+        if selected_type not in type_matches:
+            errors.append(f"{label}: response_schema contains unsupported type {selected_type!r}")
+            return
+        if not type_matches[selected_type]:
+            errors.append(f"{label}: target does not satisfy response_schema type {selected_type}")
+            return
+    if "const" in schema and value != schema["const"]:
+        errors.append(f"{label}: target does not satisfy response_schema const")
+    enum = schema.get("enum")
+    if enum is not None and (not isinstance(enum, list) or value not in enum):
+        errors.append(f"{label}: target does not satisfy response_schema enum")
+    if isinstance(value, Mapping):
+        required = schema.get("required", [])
+        if not isinstance(required, list) or any(not isinstance(key, str) for key in required):
+            errors.append(f"{label}: response_schema.required must be a string array")
+            required = []
+        for key in required:
+            if key not in value:
+                errors.append(f"{label}: target is missing response_schema key {key!r}")
+        properties = schema.get("properties", {})
+        if not isinstance(properties, Mapping) or any(
+            not isinstance(key, str) or not isinstance(spec, Mapping)
+            for key, spec in properties.items()
+        ):
+            errors.append(f"{label}: response_schema.properties must be an object")
+            properties = {}
+        if schema.get("additionalProperties") is False:
+            extra = sorted(set(value) - set(properties))
+            if extra:
+                errors.append(
+                    f"{label}: target has response_schema-forbidden key(s): "
+                    + ", ".join(extra))
+        for key, item in value.items():
+            child = properties.get(key)
+            if isinstance(child, Mapping):
+                _validate_json_schema_instance(
+                    item, child, label=f"{label}.{key}", errors=errors)
+    if isinstance(value, list):
+        minimum = schema.get("minItems")
+        if isinstance(minimum, int) and not isinstance(minimum, bool) and len(value) < minimum:
+            errors.append(f"{label}: target has fewer than response_schema.minItems")
+        items = schema.get("items")
+        if items is not None and not isinstance(items, Mapping):
+            errors.append(f"{label}: response_schema.items must be an object")
+        elif isinstance(items, Mapping):
+            for index, item in enumerate(value):
+                _validate_json_schema_instance(
+                    item, items, label=f"{label}[{index}]", errors=errors)
+    if isinstance(value, str):
+        minimum = schema.get("minLength")
+        if isinstance(minimum, int) and not isinstance(minimum, bool) and len(value) < minimum:
+            errors.append(f"{label}: target is shorter than response_schema.minLength")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        minimum = schema.get("minimum")
+        if isinstance(minimum, (int, float)) and value < minimum:
+            errors.append(f"{label}: target is below response_schema.minimum")
+
+
+def _nonnegative_integer(
+    value: Any, *, label: str, errors: list[str],
+) -> int | None:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        errors.append(f"{label}: must be a non-negative integer")
+        return None
+    return value
+
+
+def _validate_budget_rows(
+    rows: Any, *, label: str, errors: list[str], require_paragraphs: bool,
+) -> tuple[int, int] | None:
+    if not isinstance(rows, list) or not rows:
+        errors.append(f"{label}: must be a non-empty array")
+        return None
+    identifiers: set[str] = set()
+    total_words = 0
+    valid_words = 0
+    for index, row in enumerate(rows):
+        row_label = f"{label}[{index}]"
+        if not isinstance(row, Mapping):
+            errors.append(f"{row_label}: must be an object")
+            continue
+        identifier = row.get("id")
+        if not isinstance(identifier, str) or not identifier.strip():
+            errors.append(f"{row_label}.id: must be a non-empty string")
+        elif identifier in identifiers:
+            errors.append(f"{row_label}.id: duplicate section id {identifier!r}")
+        else:
+            identifiers.add(identifier)
+        words = _nonnegative_integer(
+            row.get("words"), label=f"{row_label}.words", errors=errors)
+        if words is not None:
+            total_words += words
+            valid_words += 1
+        if require_paragraphs:
+            _nonnegative_integer(
+                row.get("paragraphs"),
+                label=f"{row_label}.paragraphs", errors=errors)
+        for optional_count in ("figures", "tables"):
+            if optional_count in row:
+                _nonnegative_integer(
+                    row.get(optional_count),
+                    label=f"{row_label}.{optional_count}", errors=errors)
+    return total_words, valid_words
+
+
+def _validate_structure_semantics(
+    task_type: Any, target: Mapping[str, Any], *, label: str,
+    errors: list[str],
+) -> None:
+    """Enforce arithmetic invariants that JSON Schema alone cannot express."""
+
+    if task_type == "budget_structure":
+        section_words = _nonnegative_integer(
+            target.get("section_words"),
+            label=f"{label}.section_words", errors=errors)
+        budget_result = _validate_budget_rows(
+            target.get("section_budgets"),
+            label=f"{label}.section_budgets", errors=errors,
+            require_paragraphs=True)
+        if section_words is not None and budget_result is not None:
+            budget_words, valid_words = budget_result
+            budgets = target.get("section_budgets")
+            if (
+                isinstance(budgets, list)
+                and valid_words == len(budgets)
+                and budget_words != section_words
+            ):
+                errors.append(
+                    f"{label}: section_budgets words sum to {budget_words}, "
+                    f"not section_words {section_words}")
+        return
+
+    if task_type != "brief_to_blueprint":
+        return
+    paper_counts = target.get("paper_counts")
+    if not isinstance(paper_counts, Mapping):
+        errors.append(f"{label}.paper_counts: must be an object")
+        section_words = None
+    else:
+        count_values = {
+            key: _nonnegative_integer(
+                paper_counts.get(key), label=f"{label}.paper_counts.{key}",
+                errors=errors)
+            for key in (
+                "abstract_words", "section_words", "section_paragraphs",
+                "unsectioned_words", "figures", "tables",
+            )
+        }
+        section_words = count_values["section_words"]
+    sections = target.get("sections")
+    section_result = _validate_budget_rows(
+        sections, label=f"{label}.sections", errors=errors,
+        require_paragraphs=False)
+    if isinstance(sections, list):
+        for index, section in enumerate(sections):
+            if not isinstance(section, Mapping):
+                continue
+            for field_name in ("heading", "role"):
+                value = section.get(field_name)
+                if not isinstance(value, str) or not value.strip():
+                    errors.append(
+                        f"{label}.sections[{index}].{field_name}: "
+                        "must be a non-empty string")
+    if section_words is not None and section_result is not None:
+        budget_words, valid_words = section_result
+        if (
+            isinstance(sections, list)
+            and valid_words == len(sections)
+            and budget_words != section_words
+        ):
+            errors.append(
+                f"{label}: section words sum to {budget_words}, "
+                f"not paper_counts.section_words {section_words}")
+
+
+def _validate_structure_corpus_records(
+    records: Sequence[Mapping[str, Any]], *, require_all_strata: bool,
+) -> None:
+    if not records:
+        raise HarnessError("the academic structure corpus is empty")
+    errors: list[str] = []
+    seen_ids: set[str] = set()
+    document_splits: dict[str, str] = {}
+    author_splits: dict[str, str] = {}
+    splits: set[str] = set()
+    strata: set[str] = set()
+    observed_tasks: set[str] = set()
+    allowed_tasks = STRUCTURE_TASK_TYPES | {STRUCTURE_REPLAY_TASK}
+    for index, row in enumerate(records):
+        label = f"record {index + 1}"
+        if row.get("schema_version") != STRUCTURE_CORPUS_SCHEMA:
+            errors.append(
+                f"{label}: schema_version must be {STRUCTURE_CORPUS_SCHEMA!r}")
+        example_id = row.get("example_id")
+        if not isinstance(example_id, str) or not example_id.strip():
+            errors.append(f"{label}: example_id is required")
+        elif example_id in seen_ids:
+            errors.append(f"{label}: duplicate example_id {example_id!r}")
+        else:
+            seen_ids.add(example_id)
+        split = row.get("split")
+        if split not in {"train", "validation", "test"}:
+            errors.append(f"{label}: split must be train, validation, or test")
+        else:
+            splits.add(str(split))
+        task_type = row.get("task_type")
+        if task_type not in allowed_tasks:
+            errors.append(
+                f"{label}: task_type must be one of {', '.join(sorted(allowed_tasks))}")
+        else:
+            observed_tasks.add(str(task_type))
+        source = row.get("source")
+        if not isinstance(source, Mapping):
+            errors.append(f"{label}: source object is required")
+        else:
+            stratum = source.get("stratum")
+            if stratum not in REQUIRED_STRATA:
+                errors.append(
+                    f"{label}: source.stratum must be arxiv:hep-th, arxiv:hep-ph, or pubmed")
+            else:
+                strata.add(str(stratum))
+        document = row.get("document")
+        if not isinstance(document, Mapping) or not document.get("document_id"):
+            errors.append(f"{label}: document.document_id is required")
+        elif split in {"train", "validation", "test"}:
+            document_id = str(document["document_id"])
+            previous = document_splits.setdefault(document_id, str(split))
+            if previous != split:
+                errors.append(
+                    f"{label}: document {document_id!r} leaks across {previous!r} and {split!r}")
+            authors = document.get("authors")
+            if not isinstance(authors, list) or any(
+                not isinstance(author, str) for author in authors
+            ):
+                errors.append(f"{label}: document.authors must be a list of strings")
+            else:
+                for author in authors:
+                    normalised = _normalised_author(author)
+                    if not normalised:
+                        continue
+                    author_previous = author_splits.setdefault(normalised, str(split))
+                    if author_previous != split:
+                        errors.append(
+                            f"{label}: author {author!r} leaks across "
+                            f"{author_previous!r} and {split!r}")
+        prompt_input = row.get("input")
+        if not isinstance(prompt_input, Mapping) or not prompt_input:
+            errors.append(f"{label}: input must be a non-empty JSON object")
+            continue
+        _validate_json_tree(prompt_input, label=f"{label}.input", errors=errors)
+        target = row.get("target")
+        if task_type == STRUCTURE_REPLAY_TASK:
+            if not isinstance(target, str) or not target.strip():
+                errors.append(f"{label}: prose_replay target must be non-empty prose")
+                continue
+            unit = prompt_input.get("unit")
+            if unit not in {"sentence", "paragraph"}:
+                errors.append(
+                    f"{label}: prose_replay input.unit must be sentence or paragraph")
+            context = prompt_input.get("context")
+            if not isinstance(context, str):
+                errors.append(f"{label}: prose_replay input.context must be a string")
+            elif target.strip():
+                leakage_reason = target_context_leakage_reason(target, context)
+                if leakage_reason:
+                    errors.append(
+                        f"{label}: target leaks into input.context ({leakage_reason})")
+            claims = prompt_input.get("claims")
+            if not isinstance(claims, list) or not claims or any(
+                not isinstance(claim, str) or not claim.strip() for claim in claims
+            ):
+                errors.append(
+                    f"{label}: prose_replay input.claims must contain non-empty strings")
+            for field_name in ("rhetorical_relation", "certainty"):
+                if not isinstance(prompt_input.get(field_name), str) or not str(
+                    prompt_input.get(field_name, "")
+                ).strip():
+                    errors.append(f"{label}: prose_replay input.{field_name} is required")
+            citation_count = prompt_input.get("citation_count")
+            citation_slots = prompt_input.get("citation_slots")
+            expected_slots = EXACT_CITATION_RE.findall(target)
+            if (
+                not isinstance(citation_count, int)
+                or isinstance(citation_count, bool)
+                or citation_count < 0
+            ):
+                errors.append(
+                    f"{label}: prose_replay input.citation_count must be a non-negative integer")
+            if citation_slots != expected_slots:
+                errors.append(
+                    f"{label}: prose_replay input.citation_slots must exactly match target")
+            if isinstance(citation_count, int) and citation_count != len(expected_slots):
+                errors.append(
+                    f"{label}: prose_replay input.citation_count does not match target")
+        else:
+            if not isinstance(target, Mapping) or not target:
+                errors.append(
+                    f"{label}: structure target must be a non-empty JSON object")
+                continue
+            _validate_json_tree(target, label=f"{label}.target", errors=errors)
+            response_schema = prompt_input.get("response_schema")
+            if not isinstance(response_schema, Mapping) or response_schema.get("type") != "object":
+                errors.append(
+                    f"{label}: structure input.response_schema must describe an object")
+            else:
+                _validate_json_schema_instance(
+                    target, response_schema, label=f"{label}.target", errors=errors)
+            _validate_structure_semantics(
+                task_type, target, label=f"{label}.target", errors=errors)
+            try:
+                encoded = canonical_json(target)
+            except (TypeError, ValueError) as exc:
+                errors.append(f"{label}: structure target is not canonical JSON: {exc}")
+            else:
+                if len(encoded) > 64 * 1024:
+                    errors.append(f"{label}: canonical structure target exceeds 64 KiB")
+    missing_splits = {"train", "validation", "test"} - splits
+    if missing_splits:
+        errors.append(
+            f"corpus is missing required split(s): {', '.join(sorted(missing_splits))}")
+    if require_all_strata:
+        missing_strata = REQUIRED_STRATA - strata
+        if missing_strata:
+            errors.append(
+                f"corpus is missing required source strata: {', '.join(sorted(missing_strata))}")
+    if not observed_tasks.intersection(STRUCTURE_TASK_TYPES):
+        errors.append("structure corpus contains no structure-supervision task")
+    if errors:
+        raise HarnessError(
+            "invalid academic structure corpus:\n- " + "\n- ".join(errors[:50]))
+
+
+def validate_corpus_records(
+    records: Sequence[Mapping[str, Any]], *, require_all_strata: bool = False,
+    config: Mapping[str, Any] | None = None,
+) -> None:
+    if _corpus_schema(config) == STRUCTURE_CORPUS_SCHEMA:
+        _validate_structure_corpus_records(
+            records, require_all_strata=require_all_strata)
+        return
     if not records:
         raise HarnessError("the academic corpus is empty")
     errors: list[str] = []
@@ -494,18 +1015,141 @@ def format_academic_prompt(row: Mapping[str, Any]) -> str:
     )
 
 
+def format_structure_prompt(row: Mapping[str, Any]) -> str:
+    """Render one stage-two example without leaking its canonical target."""
+
+    prompt_input = row["input"]
+    if row["task_type"] == STRUCTURE_REPLAY_TASK:
+        replay = {
+            "task_type": prompt_input["unit"],
+            "input": {
+                key: value for key, value in prompt_input.items() if key != "unit"
+            },
+        }
+        return format_academic_prompt(replay)
+    return format_structure_task_prompt(str(row["task_type"]), prompt_input)
+
+
+def _structure_exact_token_gate(
+    corpus_manifest: Mapping[str, Any], records: Sequence[Mapping[str, Any]],
+    *, config: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Validate the compiler's exact MLX chat-template boundary receipt.
+
+    Stage two deliberately has no partition/truncation semantics.  Preserve the
+    compiler receipt in the prepared dataset so the training process can prove
+    that its selected model exposes the same tokenizer identity.
+    """
+
+    gates = corpus_manifest.get("gates")
+    gate = gates.get("exact_training_token_gate") if isinstance(gates, Mapping) else None
+    if not isinstance(gate, Mapping):
+        raise HarnessError(
+            "academic structure corpus manifest has no exact training-token gate")
+    training = config.get("training") if isinstance(config, Mapping) else None
+    configured_limit = (
+        training.get("max_seq_length") if isinstance(training, Mapping) else None
+    )
+    limit = gate.get("max_sequence_length")
+    if (
+        gate.get("method") != STRUCTURE_EXACT_TOKEN_GATE_METHOD
+        or gate.get("overflow_policy") != STRUCTURE_EXACT_TOKEN_OVERFLOW_POLICY
+        or gate.get("derived_rows") != 0
+        or not isinstance(limit, int)
+        or isinstance(limit, bool)
+        or limit <= 1
+        or limit != configured_limit
+    ):
+        raise HarnessError(
+            "academic structure corpus exact training-token gate is incompatible")
+    tokenizer = gate.get("tokenizer")
+    if (
+        not isinstance(tokenizer, Mapping)
+        or not isinstance(tokenizer.get("identity"), str)
+        or not tokenizer["identity"].strip()
+    ):
+        raise HarnessError(
+            "academic structure corpus exact training-token gate has no tokenizer identity")
+    try:
+        canonical_json(tokenizer)
+    except (TypeError, ValueError) as exc:
+        raise HarnessError(
+            "academic structure corpus tokenizer receipt is not stable JSON") from exc
+
+    largest_row = 0
+    for index, row in enumerate(records, 1):
+        provenance = row.get("provenance")
+        total = provenance.get("exact_training_tokens") if isinstance(
+            provenance, Mapping) else None
+        offset = provenance.get("exact_prompt_offset") if isinstance(
+            provenance, Mapping) else None
+        completion = provenance.get("exact_completion_tokens") if isinstance(
+            provenance, Mapping) else None
+        if (
+            not isinstance(total, int)
+            or isinstance(total, bool)
+            or not isinstance(offset, int)
+            or isinstance(offset, bool)
+            or not isinstance(completion, int)
+            or isinstance(completion, bool)
+            or not 0 < offset < total <= limit
+            or completion != total - offset
+        ):
+            raise HarnessError(
+                f"academic structure corpus record {index} has no valid exact "
+                "training-token receipt")
+        largest_row = max(largest_row, total)
+    largest_accepted = gate.get("largest_accepted_tokens")
+    if (
+        not isinstance(largest_accepted, int)
+        or isinstance(largest_accepted, bool)
+        or not largest_row <= largest_accepted <= limit
+    ):
+        raise HarnessError(
+            "academic structure corpus exact training-token maximum is incompatible")
+    measured = gate.get("candidates_measured")
+    rejected = gate.get("candidates_rejected")
+    if (
+        not isinstance(measured, int)
+        or isinstance(measured, bool)
+        or measured < len(records)
+        or not isinstance(rejected, int)
+        or isinstance(rejected, bool)
+        or rejected < 0
+        or rejected > measured
+    ):
+        raise HarnessError(
+            "academic structure corpus exact training-token counts are incompatible")
+    return dict(gate)
+
+
 def prepare_mlx_dataset(
     corpus_path: Path, output_dir: Path, *, require_all_strata: bool = True,
-    require_trainable: bool = True,
+    require_trainable: bool = True, config: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not corpus_path.is_file():
         raise HarnessError("training preparation requires the combined corpus JSONL file")
-    records = read_corpus_records(corpus_path)
-    validate_corpus_records(records, require_all_strata=require_all_strata)
+    prompt_contract = _prompt_contract(config)
+    corpus_schema = _corpus_schema(config)
+    structure_mode = prompt_contract == STRUCTURE_PROMPT_CONTRACT
+    records = read_corpus_records(corpus_path, config=config)
+    validate_corpus_records(
+        records, require_all_strata=require_all_strata, config=config)
     corpus_manifest_path = corpus_path.with_name(f"{corpus_path.name}.manifest.json")
     corpus_manifest = _read_json(corpus_manifest_path, "academic corpus manifest")
-    if corpus_manifest.get("schema_version", corpus_manifest.get("schema")) != "spiral.academic-corpus-manifest.v1":
+    expected_manifest_schema = (
+        STRUCTURE_CORPUS_MANIFEST_SCHEMA
+        if structure_mode else "spiral.academic-corpus-manifest.v1"
+    )
+    if corpus_manifest.get("schema_version", corpus_manifest.get("schema")) != expected_manifest_schema:
         raise HarnessError("academic corpus manifest has the wrong schema")
+    if structure_mode:
+        if corpus_manifest.get("corpus_schema_version") != corpus_schema:
+            raise HarnessError(
+                "academic structure corpus manifest has the wrong corpus schema")
+        if corpus_manifest.get("prompt_contract") != prompt_contract:
+            raise HarnessError(
+                "academic structure corpus manifest has the wrong prompt contract")
     if set(corpus_manifest.get("source_strata") or []) != REQUIRED_STRATA:
         raise HarnessError("academic corpus manifest does not attest the exact three source strata")
     if require_trainable and corpus_manifest.get("trainable") is not True:
@@ -513,6 +1157,10 @@ def prepare_mlx_dataset(
     raw_corpus_sha256 = sha256_file(corpus_path)
     if corpus_manifest.get("corpus_sha256") != raw_corpus_sha256:
         raise HarnessError("academic corpus bytes do not match the corpus manifest")
+    structure_exact_token_gate = (
+        _structure_exact_token_gate(corpus_manifest, records, config=config)
+        if structure_mode else None
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     split_names = {"train": "train", "validation": "valid", "test": "test"}
     by_split: dict[str, list[bytes]] = {name: [] for name in split_names.values()}
@@ -522,9 +1170,17 @@ def prepare_mlx_dataset(
     for row in sorted(records, key=lambda item: (str(item["split"]), str(item["example_id"]))):
         canonical_source.update(canonical_json(row))
         split = split_names[str(row["split"])]
+        completion = (
+            row["target"].strip()
+            if row["task_type"] == STRUCTURE_REPLAY_TASK
+            else canonical_json(row["target"]).decode("utf-8").rstrip("\n")
+        ) if structure_mode else row["target"].strip()
         mlx_row = {
-            "prompt": format_academic_prompt(row),
-            "completion": row["target"].strip(),
+            "prompt": (
+                format_structure_prompt(row)
+                if structure_mode else format_academic_prompt(row)
+            ),
+            "completion": completion,
             "example_id": row["example_id"],
             "source_stratum": row["source"]["stratum"],
             "task_type": row["task_type"],
@@ -549,7 +1205,7 @@ def prepare_mlx_dataset(
         }
     manifest = {
         "schema_version": DATASET_SCHEMA,
-        "prompt_contract": PROMPT_CONTRACT,
+        "prompt_contract": prompt_contract,
         "source_corpus": str(corpus_path.resolve()),
         "source_corpus_sha256": canonical_source.hexdigest(),
         "source_corpus_file_sha256": raw_corpus_sha256,
@@ -566,11 +1222,31 @@ def prepare_mlx_dataset(
         },
         "splits": manifest_splits,
     }
+    if structure_mode:
+        manifest["target_context_leakage_gate"].update({
+            "scope": "prose_replay_only",
+            "structure_target_overlap": (
+                "allowed where required by observed-structure task semantics"),
+        })
+        manifest.update({
+            "profile_id": STRUCTURE_PROFILE_ID,
+            "corpus_schema_version": STRUCTURE_CORPUS_SCHEMA,
+            "source_corpus_manifest_schema": STRUCTURE_CORPUS_MANIFEST_SCHEMA,
+            "target_contract": {
+                "structure_tasks": sorted(STRUCTURE_TASK_TYPES),
+                "structure_target": "canonical_json_object",
+                "prose_replay_task": STRUCTURE_REPLAY_TASK,
+                "prose_replay_target": "nonempty_academic_prose",
+            },
+            "source_exact_training_token_gate": structure_exact_token_gate,
+        })
     atomic_write_json(output_dir / "dataset_manifest.json", manifest)
     return manifest
 
 
-def load_dataset_manifest(data_dir: Path) -> dict[str, Any]:
+def load_dataset_manifest(
+    data_dir: Path, *, config: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     path = data_dir / "dataset_manifest.json"
     try:
         manifest = json.loads(path.read_text(encoding="utf-8"))
@@ -578,6 +1254,47 @@ def load_dataset_manifest(data_dir: Path) -> dict[str, Any]:
         raise HarnessError(f"cannot read prepared dataset manifest {path}: {exc}") from exc
     if manifest.get("schema_version") != DATASET_SCHEMA or manifest.get("completion_only_loss") is not True:
         raise HarnessError("prepared dataset manifest does not guarantee completion-only data")
+    prompt_contract = _prompt_contract(config)
+    if manifest.get("prompt_contract") != prompt_contract:
+        raise HarnessError("prepared dataset manifest has the wrong prompt contract")
+    if prompt_contract == STRUCTURE_PROMPT_CONTRACT:
+        if (
+            manifest.get("profile_id") != STRUCTURE_PROFILE_ID
+            or manifest.get("corpus_schema_version") != STRUCTURE_CORPUS_SCHEMA
+            or manifest.get("source_corpus_manifest_schema")
+            != STRUCTURE_CORPUS_MANIFEST_SCHEMA
+        ):
+            raise HarnessError(
+                "prepared structure dataset manifest has an incompatible contract")
+        target_contract = manifest.get("target_contract")
+        if not isinstance(target_contract, Mapping) or (
+            target_contract.get("structure_tasks") != sorted(STRUCTURE_TASK_TYPES)
+            or target_contract.get("structure_target") != "canonical_json_object"
+            or target_contract.get("prose_replay_task") != STRUCTURE_REPLAY_TASK
+            or target_contract.get("prose_replay_target")
+            != "nonempty_academic_prose"
+        ):
+            raise HarnessError(
+                "prepared structure dataset has no exact target contract")
+        source_gate = manifest.get("source_exact_training_token_gate")
+        source_tokenizer = (
+            source_gate.get("tokenizer") if isinstance(source_gate, Mapping) else None
+        )
+        configured_limit = config.get("training", {}).get("max_seq_length") if isinstance(
+            config, Mapping) and isinstance(config.get("training"), Mapping) else None
+        if (
+            not isinstance(source_gate, Mapping)
+            or source_gate.get("method") != STRUCTURE_EXACT_TOKEN_GATE_METHOD
+            or source_gate.get("overflow_policy")
+            != STRUCTURE_EXACT_TOKEN_OVERFLOW_POLICY
+            or source_gate.get("derived_rows") != 0
+            or source_gate.get("max_sequence_length") != configured_limit
+            or not isinstance(source_tokenizer, Mapping)
+            or not isinstance(source_tokenizer.get("identity"), str)
+            or not source_tokenizer["identity"].strip()
+        ):
+            raise HarnessError(
+                "prepared structure dataset has no compatible exact training-token gate")
     for split in ("train", "valid", "test"):
         entry = manifest.get("splits", {}).get(split, {})
         file_path = data_dir / str(entry.get("path", ""))
@@ -1005,7 +1722,7 @@ def run_preflight(
     except HarnessError as exc:
         report.errors.append(str(exc))
     try:
-        dataset = load_dataset_manifest(data_dir)
+        dataset = load_dataset_manifest(data_dir, config=config)
         report.facts["dataset"] = dataset
     except HarnessError as exc:
         report.errors.append(str(exc))
@@ -1160,6 +1877,7 @@ def build_training_run_contract(
     config: Mapping[str, Any], base_receipt: Mapping[str, Any],
     dataset_manifest: Mapping[str, Any],
     *, training_data_receipt: Mapping[str, Any] | None = None,
+    parent_adapter: ParentAdapterInitialization | None = None,
 ) -> dict[str, Any]:
     """Build the stable semantic identity shared by every resume attempt.
 
@@ -1206,9 +1924,19 @@ def build_training_run_contract(
             "splits": split_identity,
         },
     }
+    if dataset_manifest.get("prompt_contract") == STRUCTURE_PROMPT_CONTRACT:
+        identity_contract["dataset"].update({
+            "profile_id": dataset_manifest.get("profile_id"),
+            "corpus_schema_version": dataset_manifest.get("corpus_schema_version"),
+            "source_corpus_manifest_schema": dataset_manifest.get(
+                "source_corpus_manifest_schema"),
+            "target_contract": dataset_manifest.get("target_contract"),
+        })
     if training_data_receipt is not None:
         identity_contract["bounded_training_data"] = _bounded_training_data_attestation(
             training_data_receipt)
+    if parent_adapter is not None:
+        identity_contract["parent_adapter"] = dict(parent_adapter.identity)
     return {
         "schema_version": TRAINING_RUN_SCHEMA,
         "run_identity": sha256_bytes(canonical_json(identity_contract)),
@@ -1375,6 +2103,268 @@ class CapturedCheckpoint:
     bundle_sha256: str
     receipt_sha256: str
     run_identity: str | None
+
+
+@dataclass(frozen=True)
+class TrainingRetryDecision:
+    """A bounded recovery decision for one exited MLX trainer child."""
+
+    retry: bool
+    recovery_mode: str
+    delay_seconds: float | None
+    reason: str
+    signal_name: str | None
+
+
+def plan_training_retry(
+    exit_status: int, *, retries_used: int, max_retries: int,
+    base_delay_seconds: float, maximum_delay_seconds: float,
+    checkpoint: CapturedCheckpoint | None,
+) -> TrainingRetryDecision:
+    """Retry signal-terminated children, never ordinary deterministic exits.
+
+    macOS reports an MLX/Metal ``SIGABRT`` as ``-6`` through ``subprocess``.
+    Other negative values likewise mean the child was terminated by a signal and
+    are safe to retry within the explicit finite budget.  Positive exits are
+    treated as deterministic trainer/configuration failures and fail closed.
+    """
+
+    if not isinstance(exit_status, int) or isinstance(exit_status, bool):
+        raise HarnessError("trainer exit status must be an integer")
+    if (
+        not isinstance(retries_used, int) or isinstance(retries_used, bool)
+        or retries_used < 0
+        or not isinstance(max_retries, int) or isinstance(max_retries, bool)
+        or max_retries < 0
+    ):
+        raise HarnessError("training retry counts must be non-negative integers")
+    if max_retries > 20:
+        raise HarnessError("maximum training retries must not exceed 20")
+    for value, label in (
+        (base_delay_seconds, "base retry delay"),
+        (maximum_delay_seconds, "maximum retry delay"),
+    ):
+        if (
+            not isinstance(value, (int, float)) or isinstance(value, bool)
+            or not math.isfinite(float(value)) or float(value) < 0
+        ):
+            raise HarnessError(f"{label} must be a finite non-negative number")
+    if float(maximum_delay_seconds) > 60:
+        raise HarnessError("maximum retry delay must not exceed 60 seconds")
+    if float(base_delay_seconds) > float(maximum_delay_seconds):
+        raise HarnessError("base retry delay must not exceed maximum retry delay")
+
+    recovery_mode = "checkpoint_resume" if checkpoint is not None else "fresh_restart"
+    if exit_status >= 0:
+        return TrainingRetryDecision(
+            retry=False,
+            recovery_mode=recovery_mode,
+            delay_seconds=None,
+            reason="non_signal_exit",
+            signal_name=None,
+        )
+    signal_number = -exit_status
+    try:
+        signal_name = signal.Signals(signal_number).name
+    except ValueError:
+        signal_name = f"SIGNAL_{signal_number}"
+    if retries_used >= max_retries:
+        return TrainingRetryDecision(
+            retry=False,
+            recovery_mode=recovery_mode,
+            delay_seconds=None,
+            reason="retry_budget_exhausted",
+            signal_name=signal_name,
+        )
+    delay = min(
+        float(maximum_delay_seconds),
+        float(base_delay_seconds) * (2 ** retries_used),
+    )
+    return TrainingRetryDecision(
+        retry=True,
+        recovery_mode=recovery_mode,
+        delay_seconds=delay,
+        reason="signal_terminated",
+        signal_name=signal_name,
+    )
+
+
+class TrainingRunLock:
+    """One fail-fast supervisor per immutable output/run directory.
+
+    The descriptor is deliberately inherited by the MLX child.  If the Python
+    supervisor itself is killed, the orphan trainer continues to hold this lock
+    until it exits, so a replacement supervisor cannot launch a duplicate child.
+    """
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.descriptor: int | None = None
+
+    def acquire(self, *, owner: Mapping[str, Any]) -> None:
+        if fcntl is None:
+            raise HarnessError("the training run lock requires fcntl")
+        if self.descriptor is not None:
+            raise HarnessError("training run lock is already acquired")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            os.chmod(self.path, 0o600)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise HarnessError(
+                    "this academic training run is already supervised; "
+                    "a duplicate trainer was not started"
+                ) from exc
+            record = {
+                "pid": os.getpid(),
+                "acquired_at": time.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "type": "spiral_academic_training_supervisor",
+                **dict(owner),
+            }
+            raw = json.dumps(
+                record, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")[:4096]
+            os.ftruncate(descriptor, 0)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            os.write(descriptor, raw)
+            os.fsync(descriptor)
+            os.set_inheritable(descriptor, True)
+            self.descriptor = descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    def release(self) -> None:
+        descriptor, self.descriptor = self.descriptor, None
+        if descriptor is None:
+            return
+        try:
+            if fcntl is not None:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+    def __enter__(self) -> "TrainingRunLock":
+        if self.descriptor is None:
+            raise HarnessError("call acquire() before entering the training run lock")
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        self.release()
+
+
+class TrainingSupervisorJournal:
+    """Durable, identity-locked retry events plus an atomic current status."""
+
+    def __init__(
+        self, output: Path, *, run_identity: str, session_id: str,
+        max_retries: int, base_delay_seconds: float,
+        maximum_delay_seconds: float,
+    ) -> None:
+        if not SHA256_RE.fullmatch(run_identity):
+            raise HarnessError("training supervisor run identity is invalid")
+        # Reuse the policy validator without authorizing a retry.
+        plan_training_retry(
+            0, retries_used=0, max_retries=max_retries,
+            base_delay_seconds=base_delay_seconds,
+            maximum_delay_seconds=maximum_delay_seconds,
+            checkpoint=None,
+        )
+        if not isinstance(session_id, str) or not session_id:
+            raise HarnessError("training supervisor session id is invalid")
+        self.output = output
+        self.events_path = output / "training-supervisor-events.jsonl"
+        self.status_path = output / "training-supervisor-status.json"
+        self.run_identity = run_identity
+        self.session_id = session_id
+        self.max_retries = max_retries
+        self.base_delay_seconds = float(base_delay_seconds)
+        self.maximum_delay_seconds = float(maximum_delay_seconds)
+        self.sequence = 0
+        output.mkdir(parents=True, exist_ok=True)
+        self._load_existing()
+
+    def _load_existing(self) -> None:
+        if self.events_path.exists() and not self.events_path.is_file():
+            raise HarnessError("training supervisor event ledger is not a file")
+        if self.events_path.is_file():
+            for line_number, raw in enumerate(
+                self.events_path.read_text(encoding="utf-8").splitlines(), 1
+            ):
+                try:
+                    record = json.loads(raw)
+                except json.JSONDecodeError as exc:
+                    raise HarnessError(
+                        "training supervisor event ledger is corrupt at line "
+                        f"{line_number}: {exc}"
+                    ) from exc
+                if (
+                    not isinstance(record, Mapping)
+                    or record.get("schema_version")
+                    != TRAINING_SUPERVISOR_EVENT_SCHEMA
+                    or record.get("run_identity") != self.run_identity
+                    or record.get("sequence") != line_number
+                ):
+                    raise HarnessError(
+                        "training supervisor event ledger identity/sequence mismatch")
+                self.sequence = line_number
+        if self.status_path.exists() and not self.status_path.is_file():
+            raise HarnessError("training supervisor status is not a file")
+        if self.status_path.is_file():
+            status = _read_json(
+                self.status_path, "training supervisor status")
+            if (
+                status.get("schema_version")
+                != TRAINING_SUPERVISOR_STATUS_SCHEMA
+                or status.get("run_identity") != self.run_identity
+            ):
+                raise HarnessError(
+                    "training supervisor status belongs to another run identity")
+
+    def append(self, event: str, **fields: Any) -> dict[str, Any]:
+        if not isinstance(event, str) or not event:
+            raise HarnessError("training supervisor event name is invalid")
+        self.sequence += 1
+        record = {
+            "schema_version": TRAINING_SUPERVISOR_EVENT_SCHEMA,
+            "sequence": self.sequence,
+            "recorded_at": time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "run_identity": self.run_identity,
+            "session_id": self.session_id,
+            "event": event,
+            **fields,
+        }
+        descriptor = os.open(
+            self.events_path, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
+        try:
+            os.write(descriptor, canonical_json(record))
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        return record
+
+    def write_status(self, *, state: str, **fields: Any) -> dict[str, Any]:
+        status = {
+            "schema_version": TRAINING_SUPERVISOR_STATUS_SCHEMA,
+            "state": state,
+            "updated_at": time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "run_identity": self.run_identity,
+            "session_id": self.session_id,
+            "pid": os.getpid(),
+            "max_retries": self.max_retries,
+            "base_delay_seconds": self.base_delay_seconds,
+            "maximum_delay_seconds": self.maximum_delay_seconds,
+            "last_event_sequence": self.sequence,
+            "event_ledger": str(self.events_path),
+            **fields,
+        }
+        atomic_write_json(self.status_path, status)
+        return status
 
 
 class CheckpointLedger:
@@ -1603,6 +2593,263 @@ def adapter_bundle_digest(adapter_dir: Path) -> tuple[str, list[dict[str, Any]]]
     return digest.hexdigest(), entries
 
 
+@dataclass(frozen=True)
+class ParentAdapterInitialization:
+    """Verified immutable adapter used to initialize a distinct training run."""
+
+    manifest_path: Path
+    adapter_dir: Path
+    adapter_config_path: Path
+    weights_path: Path
+    identity: Mapping[str, Any]
+
+
+def _parent_adapter_path(manifest_path: Path, value: Any) -> Path:
+    relative = Path(str(value or ""))
+    if not str(value or "") or relative.is_absolute() or ".." in relative.parts:
+        raise HarnessError("parent adapter manifest contains an unsafe adapter.path")
+    destination = (manifest_path.parent / relative).resolve()
+    try:
+        destination.relative_to(manifest_path.parent.resolve())
+    except ValueError as exc:
+        raise HarnessError(
+            "parent adapter manifest escapes its containing directory") from exc
+    if not destination.is_dir():
+        raise HarnessError(f"parent adapter directory is missing: {destination}")
+    return destination
+
+
+def _expected_adapter_tensor_names(target_inventory: Mapping[str, Any]) -> set[str]:
+    result: set[str] = set()
+    targets_per_layer = target_inventory.get("targets_per_layer")
+    if not isinstance(targets_per_layer, Mapping) or not targets_per_layer:
+        raise HarnessError("base preflight has no exact LoRA target inventory")
+    for raw_layer, raw_targets in targets_per_layer.items():
+        try:
+            layer = int(raw_layer)
+        except (TypeError, ValueError) as exc:
+            raise HarnessError("base LoRA inventory has an invalid layer") from exc
+        if not isinstance(raw_targets, list) or not raw_targets:
+            raise HarnessError("base LoRA inventory has an empty target layer")
+        for raw_target in raw_targets:
+            target = str(raw_target)
+            prefix = f"language_model.model.layers.{layer}.{target}"
+            result.update({f"{prefix}.lora_a", f"{prefix}.lora_b"})
+    return result
+
+
+def _validate_parent_tensor_inventory(
+    weights_path: Path, target_inventory: Mapping[str, Any], *, rank: int,
+) -> None:
+    header = safetensors_header(weights_path)
+    observed = {name for name in header if name != "__metadata__"}
+    expected = _expected_adapter_tensor_names(target_inventory)
+    if observed != expected:
+        missing = sorted(expected - observed)
+        extra = sorted(observed - expected)
+        detail = []
+        if missing:
+            detail.append("missing " + ", ".join(missing[:4]))
+        if extra:
+            detail.append("unexpected " + ", ".join(extra[:4]))
+        raise HarnessError(
+            "parent adapter tensor inventory does not exactly match the configured "
+            "LoRA topology" + (": " + "; ".join(detail) if detail else ""))
+    for name in sorted(observed):
+        spec = header[name]
+        shape = spec.get("shape") if isinstance(spec, Mapping) else None
+        dtype = spec.get("dtype") if isinstance(spec, Mapping) else None
+        if (
+            not isinstance(shape, list)
+            or len(shape) != 2
+            or any(
+                not isinstance(value, int) or isinstance(value, bool) or value <= 0
+                for value in shape
+            )
+        ):
+            raise HarnessError(f"parent adapter tensor {name!r} has an invalid shape")
+        if name.endswith(".lora_a") and shape[-1] != rank:
+            raise HarnessError(f"parent adapter tensor {name!r} has the wrong rank")
+        if name.endswith(".lora_b") and shape[0] != rank:
+            raise HarnessError(f"parent adapter tensor {name!r} has the wrong rank")
+        if dtype != "F32":
+            raise HarnessError(
+                f"parent adapter tensor {name!r} must retain MLX-LM F32 LoRA weights")
+
+
+def validate_parent_adapter_initialization(
+    manifest_path: Path, config: Mapping[str, Any],
+    base_receipt: Mapping[str, Any],
+) -> ParentAdapterInitialization:
+    """Authenticate a parent adapter without importing or loading MLX weights."""
+
+    manifest_path = manifest_path.expanduser().resolve()
+    manifest = _read_json(manifest_path, "parent academic adapter manifest")
+    if manifest.get("schema_version") != ADAPTER_SCHEMA:
+        raise HarnessError("parent adapter manifest has an incompatible schema")
+    parent_profile = str(manifest.get("profile_id", ""))
+    parent_prompt = str(manifest.get("prompt_contract", ""))
+    if SUPPORTED_PROFILE_CONTRACTS.get(parent_profile) != parent_prompt:
+        raise HarnessError("parent adapter profile/prompt contract is unsupported")
+    base = manifest.get("base_model")
+    if not isinstance(base, Mapping):
+        raise HarnessError("parent adapter manifest has no base-model receipt")
+    for field in (
+        "model_id", "revision", "model_type", "architecture", "config_sha256",
+        "weight_index_sha256", "weight_inventory_sha256", "weight_files",
+        "quantization",
+    ):
+        if base.get(field) != base_receipt.get(field):
+            raise HarnessError(
+                f"parent adapter base {field} does not match the selected Qwen3.8 base")
+    adapter = manifest.get("adapter")
+    if not isinstance(adapter, Mapping) or adapter.get("format") != "mlx_lm_lora":
+        raise HarnessError("parent adapter manifest has no MLX-LM LoRA bundle")
+    adapter_dir = _parent_adapter_path(manifest_path, adapter.get("path"))
+    bundle_sha256, required_files = adapter_bundle_digest(adapter_dir)
+    if adapter.get("sha256") != bundle_sha256:
+        raise HarnessError("parent adapter bundle digest does not match its manifest")
+    manifest_files = adapter.get("required_files")
+    if not isinstance(manifest_files, list) or manifest_files != required_files:
+        raise HarnessError(
+            "parent adapter required-file inventory does not match its manifest")
+
+    adapter_config_path = adapter_dir / "adapter_config.json"
+    weights_path = adapter_dir / "adapters.safetensors"
+    adapter_config = _read_json(adapter_config_path, "parent adapter config")
+    if adapter_config.get("fine_tune_type") != "lora":
+        raise HarnessError("parent adapter is not a LoRA adapter")
+    if adapter_config.get("num_layers") != config["training"]["num_layers"]:
+        raise HarnessError("parent adapter num_layers does not match stage-two topology")
+    parent_lora = adapter_config.get("lora_parameters")
+    if not isinstance(parent_lora, Mapping):
+        raise HarnessError("parent adapter config has no LoRA parameters")
+    expected_lora = config["lora"]
+    try:
+        parent_scale = float(parent_lora.get("scale"))
+        parent_dropout = float(parent_lora.get("dropout"))
+    except (TypeError, ValueError) as exc:
+        raise HarnessError(
+            "parent adapter LoRA scale/dropout must be finite numbers") from exc
+    if (
+        parent_lora.get("keys") != expected_lora["keys"]
+        or parent_lora.get("rank") != expected_lora["rank"]
+        or not math.isfinite(parent_scale)
+        or not math.isfinite(parent_dropout)
+        or parent_scale != float(expected_lora["scale"])
+        or parent_dropout != float(expected_lora["dropout"])
+    ):
+        raise HarnessError(
+            "parent adapter LoRA keys/rank/scale/dropout do not exactly match "
+            "stage-two topology")
+    target_inventory = base_receipt.get("target_inventory")
+    if not isinstance(target_inventory, Mapping):
+        raise HarnessError("selected base receipt has no LoRA target inventory")
+    parent_training = manifest.get("training")
+    if not isinstance(parent_training, Mapping) or (
+        parent_training.get("trainable_layers")
+        != target_inventory.get("selected_layers")
+        or parent_training.get("trainable_target_paths") != expected_lora["keys"]
+        or parent_training.get("target_path_counts")
+        != target_inventory.get("target_path_counts")
+        or parent_training.get("total_target_modules")
+        != target_inventory.get("total_target_modules")
+    ):
+        raise HarnessError(
+            "parent adapter manifest LoRA inventory does not match the selected base")
+    _validate_parent_tensor_inventory(
+        weights_path, target_inventory, rank=int(expected_lora["rank"]))
+
+    config_entry = next(
+        entry for entry in required_files if entry["path"] == "adapter_config.json")
+    weights_entry = next(
+        entry for entry in required_files if entry["path"] == "adapters.safetensors")
+    parent_lineage = manifest.get("lineage")
+    parent_generation = 0
+    parent_lineage_sha256 = None
+    if parent_lineage is not None:
+        if not isinstance(parent_lineage, Mapping):
+            raise HarnessError("parent adapter lineage must be an object")
+        if set(parent_lineage) != {"schema_version", "generation", "parent"}:
+            raise HarnessError("parent adapter lineage has unexpected fields")
+        if parent_lineage.get("schema_version") != ADAPTER_LINEAGE_SCHEMA:
+            raise HarnessError("parent adapter lineage has an incompatible schema")
+        generation = parent_lineage.get("generation")
+        if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
+            raise HarnessError("parent adapter lineage generation is invalid")
+        ancestor = parent_lineage.get("parent")
+        if not isinstance(ancestor, Mapping):
+            raise HarnessError("parent adapter lineage has no authenticated ancestor")
+        allowed_ancestor_fields = {
+            "schema_version", "generation", "manifest_sha256", "profile_id",
+            "prompt_contract", "base_weight_inventory_sha256",
+            "adapter_tree_sha256", "adapter_config_sha256",
+            "adapter_weights_sha256", "lora_topology_sha256",
+            "parent_lineage_sha256",
+        }
+        if set(ancestor) - allowed_ancestor_fields:
+            raise HarnessError("parent adapter lineage ancestor has unexpected fields")
+        if (
+            ancestor.get("schema_version") != PARENT_ADAPTER_SCHEMA
+            or ancestor.get("generation") != generation
+        ):
+            raise HarnessError("parent adapter lineage generation is inconsistent")
+        if SUPPORTED_PROFILE_CONTRACTS.get(str(ancestor.get("profile_id", ""))) != str(
+            ancestor.get("prompt_contract", "")
+        ):
+            raise HarnessError("parent adapter lineage profile is unsupported")
+        for digest_field in (
+            "manifest_sha256", "base_weight_inventory_sha256",
+            "adapter_tree_sha256", "adapter_config_sha256",
+            "adapter_weights_sha256", "lora_topology_sha256",
+        ):
+            if not SHA256_RE.fullmatch(str(ancestor.get(digest_field, ""))):
+                raise HarnessError(
+                    f"parent adapter lineage has invalid {digest_field}")
+        optional_lineage_hash = ancestor.get("parent_lineage_sha256")
+        if optional_lineage_hash is not None and not SHA256_RE.fullmatch(
+            str(optional_lineage_hash)
+        ):
+            raise HarnessError(
+                "parent adapter lineage has invalid parent_lineage_sha256")
+        if ancestor.get("base_weight_inventory_sha256") != base.get(
+            "weight_inventory_sha256"
+        ):
+            raise HarnessError(
+                "parent adapter ancestor is based on a different weight inventory")
+        parent_generation = generation
+        parent_lineage_sha256 = sha256_bytes(canonical_json(parent_lineage))
+    topology = {
+        "num_layers": config["training"]["num_layers"],
+        "keys": list(expected_lora["keys"]),
+        "rank": expected_lora["rank"],
+        "scale": expected_lora["scale"],
+        "dropout": expected_lora["dropout"],
+        "tensor_names": sorted(_expected_adapter_tensor_names(target_inventory)),
+    }
+    identity = {
+        "schema_version": PARENT_ADAPTER_SCHEMA,
+        "generation": parent_generation + 1,
+        "manifest_sha256": sha256_file(manifest_path),
+        "profile_id": parent_profile,
+        "prompt_contract": parent_prompt,
+        "base_weight_inventory_sha256": base["weight_inventory_sha256"],
+        "adapter_tree_sha256": bundle_sha256,
+        "adapter_config_sha256": config_entry["sha256"],
+        "adapter_weights_sha256": weights_entry["sha256"],
+        "lora_topology_sha256": sha256_bytes(canonical_json(topology)),
+    }
+    if parent_lineage_sha256 is not None:
+        identity["parent_lineage_sha256"] = parent_lineage_sha256
+    return ParentAdapterInitialization(
+        manifest_path=manifest_path,
+        adapter_dir=adapter_dir,
+        adapter_config_path=adapter_config_path,
+        weights_path=weights_path,
+        identity=identity,
+    )
+
+
 def publish_adapter_bundle(work_dir: Path, output_root: Path) -> tuple[Path, str, list[dict[str, Any]]]:
     adapter_dir = output_root / "adapter"
     if adapter_dir.exists():
@@ -1634,14 +2881,26 @@ def build_adapter_manifest(
     dataset_manifest_path: Path, adapter_manifest_path: Path, adapter_dir: Path, bundle_digest: str,
     required_files: Sequence[Mapping[str, Any]], package_versions: Mapping[str, str | None],
     training_data_receipt: Mapping[str, Any] | None = None,
+    parent_adapter: ParentAdapterInitialization | None = None,
 ) -> dict[str, Any]:
     training = config["training"]
     target_inventory = base_receipt["target_inventory"]
     source_manifest_path = Path(str(dataset_manifest["source_corpus_manifest"]))
+    configured_profile = config.get("profile")
+    if isinstance(configured_profile, Mapping):
+        profile_id = str(configured_profile.get("id", PROFILE_ID))
+        prompt_contract = str(
+            configured_profile.get("prompt_contract", PROMPT_CONTRACT))
+    else:
+        # The low-level builder historically accepted minimal, already-audited
+        # prose configs. Production configs still pass strict validation at load.
+        profile_id = PROFILE_ID
+        prompt_contract = PROMPT_CONTRACT
+    structure_mode = prompt_contract == STRUCTURE_PROMPT_CONTRACT
     manifest = {
         "schema_version": ADAPTER_SCHEMA,
-        "profile_id": PROFILE_ID,
-        "prompt_contract": PROMPT_CONTRACT,
+        "profile_id": profile_id,
+        "prompt_contract": prompt_contract,
         "base_model": {
             "model_id": base_receipt["model_id"],
             "revision": base_receipt["revision"],
@@ -1690,7 +2949,9 @@ def build_adapter_manifest(
         },
         "runtime": {
             "provider": "mlx_lm",
-            "model": "qwen3.8-27b-academic",
+            "model": (
+                "qwen3.8-27b-academic-structure"
+                if structure_mode else "qwen3.8-27b-academic"),
             "base_url": "http://127.0.0.1:8080/v1",
             "transport_adapter": "openai-compatible",
             # Default request multiplier around the trained adapter delta. The
@@ -1699,9 +2960,20 @@ def build_adapter_manifest(
             "default_adapter_strength": 1.0,
         },
     }
+    if structure_mode:
+        manifest["runtime"].update({
+            "scope": "spiral_paper_planner_only",
+            "spiralchat_eligible": False,
+        })
     if training_data_receipt is not None:
         manifest["dataset"]["bounded_training_data"] = _bounded_training_data_attestation(
             training_data_receipt)
+    if parent_adapter is not None:
+        manifest["lineage"] = {
+            "schema_version": ADAPTER_LINEAGE_SCHEMA,
+            "generation": parent_adapter.identity["generation"],
+            "parent": dict(parent_adapter.identity),
+        }
     return manifest
 
 
@@ -1903,11 +3175,15 @@ def run_training_process(
     command: Sequence[str], work_adapter_dir: Path, ledger: CheckpointLedger,
     *, cumulative_offset: int = 0, poll_seconds: float = 0.5,
     inherited_lease_fd: int | None = None,
+    inherited_run_lock_fd: int | None = None,
     metrics_path: Path | None = None, metrics_mode: str = "production",
     metrics_run_id: str = "", trainer_log_path: Path | None = None,
 ) -> int:
     """Run MLX-LM and atomically mirror each complete numbered checkpoint."""
-    pass_fds = (inherited_lease_fd,) if inherited_lease_fd is not None else ()
+    pass_fds = tuple(
+        descriptor for descriptor in (inherited_lease_fd, inherited_run_lock_fd)
+        if descriptor is not None
+    )
     journal = (
         TrainingMetricsJournal(
             metrics_path, mode=metrics_mode,
@@ -1967,7 +3243,11 @@ def run_training_process(
             time.sleep(poll_seconds)
         reader.join(timeout=2)
         _capture_native_checkpoints(
-            work_adapter_dir, ledger, captured, cumulative_offset, strict=True)
+            work_adapter_dir, ledger, captured, cumulative_offset,
+            # A signal-killed Metal child can leave its current native snapshot
+            # incomplete. Never let that uncommitted file mask the negative
+            # return code that the bounded supervisor must classify and retry.
+            strict=process.returncode == 0)
         if log_descriptor is not None:
             os.fsync(log_descriptor)
         if metric_failures:
