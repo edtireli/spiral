@@ -963,16 +963,60 @@ def _plan_chat(
 
 
 def parse_plan(data: dict) -> Plan:
+    """Materialize only complete plan records from schema-constrained/salvaged JSON.
+
+    A local answer may reach its hard token cap while opening the final task. JSON
+    salvage deliberately closes that tail so all earlier work remains usable; the
+    parser must therefore discard the one incomplete record rather than crashing the
+    entire run. Deterministic requirement coverage later reconstructs omitted feature
+    work and lints the retained plan.
+    """
+
+    def text(value: object) -> str:
+        return value.strip() if isinstance(value, str) else ""
+
+    def strings(value: object) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return [selected for item in value if (selected := text(item))]
+
     milestones = []
-    for m in data.get("milestones", []):
-        tasks = [
-            Task(t["title"], t.get("description", ""), t.get("files", []) or [],
-                 t.get("verify", "") or "", t.get("requirements", []) or [],
-                 t.get("exports", []) or [], t.get("imports", []) or [])
-            for t in m.get("tasks", [])
-        ]
-        milestones.append(Milestone(m["title"], tasks, m.get("goal", "")))
-    return Plan(data.get("understanding", ""), milestones)
+    source_milestones = data.get("milestones", []) if isinstance(data, dict) else []
+    if not isinstance(source_milestones, list):
+        source_milestones = []
+    for index, milestone in enumerate(source_milestones, 1):
+        if not isinstance(milestone, dict):
+            continue
+        tasks = []
+        source_tasks = milestone.get("tasks", [])
+        if not isinstance(source_tasks, list):
+            source_tasks = []
+        for task in source_tasks:
+            if not isinstance(task, dict):
+                continue
+            title = text(task.get("title"))
+            if not title:
+                continue
+            tasks.append(Task(
+                title,
+                text(task.get("description")),
+                strings(task.get("files")),
+                text(task.get("verify")),
+                strings(task.get("requirements")),
+                strings(task.get("exports")),
+                strings(task.get("imports")),
+            ))
+        if not tasks:
+            continue
+        milestones.append(Milestone(
+            text(milestone.get("title")) or f"Implementation {index}",
+            tasks,
+            text(milestone.get("goal")),
+        ))
+    plan = Plan(text(data.get("understanding")) if isinstance(data, dict) else "", milestones)
+    if not plan.task_count:
+        raise ValueError("planner returned no complete tasks")
+    return plan
 
 
 def _gate_line(gate: str) -> str:

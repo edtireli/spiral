@@ -19,7 +19,7 @@ from spiral.planner import (  # noqa: E402
     ARTIFACT_SYSTEM, CRITIC_SYSTEM, PLANNER_SYSTEM, REPOSITORY_DATA_BOUNDARY,
     VALIDATOR_SYSTEM,
     _plan_chat, coverage_gaps, enrich_product_spec, ensure_plan_coverage,
-    extract_spec, make_plan,
+    extract_spec, make_plan, parse_plan,
     normalize_plan_requirements, sanitize_checks, Plan, Milestone, Task,
 )
 from spiral.llm import ChatResult  # noqa: E402
@@ -75,7 +75,8 @@ def test_local_structured_reasoning_has_one_finite_probe_then_answer_only():
 def test_initial_spec_and_plan_emit_json_without_hidden_think_forever():
     models = _PlannerModels([
         _reply('{"requirements": [{"id": "R1", "text": "safe"}]}'),
-        _reply('{"understanding": "safe tool", "milestones": []}'),
+        _reply('{"understanding": "safe tool", "milestones": [{"title": "Core", '
+               '"tasks": [{"title": "Implement safe tool"}]}]}'),
     ])
     spec, _ = extract_spec("build safely", _PlannerConfig(), models)
     plan, _ = make_plan("build safely", "empty repo", cfg=_PlannerConfig(), ol=models)
@@ -84,6 +85,36 @@ def test_initial_spec_and_plan_emit_json_without_hidden_think_forever():
     assert plan.understanding == "safe tool"
     assert [call[2]["think"] for call in models.calls] == [False, False]
     assert [call[2]["num_predict"] for call in models.calls] == [4096, 6144]
+
+
+def test_salvaged_plan_discards_only_incomplete_tail_task():
+    plan = parse_plan({
+        "understanding": "  safe inventory  ",
+        "milestones": [{
+            "title": "Core",
+            "tasks": [
+                {
+                    "title": "Build policy guard",
+                    "description": "Reject non-local targets",
+                    "files": ["src/policy.py", 42],
+                    "requirements": ["R1", None],
+                },
+                {},  # token-cap salvage closed the unfinished final object
+            ],
+        }],
+    })
+
+    assert plan.understanding == "safe inventory"
+    assert plan.task_count == 1
+    assert plan.milestones[0].tasks[0].files == ["src/policy.py"]
+    assert plan.milestones[0].tasks[0].requirements == ["R1"]
+
+
+def test_salvaged_plan_without_one_complete_task_fails_explicitly():
+    import pytest
+
+    with pytest.raises(ValueError, match="no complete tasks"):
+        parse_plan({"milestones": [{"title": "tail", "tasks": [{}]}]})
 
 
 def test_repo_aware_model_roles_treat_repository_material_as_untrusted_data():
