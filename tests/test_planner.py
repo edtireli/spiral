@@ -11,19 +11,79 @@ from __future__ import annotations
 
 import os
 import sys
+from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from spiral.planner import (  # noqa: E402
     ARTIFACT_SYSTEM, CRITIC_SYSTEM, PLANNER_SYSTEM, REPOSITORY_DATA_BOUNDARY,
     VALIDATOR_SYSTEM,
-    coverage_gaps, enrich_product_spec, ensure_plan_coverage,
+    _plan_chat, coverage_gaps, enrich_product_spec, ensure_plan_coverage,
+    extract_spec, make_plan,
     normalize_plan_requirements, sanitize_checks, Plan, Milestone, Task,
 )
+from spiral.llm import ChatResult  # noqa: E402
 
 
 def _plan(*tasks: tuple[str, str]) -> Plan:
     return Plan("u", [Milestone("m", [Task(t, d) for t, d in tasks])])
+
+
+class _PlannerConfig:
+    planner = SimpleNamespace(name="local-planner")
+    planner_max_tokens = 16_384
+    keep_alive = "0"
+
+    @staticmethod
+    def spec_for(_model: str):
+        return SimpleNamespace(num_ctx=32_768)
+
+
+class _PlannerModels:
+    def __init__(self, replies):
+        self.providers = {}
+        self.replies = list(replies)
+        self.calls = []
+
+    def chat(self, model, messages, **kwargs):
+        self.calls.append((model, messages, kwargs))
+        return self.replies.pop(0)
+
+
+def _reply(text: str, *, thinking: str | None = None, reason: str = "stop"):
+    return ChatResult(
+        text=text, prompt_tokens=10, completion_tokens=20,
+        thinking=thinking, raw={"done_reason": reason},
+    )
+
+
+def test_local_structured_reasoning_has_one_finite_probe_then_answer_only():
+    models = _PlannerModels([
+        _reply("", thinking="still considering", reason="length"),
+        _reply('{"answer": true}'),
+    ])
+    result = _plan_chat(
+        "system", "user", _PlannerConfig(), models, temperature=0.2,
+        schema={"type": "object"}, think=True, max_tokens=6000,
+    )
+
+    assert result.text == '{"answer": true}'
+    assert [call[2]["think"] for call in models.calls] == [True, False]
+    assert [call[2]["num_predict"] for call in models.calls] == [2048, 6000]
+
+
+def test_initial_spec_and_plan_emit_json_without_hidden_think_forever():
+    models = _PlannerModels([
+        _reply('{"requirements": [{"id": "R1", "text": "safe"}]}'),
+        _reply('{"understanding": "safe tool", "milestones": []}'),
+    ])
+    spec, _ = extract_spec("build safely", _PlannerConfig(), models)
+    plan, _ = make_plan("build safely", "empty repo", cfg=_PlannerConfig(), ol=models)
+
+    assert spec[0]["id"] == "R1"
+    assert plan.understanding == "safe tool"
+    assert [call[2]["think"] for call in models.calls] == [False, False]
+    assert [call[2]["num_predict"] for call in models.calls] == [4096, 6144]
 
 
 def test_repo_aware_model_roles_treat_repository_material_as_untrusted_data():
