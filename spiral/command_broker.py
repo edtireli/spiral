@@ -890,42 +890,54 @@ class CommandBroker:
 
         env = scrubbed_environment(
             self.root, self.environment, full_access=full_access)
+        from spiral.runtime_control import get_runtime_control
+
+        runtime_control = get_runtime_control()
+        runtime_control.checkpoint()
         started = time.monotonic()
+        paused_at_start = runtime_control.paused_seconds()
         lines: list[str] = []
         process: subprocess.Popen | None = None
         timed_out = False
         try:
-            process = subprocess.Popen(
-                argv, cwd=work, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, stdin=subprocess.DEVNULL, env=env,
-                start_new_session=(os.name == "posix"),
-            )
-            assert process.stdout is not None
-            deadline = time.monotonic() + max(1, timeout)
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    _terminate_process_tree(process)
-                    timed_out = True
-                    lines.append(f"\n(timed out after {timeout}s)")
-                    break
-                ready, _, _ = select.select(
-                    [process.stdout], [], [], min(0.25, remaining))
-                if ready:
-                    line = process.stdout.readline()
-                    if line:
-                        lines.append(line)
-                        if on_line:
-                            try:
-                                on_line(line.rstrip())
-                            except Exception:
-                                pass
-                if process.poll() is not None:
-                    tail = process.stdout.read()
-                    if tail:
-                        lines.append(tail)
-                    break
-            code = 124 if timed_out else process.wait(timeout=15)
+            # The detached process owns a separate session/process group. Keep it
+            # registered until the complete group exits, not merely until its shell
+            # leader does, so a cooperative pause cannot leave descendants mutating
+            # the workspace behind a false "paused" acknowledgement.
+            with runtime_control.activity("command"):
+                process = subprocess.Popen(
+                    argv, cwd=work, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, stdin=subprocess.DEVNULL, env=env,
+                    start_new_session=(os.name == "posix"),
+                )
+                assert process.stdout is not None
+                deadline = time.monotonic() + max(1, timeout)
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        _terminate_process_tree(process)
+                        timed_out = True
+                        lines.append(f"\n(timed out after {timeout}s)")
+                        break
+                    ready, _, _ = select.select(
+                        [process.stdout], [], [], min(0.25, remaining))
+                    if ready:
+                        line = process.stdout.readline()
+                        if line:
+                            lines.append(line)
+                            if on_line:
+                                try:
+                                    on_line(line.rstrip())
+                                except Exception:
+                                    pass
+                    if process.poll() is not None:
+                        if _process_group_alive(process):
+                            continue
+                        tail = process.stdout.read()
+                        if tail:
+                            lines.append(tail)
+                        break
+                code = 124 if timed_out else process.wait(timeout=15)
         except KeyboardInterrupt:
             if process is not None:
                 _terminate_process_tree(process, interrupted=True)
@@ -938,6 +950,9 @@ class CommandBroker:
         finally:
             if process is not None and process.stdout is not None:
                 process.stdout.close()
+        # On an ordinary broker exception, process-tree cleanup happens in the outer
+        # handler above. Only now is it safe to satisfy a pending cooperative pause.
+        runtime_control.checkpoint()
         output = "".join(lines).strip()
         result = RunResult(command, code, output)
         try:
@@ -961,7 +976,11 @@ class CommandBroker:
             "reference_roots": [str(path) for path in self.reference_roots],
             "environment_keys": sorted(env),
             "exit": code,
-            "seconds": round(time.monotonic() - started, 2),
+            "seconds": round(max(
+                0.0,
+                time.monotonic() - started
+                - (runtime_control.paused_seconds() - paused_at_start),
+            ), 2),
             "output_tail": output[-2000:],
             "ok": code == 0,
         })

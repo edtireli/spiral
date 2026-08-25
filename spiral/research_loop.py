@@ -43,6 +43,8 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from spiral.runtime_control import checkpoint as runtime_checkpoint
+
 
 # Machine-decidable strengths always qualify a finding as a real result. For empirical
 # fields (neuroscience/biology/medicine) there is no SymPy oracle, so a claim grounded
@@ -4593,6 +4595,7 @@ class ResearchLoop:
 
     # -- the loop ------------------------------------------------------------
     def run(self, max_rounds: int | None = None, token_budget: int | None = None) -> ResearchState:
+        runtime_checkpoint()
         if (self.state.status in {"solved", "new_question"}
                 and self.state.completion.get("ready")):
             living_manifest = self.dir / "living-paper.json"
@@ -4649,6 +4652,7 @@ class ResearchLoop:
             int((self.state.coverage.get("graph") or {}).get("closed_current_seed_count") or 0),
         )
         while True:
+            runtime_checkpoint()
             if max_rounds is not None and self.state.round >= max_rounds:
                 self.state.status = "exhausted"; break
             budget_used = self.state.tokens
@@ -4694,6 +4698,7 @@ class ResearchLoop:
                 if skipped:
                     self._say(f"  skip · {skipped} paraphrase(s) of tried searches")
                 for q in sweep:
+                    runtime_checkpoint()
                     self.gather(q, k=per, categories=cats)
             # DEPTH: snowball the citation graph — pulls in the foundational works many
             # corpus papers cite but keyword search can't reach, until it saturates. This

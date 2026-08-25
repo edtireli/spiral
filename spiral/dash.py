@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import collections
 import json
+import os
+import re
 import sys
 import threading
 import time
@@ -29,6 +31,9 @@ from rich.text import Text
 from spiral.banner import CLASSIC, Spinner
 
 CLAY = "rgb(217,119,87)"
+UI_EVENT_SCHEMA = "spiral.ui.progress.v1"
+UI_EVENT_PREFIX = "SPIRAL_UI_EVENT_V1"
+_UI_TOKEN = re.compile(r"^[0-9a-f]{32}$")
 
 
 class Dash:
@@ -64,6 +69,14 @@ class Dash:
         self._paused = False
         self._samples: collections.deque = collections.deque(maxlen=60)  # (t, tok) for live t/s
         self._done_times: list[float] = []                               # green timestamps for ETA
+        # The detached host supplies an unguessable per-attempt token.  Standalone
+        # terminals omit it and retain exactly their existing Rich UI.  Machine UI
+        # frames are full snapshots, never chain-of-thought, so a reconnecting client
+        # can render the latest one without replaying terminal control sequences.
+        candidate = os.environ.get("SPIRAL_UI_EVENT_TOKEN", "").strip().lower()
+        self._ui_event_token = candidate if _UI_TOKEN.fullmatch(candidate) else ""
+        self._ui_event_sequence = 0
+        self._ui_event_lock = threading.Lock()
 
     # -- lifecycle -------------------------------------------------------------
     def __enter__(self) -> "Dash":
@@ -75,6 +88,7 @@ class Dash:
         else:
             self._thread = threading.Thread(target=self._hb_loop, daemon=True)
         self._thread.start()
+        self._emit_ui()
         return self
 
     def __exit__(self, *exc) -> None:
@@ -84,6 +98,7 @@ class Dash:
         if self._live:
             self._live.update(self._render(final=True))
             self._live.__exit__(*exc)
+        self._emit_ui(final=True)
 
     def _anim_loop(self) -> None:
         while not self._stop.wait(0.08):
@@ -108,6 +123,72 @@ class Dash:
                 line += f" · idea: {self._idea[:120]}"
             sys.stdout.write(line + "\n")
             sys.stdout.flush()
+            self._emit_ui()
+
+    def _ui_snapshot(self, *, final: bool = False) -> dict:
+        milestones = []
+        if self.plan is not None:
+            for mi, milestone in enumerate(self.plan.milestones, 1):
+                tasks = []
+                states = []
+                for ti, task in enumerate(milestone.tasks, 1):
+                    raw = self.status.get((mi, ti), "")
+                    state = {
+                        "run": "running", "done": "done", "blocked": "blocked",
+                    }.get(raw, "pending")
+                    states.append(state)
+                    tasks.append({
+                        "index": ti,
+                        "title": str(task.title)[:240],
+                        "status": state,
+                    })
+                if states and all(state == "done" for state in states):
+                    milestone_status = "done"
+                elif "blocked" in states:
+                    milestone_status = "blocked"
+                elif "running" in states:
+                    milestone_status = "running"
+                else:
+                    milestone_status = "pending"
+                milestones.append({
+                    "index": mi,
+                    "title": str(milestone.title)[:240],
+                    "status": milestone_status,
+                    "tasks": tasks,
+                })
+        return {
+            "schema_version": UI_EVENT_SCHEMA,
+            "phase": self._phase[:240],
+            "model": self._model[:240],
+            "detail": self._detail[:700],
+            "idea": self._idea[:700],
+            "tokens": max(0, int(self._tokens)),
+            "elapsed_seconds": max(0.0, round(time.time() - self._t0, 3)),
+            "done": max(0, int(self._done)),
+            "blocked": max(0, int(self._blocked)),
+            "final": bool(final),
+            "milestones": milestones,
+        }
+
+    def _emit_ui(self, *, final: bool = False) -> None:
+        if not self._ui_event_token:
+            return
+        with self._ui_event_lock:
+            self._ui_event_sequence += 1
+            payload = self._ui_snapshot(final=final)
+            payload["sequence"] = self._ui_event_sequence
+            line = (
+                f"{UI_EVENT_PREFIX} {self._ui_event_token} "
+                + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+                + "\n"
+            )
+            # One write keeps a frame intact with the ordinary heartbeat/output stream;
+            # the host authenticates and removes it before publishing raw log deltas.
+            try:
+                os.write(sys.stdout.fileno(), line.encode("utf-8"))
+            except (AttributeError, OSError, ValueError):
+                sys.stdout.write(line)
+                sys.stdout.flush()
 
     # -- mutations ---------------------------------------------------------------
     def phase(self, name: str, model: str = "") -> None:
@@ -115,6 +196,7 @@ class Dash:
         self._phase_t0 = time.time()
         self._detail = ""
         self._samples.clear()  # t/s is per-generation, not across phases
+        self._emit_ui()
 
     def tick(self, n: int = 1) -> None:
         self._tokens += n
@@ -132,6 +214,7 @@ class Dash:
 
     def detail(self, s: str) -> None:
         self._detail = (s or "").strip()[-70:]
+        self._emit_ui()
 
     def idea(self, s: str) -> None:
         """Pinned high-level working note.
@@ -160,6 +243,7 @@ class Dash:
                     f.write(json.dumps(entry, ensure_ascii=False) + "\n")
             except Exception:
                 self._thought_log = None
+        self._emit_ui()
 
     def toggle_thoughts(self) -> None:
         self.thoughts_expanded = not self.thoughts_expanded
@@ -201,6 +285,7 @@ class Dash:
             self._done_times.append(time.time())
         if state == "blocked" and prev != "blocked":
             self._blocked += 1
+        self._emit_ui()
 
     def print(self, *args, **kwargs) -> None:
         # with Live active on this console, prints land ABOVE the pinned region

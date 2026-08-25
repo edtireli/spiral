@@ -53,11 +53,19 @@ class BudgetExceeded(RuntimeError):
 class RunBudget:
     """One wall/token/call ledger shared by every role in an orchestration run."""
 
-    def __init__(self, limits: BudgetLimits, *, clock=time.monotonic):
+    def __init__(self, limits: BudgetLimits, *, clock=time.monotonic,
+                 paused_clock=None):
         if min(limits.wall_seconds, limits.total_tokens, limits.model_calls) <= 0:
             raise ValueError("wall, token, and call budgets must all be finite and positive")
         self.limits = limits
         self._clock = clock
+        if paused_clock is None:
+            # Import lazily so the model-independent ledger stays usable on its own.
+            # A disabled runtime controller returns zero and has no background work.
+            from spiral.runtime_control import paused_seconds
+            paused_clock = paused_seconds
+        self._paused_clock = paused_clock
+        self._paused_at_start = max(0.0, float(paused_clock()))
         self.started_at = clock()
         self.calls = 0
         self.prompt_tokens = 0
@@ -69,7 +77,11 @@ class RunBudget:
 
     @property
     def elapsed_seconds(self) -> float:
-        return max(0.0, self._clock() - self.started_at)
+        paused = max(
+            0.0,
+            float(self._paused_clock()) - self._paused_at_start,
+        )
+        return max(0.0, self._clock() - self.started_at - paused)
 
     @property
     def exhausted(self) -> bool:
