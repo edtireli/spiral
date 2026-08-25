@@ -53,8 +53,11 @@ def test_a_confirmed_fault_stops_the_run_instead_of_blaming_the_code(tmp_path):
     that, so the honest outcome is to stop and say so."""
     atom, calls = _atom_replying(
         tmp_path, "HARNESS_ERROR: the gate calls a tool that is not installed")
+    # Hide the inner command from static top-level preflight so this test continues
+    # to exercise the model-authored HARNESS_ERROR channel itself.  A directly named
+    # missing binary is now caught even earlier, without spending a model call.
     spec = TaskSpec("add a feature",
-                    "definitely-not-a-real-binary-xyz --run")
+                    "sh -c 'definitely-not-a-real-binary-xyz --run'")
 
     with pytest.raises(HarnessFault) as caught:
         atom.run(spec, ui=Quiet(), attempts=3)
@@ -94,7 +97,8 @@ def test_a_repeated_correct_diagnosis_is_not_punished_as_a_repeat(tmp_path):
     adjudication has to run ahead of it — otherwise the channel is unreachable from
     attempt two onward, which is precisely the bug this closes."""
     atom, calls = _atom_replying(tmp_path, "HARNESS_ERROR: the gate tool is missing")
-    spec = TaskSpec("add a feature", "definitely-not-a-real-binary-xyz --run")
+    spec = TaskSpec(
+        "add a feature", "sh -c 'definitely-not-a-real-binary-xyz --run'")
 
     with pytest.raises(HarnessFault):
         atom.run(spec, ui=Quiet(), attempts=3, diversity=False)

@@ -37,7 +37,8 @@ from spiral.banner import Spinner
 from spiral.config import Config, general_api_providers
 from spiral.contracts import lint_contracts
 from spiral.execution import (
-    EvidenceLevel, EvidenceRecord, OrchestrationPolicy, TaskEvidenceDAG, TaskState,
+    BudgetExceeded, EvidenceLevel, EvidenceRecord, OrchestrationPolicy,
+    TaskEvidenceDAG, TaskState,
     evidence_level_for_command,
 )
 from spiral.ladder import is_python_gate, venv_prefix
@@ -734,6 +735,22 @@ class Conductor:
                 if status in {"green", "escalated"}:
                     green += 1
         return processed, green
+
+    @staticmethod
+    def _recovery_frontier(current_tasks: dict[str, Task], records: dict,
+                           current_head: str) -> list[str]:
+        """Blocked tasks worth one fresh pass after the repository has advanced.
+
+        A later independent task can materialize the package, fixture, interface, or
+        configuration an earlier task lacked.  Repeating immediately against the same
+        tree is thrashing; retrying once against a different verified revision is useful
+        new information.  The returned order is the original plan order.
+        """
+        return [
+            key for key in current_tasks
+            if str((records.get(key) or {}).get("status") or "") == "blocked"
+            and str((records.get(key) or {}).get("head") or "") != current_head
+        ]
 
     @staticmethod
     def _raw_goal(goal: str) -> str:
@@ -2022,20 +2039,40 @@ class Conductor:
         if atom.budget_exhausted:
             ui.print("  [red]■ run execution budget reached; task was not started[/]")
             return "blocked"
-        if atom.run(spec, attempts=attempts, strict_green=strict, ratchet=ratchet,
-                    allow_done=allow_done, ui=ui, route=getattr(self, "_route", None)):
+
+        def run_lane(**kwargs) -> bool | None:
+            try:
+                return atom.run(spec, **kwargs)
+            except BudgetExceeded as exc:
+                atom.mark_budget_exceeded(exc)
+                ui.print(
+                    f"  [red]■ run {exc.dimension} budget cannot admit another model call[/] "
+                    f"[dim]{str(exc)[:240]}[/]"
+                )
+                return None
+
+        worker = run_lane(
+            attempts=attempts, strict_green=strict, ratchet=ratchet,
+            allow_done=allow_done, ui=ui, route=getattr(self, "_route", None),
+        )
+        if worker is None:
+            return "blocked"
+        if worker:
             return "green"
         if atom.budget_exhausted:
             ui.print("  [red]■ run execution budget reached; escalation suppressed[/]")
             return "blocked"
         ui.print(f"  [rgb(217,119,87)]⇑ escalating to {self.cfg.escalation.name}[/]")
         atom.run_stats["esc_lanes"] += 1
-        if atom.run(
-            spec, model=self.cfg.escalation.name,
+        escalation = run_lane(
+            model=self.cfg.escalation.name,
             attempts=esc_attempts or self.cfg.escalation_attempts,
             strict_green=strict, ratchet=ratchet, allow_done=allow_done, ui=ui,
             diversity=False,  # the dense lane is the last resort — no second sampler
-        ):
+        )
+        if escalation is None:
+            return "blocked"
+        if escalation:
             self._distill(spec.goal)
             return "escalated"
         return "blocked"
@@ -2514,6 +2551,113 @@ class Conductor:
                         self._write_evidence_result(
                             outcome="budget_stop", blocked=blocked, atom=atom)
                         return
+
+            # ---- recovery frontier ---------------------------------------------
+            # A blocked task is evidence debt, not a permanent verdict.  Once later
+            # independent work has advanced the tree, give each blocked task one finite
+            # fresh pass against that richer repository.  This is deliberately after the
+            # ordinary grind (no racing or duplicate work) and before final validation.
+            # Same-tree failures are not replayed, so deterministic environment faults do
+            # not turn into another model loop.
+            records = dict(self.state.get("task_records") or {})
+            recovery_keys = self._recovery_frontier(
+                current_tasks, records, self._revision())
+            if recovery_keys and not atom.budget_exhausted:
+                dash.phase("recovering blocked work")
+                dash.print(
+                    f"[bold {CLAY}]━━ recovery frontier · {len(recovery_keys)} task(s) ━━[/]"
+                )
+            for task_key in recovery_keys:
+                runtime_checkpoint()
+                if atom.budget_exhausted:
+                    break
+                task = current_tasks[task_key]
+                mi, ti = (int(value) for value in task_key.split(".", 1))
+                dash.task(mi, ti, "run")
+                dash.print(
+                    f"[bold]↻ {task_key} {task.title}[/] "
+                    "[dim]repository advanced since the blocked attempt[/]"
+                )
+                if self._refresh_gate():
+                    dash.gate = self.gate
+                verify = task.verify.strip()
+                if self.gate:
+                    verify = f"({verify}) && {self.gate}" if verify else self.gate
+                recovery_spec = TaskSpec(
+                    goal=(
+                        f"{task.title}\n{task.description}\n\n"
+                        "RECOVERY PASS: earlier work was blocked, but the repository has "
+                        "since advanced. Re-inspect the current files; preserve all green "
+                        "work and finish only the remaining obligation."
+                    ).strip(),
+                    verify_cmd=verify,
+                    files=task.files or None,
+                    context=goal,
+                    exports=list(getattr(task, "exports", []) or []) or None,
+                )
+                recovery_status = self._run_task(
+                    atom, recovery_spec, dash,
+                    attempts=max(1, int(getattr(
+                        self.cfg, "builder_remediation_attempts", 3))),
+                    esc_attempts=max(1, int(getattr(
+                        self.cfg, "builder_remediation_escalation_attempts", 2))),
+                )
+                if recovery_status != "blocked":
+                    self._verify_new_gate(dash, atom, goal)
+                    blocked = [
+                        row for row in blocked
+                        if not row.startswith(f"{task_key} ")
+                    ]
+                    dash.task(mi, ti, "done")
+                    current_head = self._revision()
+                    records[task_key] = {
+                        "status": recovery_status,
+                        "fingerprint": self._task_fingerprint(task),
+                        "head": current_head,
+                        "gate": self.gate_disp,
+                        "completed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "recovered": True,
+                    }
+                    evidence = []
+                    if verify:
+                        evidence.append(EvidenceRecord(
+                            evidence_level_for_command(verify),
+                            f"recovery pass for task {task_key} verified on the advanced tree",
+                            artifact=current_head, command=verify,
+                            source="Spiral recovery frontier",
+                        ))
+                    self._evidence_dag.finish(
+                        task_key, TaskState.COMPLETE, evidence)
+                    self._evidence_dag.save(dag_path)
+                    processed_count, _ = self._task_counts(plan, records)
+                    self._write_state(
+                        task_records=records, blocked=blocked,
+                        tasks_done=processed_count, last_green_head=current_head,
+                    )
+                    dash.print("  [green]■ recovered and verified[/]")
+                else:
+                    dash.task(mi, ti, "blocked")
+                    current_head = self._revision()
+                    records[task_key] = {
+                        **dict(records.get(task_key) or {}),
+                        "status": "blocked",
+                        "fingerprint": self._task_fingerprint(task),
+                        # Advancing the recorded head is what makes this a finite
+                        # retry.  A resume on the same tree must not replay the
+                        # same failed recovery; another pass becomes eligible only
+                        # after some later verified work changes the revision.
+                        "head": current_head,
+                        "gate": self.gate_disp,
+                        "recovery_attempted_at": time.strftime(
+                            "%Y-%m-%d %H:%M:%S"),
+                    }
+                    self._write_state(
+                        task_records=records, blocked=blocked,
+                        active_task=None,
+                    )
+                    dash.print(
+                        "  [yellow]○ still blocked on the advanced tree — retained for resume[/]"
+                    )
 
             # ---- report ---------------------------------------------------------
             mins = (time.time() - t0) / 60

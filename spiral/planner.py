@@ -1398,4 +1398,13 @@ def repair_plan(
         "Return the full corrected plan as JSON."
     )
     res = _plan_chat(REPAIR_SYSTEM, user, cfg, ol, temperature=0.2, progress=progress)
-    return parse_plan(_extract_json(res.text)), res
+    # Unlike an initial plan, a repair promises the FULL corrected graph.  Accepting a
+    # token-capped salvage here can replace seventeen concrete tasks with the first nine
+    # objects that happened to fit, which is strictly worse than keeping the reviewed
+    # draft.  The conductor catches this explicit refusal and retains the original plan.
+    if str(getattr(res, "done_reason", "") or "").lower() == "length":
+        raise ValueError("plan repair was truncated before the full corrected plan was emitted")
+    repaired = parse_plan(_extract_json(res.text))
+    if plan.understanding.strip() and not repaired.understanding.strip():
+        raise ValueError("plan repair omitted the required understanding summary")
+    return repaired, res

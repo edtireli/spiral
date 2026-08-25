@@ -142,6 +142,119 @@ def test_gate_verdicts_are_memoized_on_tree_content(tmp_path):
     assert atom._gate_memo is not marker, "a changed tree must re-run the gate"
 
 
+def test_planner_python_verify_uses_bundled_interpreter_path(tmp_path):
+    """A planner's bare ``python`` must work when macOS has only ``python3``.
+
+    Component gates are normalized by the conductor, but TaskSpec.verify_cmd is
+    executed directly by Atom.  Assert on the broker receipt so this remains a
+    real sandboxed command test even on CI images that happen to install a
+    ``python`` alias globally.
+    """
+    import json
+
+    from spiral.config import Config
+
+    atom = Atom(tmp_path, Config())
+
+    class Quiet:
+        def print(self, *a, **k): pass
+        def __getattr__(self, _): return lambda *a, **k: None
+
+    result = atom._run_gate("python -c 'print(\"task-gate-ok\")'", Quiet())
+    assert result.code == 0
+    assert "task-gate-ok" in result.out
+    actions = [
+        json.loads(line)
+        for line in (tmp_path / ".spiral" / "actions.jsonl").read_text().splitlines()
+    ]
+    command = actions[-1]["command"]
+    assert command.startswith("export PATH=")
+    assert command.endswith("python -c 'print(\"task-gate-ok\")'")
+
+
+def test_missing_top_level_gate_tool_stops_before_model_dispatch(tmp_path):
+    """A deterministic host fault must not spend a model attempt asking for code edits."""
+    import subprocess
+    import types
+
+    import pytest
+
+    from spiral.config import Config
+    from spiral.harness_check import HarnessFault
+
+    subprocess.run("git init -q .", shell=True, cwd=tmp_path, check=True)
+    atom = Atom(tmp_path, Config())
+    calls = {"n": 0}
+
+    def chat(*args, **kwargs):
+        calls["n"] += 1
+        return types.SimpleNamespace(
+            text="", completion_tokens=0, prompt_tokens=0, total_tokens=0,
+            total_duration=0, eval_count=0, load_duration=0, eval_duration=0,
+        )
+
+    atom.ol = types.SimpleNamespace(
+        chat=chat, health=lambda: "stub", evict=lambda *a, **k: None)
+
+    class Quiet:
+        def print(self, *a, **k): pass
+        def __getattr__(self, _): return lambda *a, **k: None
+
+    with pytest.raises(HarnessFault):
+        atom.run(
+            TaskSpec("build a feature", "definitely-not-a-real-binary-xyz --run"),
+            ui=Quiet(), attempts=3,
+        )
+    assert calls["n"] == 0
+
+
+def test_green_partial_task_is_banked_for_escalation_instead_of_erased(tmp_path):
+    """Missing one promised artifact is incomplete, but verified work must survive."""
+    import subprocess
+    import types
+
+    from spiral.config import Config
+
+    subprocess.run("git init -q .", shell=True, cwd=tmp_path, check=True)
+    subprocess.run(
+        "git -c user.name=t -c user.email=t@t commit -qm seed --allow-empty",
+        shell=True, cwd=tmp_path, check=True,
+    )
+    atom = Atom(tmp_path, Config())
+    reply = "\n".join([
+        "a.py",
+        "<" * 7 + " SEARCH",
+        "=" * 7,
+        "VALUE = 1",
+        ">" * 7 + " REPLACE",
+        "",
+    ])
+    atom.ol = types.SimpleNamespace(
+        chat=lambda *a, **k: types.SimpleNamespace(
+            text=reply, completion_tokens=20, prompt_tokens=40, total_tokens=60,
+            total_duration=0, eval_count=20, load_duration=0, eval_duration=0,
+        ),
+        health=lambda: "stub", evict=lambda *a, **k: None,
+    )
+
+    class Quiet:
+        def print(self, *a, **k): pass
+        def __getattr__(self, _): return lambda *a, **k: None
+
+    ok = atom.run(
+        TaskSpec("create both artifacts", "true", files=["a.py", "b.py"]),
+        ui=Quiet(), attempts=1, diversity=False,
+    )
+
+    assert ok is False, "missing b.py must keep the task incomplete"
+    assert (tmp_path / "a.py").read_text() == "VALUE = 1\n"
+    log = subprocess.run(
+        "git log -1 --pretty=%s", shell=True, cwd=tmp_path,
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert "partial green checkpoint" in log
+
+
 def test_a_changed_command_also_busts_the_memo(tmp_path):
     import subprocess
 
