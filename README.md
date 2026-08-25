@@ -474,8 +474,6 @@ and can be edited directly:
   "academic_writer": {
     "enabled": false,
     "manifest_path": "/absolute/path/academic-adapter.manifest.json",
-    "corpus_manifest_path": "/absolute/path/academic_corpus.jsonl.manifest.json",
-    "dataset_manifest_path": "/absolute/path/dataset_manifest.json",
     "base_url": "http://127.0.0.1:8080/v1",
     "transport_adapter": "openai-compatible",
     "adapter_strength": 1.0
@@ -509,17 +507,21 @@ and can be edited directly:
   exact `spiral.academic-mlx-dataset.v1` prepared-dataset manifest and
   `spiral.academic-corpus-manifest.v1` source manifest (the explicit `arxiv:hep-th`,
   `arxiv:hep-ph`, and `pubmed` strata), and an explicit serving endpoint. Spiral
-  verifies the author-safe, pre-2022 source corpus and MLX adapter bundle and records
+  resolves the corpus and dataset manifests only through their authenticated paths
+  relative to `academic-adapter.manifest.json`; absolute source paths embedded in the
+  dataset receipt remain training provenance and need not stay mounted. Spiral verifies
+  the staged author-safe, pre-2022 provenance manifests and MLX adapter bundle and records
   provider, endpoint, runtime model, profile, base inventory, adapter, dataset, and
   corpus digests. This route is pinned to `mlx-community/Qwen3.8-27B-4bit` revision
   `3e6447f082e89cc7f0bc6e5441afd38dfce760ff` and its exact affine q4/group-64
   three-shard inventory; Qwen3.8 intentionally reports the underlying `qwen3_5`
-  architecture name. It writes section drafts, semantic full-body revisions, citation/
-  claim-scope prose repairs, and the final abstract. Planning/outlines, structured JSON
-  audits and referee decisions, deterministic layout-only repairs, LaTeX compile-only
-  repairs, vision/uploads, tools, and Builder are not silently captured by the prose
-  route. The companion authenticated MLX-VLM lane can nevertheless run this same
-  adapter on the complete checkpoint for image/upload and tool turns. Explicit
+  architecture name. The same selected adapter shapes the paper-only writing blueprint,
+  section outline and relative word budget, then writes section drafts, semantic full-body
+  revisions, citation/claim-scope prose repairs, and the final abstract. Ordinary research
+  planning, chat, structured JSON audits and referee decisions, deterministic layout-only
+  repairs, LaTeX compile-only repairs, vision/uploads, tools, and Builder are not captured
+  by this publication route. The companion authenticated MLX-VLM lane can nevertheless
+  run this same adapter on the complete checkpoint for image/upload and tool turns. Explicit
   `--uncensored` runs bypass the academic route so the abliterated generating seats remain
   authoritative. `adapter_strength` (or `SPIRAL_ACADEMIC_WRITER_STRENGTH`) is a true
   per-request LoRA contribution multiplier from 0.0 through 2.0 in 0.05 steps: 0.0 removes

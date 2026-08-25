@@ -12,7 +12,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from scripts.academic_finetune import CORPUS_SCHEMA, MANIFEST_SCHEMA
 from scripts.academic_finetune.sources import (
@@ -623,6 +623,9 @@ def compile_corpus(
     minimum_documents_per_split_stratum: int = MINIMUM_HELDOUT_COMPONENTS_PER_STRATUM,
     minimum_examples_per_split_stratum: int = MINIMUM_HELDOUT_COMPONENTS_PER_STRATUM,
     minimum_components_per_split_stratum: int = MINIMUM_HELDOUT_COMPONENTS_PER_STRATUM,
+    candidate_filter: Callable[
+        [Sequence[dict[str, Any]]], Sequence[dict[str, Any]]
+    ] | None = None,
 ) -> dict[str, Any]:
     """Compile cached sources atomically; output is byte-stable for equal inputs."""
 
@@ -663,6 +666,46 @@ def compile_corpus(
         for document in selected_documents
         for example in _base_examples(document, cutoff)
     )
+    # Token-bound or policy gates belong here: every complete candidate is
+    # measured before author-component splitting, held-out reduction, and the
+    # final per-stratum example balance.  The callback may only retain or
+    # annotate rows; callers that need derived examples must use a separate,
+    # explicitly attested compilation path.
+    if candidate_filter is not None:
+        originals = {
+            str(example["example_id"]): example for example in examples
+        }
+        original_ids = set(originals)
+        filtered = list(candidate_filter(tuple(examples)))
+        filtered_ids = [str(example.get("example_id", "")) for example in filtered]
+        if len(filtered_ids) != len(set(filtered_ids)):
+            raise ValueError("candidate_filter returned duplicate example identities")
+        unexpected_ids = sorted(set(filtered_ids) - original_ids)
+        if unexpected_ids:
+            raise ValueError(
+                "candidate_filter derived or replaced corpus rows: "
+                + ", ".join(unexpected_ids[:3])
+            )
+        for example in filtered:
+            identity = str(example["example_id"])
+            original = originals[identity]
+            for key, value in original.items():
+                if key == "provenance":
+                    continue
+                if example.get(key) != value:
+                    raise ValueError(
+                        "candidate_filter changed a frozen corpus row: " + identity
+                    )
+            original_provenance = original.get("provenance", {})
+            filtered_provenance = example.get("provenance", {})
+            if not isinstance(filtered_provenance, Mapping) or any(
+                filtered_provenance.get(key) != value
+                for key, value in original_provenance.items()
+            ):
+                raise ValueError(
+                    "candidate_filter changed frozen corpus provenance: " + identity
+                )
+        examples = filtered
     by_stratum: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for example in examples:
         by_stratum[example["source"]["stratum"]].append(example)

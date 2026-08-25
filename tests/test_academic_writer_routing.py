@@ -8,6 +8,7 @@ import io
 import inspect
 import json
 import os
+import shutil
 import textwrap
 from pathlib import Path
 
@@ -275,6 +276,34 @@ def _load_enabled_config(
     return Config.load()
 
 
+def _load_manifest_config(
+    root: Path, manifest: Path, monkeypatch,
+) -> Config:
+    config_dir = root / ".config" / "spiral"
+    config_dir.mkdir(parents=True)
+    (config_dir / "config.json").write_text(json.dumps({
+        "academic_writer": {
+            "enabled": True,
+            "manifest_path": str(manifest),
+            "base_url": "http://127.0.0.1:8080/v1",
+        },
+    }), encoding="utf-8")
+    monkeypatch.setenv("HOME", str(root))
+    return Config.load()
+
+
+def _relocated_route_fixture(tmp_path: Path) -> tuple[Path, Path]:
+    origin = tmp_path / "offline-volume"
+    _write_route_fixture(origin)
+    staged = tmp_path / "staged"
+    shutil.copytree(origin, staged)
+    shutil.rmtree(origin)
+    # Inference does not consume training examples.  Leave only the two staged,
+    # manifest-bound provenance receipts and the adapter bundle.
+    (staged / "academic_corpus.jsonl").unlink()
+    return staged / "academic-adapter.manifest.json", staged
+
+
 def test_academic_writer_is_off_by_default_and_outside_residency_aliasing(
         tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -348,6 +377,49 @@ def test_manifest_pins_exact_mlx_adapter_provider_and_corpus_identity(
         cfg.worker.name, cfg.planner.name, cfg.escalation.name,
         cfg.critic.name, cfg.research_auditor.name, cfg.janitor.name,
     }
+
+
+def test_relocated_staged_provenance_does_not_require_training_volume(
+        tmp_path, monkeypatch):
+    manifest, staged = _relocated_route_fixture(tmp_path)
+
+    cfg = _load_manifest_config(tmp_path / "home", manifest, monkeypatch)
+
+    spec = cfg.academic_writer
+    assert spec.ready, spec.error
+    assert Path(spec.corpus_manifest_path) == (
+        staged / "academic_corpus.jsonl.manifest.json")
+    assert Path(spec.dataset_manifest_path) == staged / "dataset_manifest.json"
+    assert spec.source_corpus_path.startswith(str(tmp_path / "offline-volume"))
+    assert not Path(spec.source_corpus_path).exists()
+
+
+def test_relocated_staged_dataset_tamper_fails_closed(tmp_path, monkeypatch):
+    manifest, staged = _relocated_route_fixture(tmp_path)
+    dataset_path = staged / "dataset_manifest.json"
+    dataset = json.loads(dataset_path.read_text(encoding="utf-8"))
+    dataset["source_corpus_sha256"] = "0" * 64
+    dataset_path.write_text(json.dumps(dataset, sort_keys=True) + "\n", encoding="utf-8")
+
+    cfg = _load_manifest_config(tmp_path / "home", manifest, monkeypatch)
+
+    assert cfg.academic_writer.enabled and not cfg.academic_writer.ready
+    assert "dataset manifest SHA-256" in cfg.academic_writer.error
+
+
+def test_manifest_relative_corpus_filename_must_match_output_identity(
+        tmp_path, monkeypatch):
+    manifest, staged = _relocated_route_fixture(tmp_path)
+    wrong_name = staged / "wrong-corpus.manifest.json"
+    shutil.copyfile(staged / "academic_corpus.jsonl.manifest.json", wrong_name)
+    receipt = json.loads(manifest.read_text(encoding="utf-8"))
+    receipt["training"]["corpus_manifest_path"] = wrong_name.name
+    manifest.write_text(json.dumps(receipt, sort_keys=True), encoding="utf-8")
+
+    cfg = _load_manifest_config(tmp_path / "home", manifest, monkeypatch)
+
+    assert cfg.academic_writer.enabled and not cfg.academic_writer.ready
+    assert "filename" in cfg.academic_writer.error
 
 
 def test_mutated_adapter_bundle_fails_closed_to_existing_writer(tmp_path, monkeypatch):
@@ -466,11 +538,15 @@ class _FakeModels:
     def __init__(
         self, cfg: Config, *, fail_academic: bool = False,
         fail_strict_eviction: bool = False,
+        academic_reply: str = "academic prose",
+        local_reply: str = "existing writer",
     ):
         self.providers = dict(cfg.providers)
         self.base_url = cfg.base_url
         self.fail_academic = fail_academic
         self.fail_strict_eviction = fail_strict_eviction
+        self.academic_reply = academic_reply
+        self.local_reply = local_reply
         self.calls = []
         self.evictions = []
         self.events = []
@@ -488,14 +564,14 @@ class _FakeModels:
         if self.fail_academic and model.startswith("academic-writer::"):
             return ChatResult(text="", raw={"error": "academic endpoint unavailable"})
         return ChatResult(
-            text=("existing writer" if model == "qwen3.8:27b" else "academic prose"),
+            text=(self.local_reply if model == "qwen3.8:27b" else self.academic_reply),
             prompt_tokens=2,
             completion_tokens=3,
             raw={"finish_reason": "stop"},
         )
 
 
-def test_paper_prose_synthesis_uses_academic_route_but_planning_and_repairs_do_not(
+def test_paper_prose_synthesis_uses_academic_route_but_ordinary_planning_and_repairs_do_not(
         tmp_path, monkeypatch):
     cfg = _load_enabled_config(tmp_path, monkeypatch)
     models = _FakeModels(cfg)
@@ -523,6 +599,100 @@ def test_paper_prose_synthesis_uses_academic_route_but_planning_and_repairs_do_n
     assert models.evictions[:2] == [set(), set()]
     assert models.events[:2] == [
         ("evict-owned", (), True), ("chat", cfg.academic_writer.name)]
+
+
+def test_paper_only_blueprint_and_outline_use_same_academic_writer(
+        tmp_path, monkeypatch):
+    cfg = _load_enabled_config(tmp_path, monkeypatch)
+    proposal = {
+        "title": "A bounded paper",
+        "sections": [
+            {
+                "name": "Introduction", "rhetorical_role": "introduction",
+                "intent": "motivate the problem", "target_words": 300,
+            },
+            {
+                "name": "Analysis", "rhetorical_role": "results",
+                "intent": "establish the result", "target_words": 900,
+            },
+        ],
+    }
+    models = _FakeModels(cfg, academic_reply=json.dumps(proposal))
+    loop = ResearchLoop("paper planning route", workdir=tmp_path / "run", cfg=cfg, ol=models)
+
+    planned = loop._synthesize_paper_plan_json(
+        "Plan this paper", "verified evidence",
+        phase="paper-outline", required=("title", "sections"),
+    )
+    ordinary, _ = loop._think("Plan research", "ordinary task", role="planner")
+
+    assert planned == proposal
+    assert ordinary == "existing writer"
+    assert [call[0] for call in models.calls] == [
+        cfg.academic_writer.name, cfg.planner.name]
+    assert models.calls[0][2]["num_predict"] == 8192
+    assert models.evictions == [set(), {cfg.planner.name}]
+
+
+def test_paper_outline_budget_preserves_adapter_emphasis_and_exact_total():
+    proposal = {
+        "sections": [
+            {"name": "Introduction", "target_words": 200},
+            {"name": "Core result", "target_words": 600},
+            {"name": "Discussion", "target_words": 200},
+        ],
+    }
+    outline = {
+        "title": "T",
+        "sections": [
+            {"name": "Introduction", "rhetorical_role": "introduction"},
+            {"name": "Core result", "rhetorical_role": "results"},
+            {"name": "Discussion", "rhetorical_role": "discussion"},
+        ],
+    }
+
+    budgeted = ResearchLoop._apply_paper_outline_budget(
+        outline, proposal, target_words=1800)
+
+    words = [row["target_words"] for row in budgeted["sections"]]
+    assert sum(words) == 1800
+    assert words[1] > words[0] == words[2]
+    assert budgeted["paper_outline_budget"] == {
+        "requested_words": 1800,
+        "proposed_words": 1000,
+        "adapter_supplied_weights": True,
+        "normalization": "deterministic_largest_remainder",
+    }
+
+
+def test_malformed_academic_paper_plan_visibly_retries_ordinary_planner(
+        tmp_path, monkeypatch):
+    cfg = _load_enabled_config(tmp_path, monkeypatch)
+    fallback = {
+        "title": "Conservative fallback",
+        "sections": [{
+            "name": "Results", "rhetorical_role": "results",
+            "intent": "state the bounded result", "target_words": 900,
+        }],
+    }
+    models = _FakeModels(
+        cfg,
+        academic_reply="not a JSON object",
+        local_reply=json.dumps(fallback),
+    )
+    loop = ResearchLoop("paper plan fallback", workdir=tmp_path / "run", cfg=cfg, ol=models)
+
+    planned = loop._synthesize_paper_plan_json(
+        "Plan this paper", "verified evidence",
+        phase="paper-outline", required=("title", "sections"),
+    )
+
+    assert planned == fallback
+    assert [call[0] for call in models.calls] == [
+        cfg.academic_writer.name, cfg.planner.name]
+    thoughts = [json.loads(line) for line in (
+        tmp_path / "run" / "thoughts.jsonl").read_text().splitlines()]
+    assert thoughts[-1]["phase"] == "academic-writer-plan-fallback"
 
 
 def test_explicit_uncensored_mode_marks_process_and_bypasses_academic_prose(
@@ -553,7 +723,7 @@ def test_explicit_uncensored_mode_marks_process_and_bypasses_academic_prose(
     assert models.evictions == [{cfg.worker.name}]
 
 
-def test_publication_pipeline_routes_only_content_prose_and_semantic_revisions():
+def test_publication_pipeline_routes_only_paper_planning_content_and_semantic_revisions():
     tree = ast.parse(textwrap.dedent(inspect.getsource(ResearchLoop.write)))
     calls = [
         node for node in ast.walk(tree)
@@ -583,6 +753,10 @@ def test_publication_pipeline_routes_only_content_prose_and_semantic_revisions()
         "abstract", "abstract-scope-repair:",
     }
     source = textwrap.dedent(inspect.getsource(ResearchLoop.write))
+    assert source.count("self._synthesize_paper_plan_json(") == 2
+    assert 'phase="paper-writing-blueprint"' in source
+    assert 'phase="paper-outline"' in source
+    assert "self._academic_structure_outline(" not in source
     assert "self._think_json(" in source
     assert 'phase="latex-compile' not in source
 
@@ -593,7 +767,7 @@ def test_api_tiers_never_promote_publication_only_route_into_build_roles(
     original_roles = (cfg.worker.name, cfg.planner.name, cfg.escalation.name, cfg.critic.name)
     console = Console(file=io.StringIO(), force_terminal=False)
 
-    with pytest.raises(SystemExit, match="academic writer does not count"):
+    with pytest.raises(SystemExit, match="academic routes do not count"):
         _apply_tier(cfg, console, "api")
     assert (cfg.worker.name, cfg.planner.name, cfg.escalation.name, cfg.critic.name) == original_roles
 

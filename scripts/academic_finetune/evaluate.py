@@ -35,7 +35,14 @@ try:
         verify_ollama_empty,
     )
 except ImportError:  # direct script execution
-    from training_support import (  # type: ignore
+    # Prediction workers execute this file directly so they can use the exact
+    # selected MLX Python without relying on an installed console entry point.
+    # Put the repository root on sys.path before importing the package: the
+    # training helpers also import the shared ``spiral`` prompt contract.
+    project_root = Path(__file__).resolve().parents[2]
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
+    from scripts.academic_finetune.training_support import (  # type: ignore
         HarnessError,
         TrainingComputeLease,
         adapter_bundle_digest,

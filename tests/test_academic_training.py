@@ -261,6 +261,28 @@ def _tiny_safetensors(path: Path, payload: bytes = b"1234") -> None:
     path.write_bytes(struct.pack("<Q", len(header)) + header + payload)
 
 
+def test_evaluation_worker_direct_script_imports_from_outside_repository(tmp_path):
+    script = Path(__file__).resolve().parents[1] / "scripts/academic_finetune/evaluate.py"
+    completed = subprocess.run(
+        [sys.executable, str(script), "_predict-worker", "--help"],
+        cwd=tmp_path, text=True, capture_output=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "--model-view" in completed.stdout
+
+
+def test_academic_server_worker_direct_script_imports_from_outside_repository(tmp_path):
+    script = Path(__file__).resolve().parents[1] / "scripts/academic_finetune/serve_adapter.py"
+    completed = subprocess.run(
+        [sys.executable, str(script), "_worker", "--help"],
+        cwd=tmp_path, text=True, capture_output=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "--manifest" in completed.stdout
+
+
 def test_local_dir_huggingface_metadata_attests_revision_without_snapshot_name(tmp_path):
     metadata = tmp_path / ".cache" / "huggingface" / "download"
     metadata.mkdir(parents=True)

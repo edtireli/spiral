@@ -87,6 +87,75 @@ ACADEMIC_AUTHOR_SAFE_SPLIT_POLICY = (
     "nonempty pilot repair"
 )
 
+# The structure adapter is a distinct, planner-only identity.  It deliberately
+# shares immutable base-weight receipts with the prose adapter while using a
+# separate profile, prompt contract, runtime model, provider alias and config
+# namespace.  No ordinary role is ever aliased to this route.
+ACADEMIC_PLANNER_PROFILE_ID = "academic-hep-pubmed-structure-v1"
+ACADEMIC_PLANNER_PROMPT_CONTRACT = "spiral.academic-paper-blueprint.v1"
+ACADEMIC_PLANNER_RUNTIME_MODEL = "qwen3.8-27b-academic-structure"
+ACADEMIC_STRUCTURE_CORPUS_SCHEMA = "spiral.academic-paper-structure.v1"
+ACADEMIC_STRUCTURE_MANIFEST_SCHEMA = "spiral.academic-structure-corpus-manifest.v1"
+ACADEMIC_PLANNER_SCOPE = "spiral_paper_planner_only"
+ACADEMIC_ADAPTER_LINEAGE_SCHEMA = "spiral.academic-adapter-lineage.v1"
+ACADEMIC_PARENT_ADAPTER_SCHEMA = "spiral.academic-parent-adapter.v1"
+ACADEMIC_STRUCTURE_LORA_KEYS = (
+    "self_attn.q_proj",
+    "self_attn.v_proj",
+    "linear_attn.in_proj_qkv",
+    "linear_attn.out_proj",
+    "mlp.gate_proj",
+    "mlp.up_proj",
+    "mlp.down_proj",
+)
+ACADEMIC_STRUCTURE_TRAINABLE_LAYERS = (60, 61, 62, 63)
+ACADEMIC_STRUCTURE_TARGET_PATH_COUNTS = {
+    "self_attn.q_proj": 1,
+    "self_attn.v_proj": 1,
+    "linear_attn.in_proj_qkv": 3,
+    "linear_attn.out_proj": 3,
+    "mlp.gate_proj": 4,
+    "mlp.up_proj": 4,
+    "mlp.down_proj": 4,
+}
+ACADEMIC_STRUCTURE_TASKS = (
+    "brief_to_blueprint",
+    "budget_structure",
+    "order_structure",
+    "recognize_role",
+    "repair_structure",
+    "restore_section",
+)
+ACADEMIC_STRUCTURE_REPLAY_TASK = "prose_replay"
+ACADEMIC_STRUCTURE_SPLIT_POLICY = (
+    "connected document-author components; deterministic constrained three-way split; "
+    "all structure and replay rows for a document remain together"
+)
+
+
+def general_api_providers(providers) -> dict:
+    """Return providers that are eligible for ordinary orchestration roles.
+
+    The two authenticated academic routes are capability-scoped endpoints, not
+    general API seats.  Keeping this predicate in config gives CLI tier selection
+    and Conductor consultation one fail-closed definition instead of two subtly
+    different filters.
+    """
+
+    if not isinstance(providers, dict):
+        return {}
+    return {
+        name: provider
+        for name, provider in providers.items()
+        if not (
+            isinstance(provider, dict)
+            and (
+                provider.get("academic_writer_only") is True
+                or provider.get("academic_planner_only") is True
+            )
+        )
+    }
+
 
 @dataclass
 class AcademicWriterSpec(ModelSpec):
@@ -182,6 +251,31 @@ class AcademicWriterSpec(ModelSpec):
         }
 
 
+@dataclass
+class AcademicPlannerSpec(AcademicWriterSpec):
+    """Authenticated paper-architecture route, isolated from prose and chat."""
+
+    lineage_sha256: str = ""
+    lora_topology_sha256: str = ""
+    parent_adapter_identity: dict = field(default_factory=dict)
+
+    def identity(self) -> dict:
+        receipt = super().identity()
+        receipt.update({
+            "scope": ACADEMIC_PLANNER_SCOPE,
+            "spiralchat_eligible": False,
+            "lineage_sha256": self.lineage_sha256,
+            "lora_topology_sha256": self.lora_topology_sha256,
+            "parent_adapter_identity": dict(self.parent_adapter_identity),
+            "allowed_scope": ["paper section outline", "section word budget"],
+            "excluded_scope": [
+                "general chat", "paper prose", "tools", "builder",
+                "research planning", "judging and audits",
+            ],
+        })
+        return receipt
+
+
 def _academic_writer_config(cfg, overlay: dict, config_file) -> None:
     """Resolve and authenticate the optional academic route without model I/O."""
 
@@ -270,6 +364,9 @@ def _academic_writer_config(cfg, overlay: dict, config_file) -> None:
         return
     if manifest_path is None or not manifest_path.is_file():
         spec.error = "enabled academic writer requires a readable manifest_path"
+        return
+    if manifest_path.name != "academic-adapter.manifest.json":
+        spec.error = "academic writer manifest filename must be academic-adapter.manifest.json"
         return
 
     try:
@@ -495,12 +592,24 @@ def _academic_writer_config(cfg, overlay: dict, config_file) -> None:
         spec.error = "academic writer adapter SHA-256 does not match the manifest"
         return
 
-    corpus_value = env_or(
+    pinned_corpus_value = str(training.get("corpus_manifest_path") or "").strip()
+    if not pinned_corpus_value or Path(pinned_corpus_value).is_absolute():
+        spec.error = "academic writer corpus manifest must be manifest-relative"
+        return
+    corpus_path = resolved_path(
+        pinned_corpus_value, relative_to=manifest_path.parent)
+    configured_corpus_value = env_or(
         "SPIRAL_ACADEMIC_WRITER_CORPUS_MANIFEST", "corpus_manifest_path",
-        raw.get("corpus_manifest", training.get("corpus_manifest_path", "")))
-    corpus_path = resolved_path(corpus_value, relative_to=manifest_path.parent)
+        raw.get("corpus_manifest", ""))
+    if str(configured_corpus_value or "").strip():
+        configured_corpus_path = resolved_path(
+            configured_corpus_value, relative_to=manifest_path.parent)
+        if configured_corpus_path != corpus_path:
+            spec.error = (
+                "academic writer corpus_manifest_path is manifest-pinned and cannot be overridden")
+            return
     spec.corpus_manifest_path = str(corpus_path) if corpus_path else ""
-    if corpus_path is None or not corpus_path.is_file():
+    if corpus_path is None or corpus_path.is_symlink() or not corpus_path.is_file():
         spec.error = "academic writer requires its exact corpus_manifest_path"
         return
     try:
@@ -529,6 +638,14 @@ def _academic_writer_config(cfg, overlay: dict, config_file) -> None:
         return
     if corpus_manifest.get("corpus_schema_version") != ACADEMIC_PROMPT_CONTRACT:
         spec.error = "academic corpus examples do not match the plan-prose prompt contract"
+        return
+    corpus_output_filename = str(corpus_manifest.get("output_filename") or "").strip()
+    if (
+        not corpus_output_filename
+        or Path(corpus_output_filename).name != corpus_output_filename
+        or corpus_path.name != f"{corpus_output_filename}.manifest.json"
+    ):
+        spec.error = "academic corpus manifest filename does not match its output_filename"
         return
     if corpus_manifest.get("trainable") is not True:
         spec.error = "academic corpus manifest is not marked trainable"
@@ -601,12 +718,28 @@ def _academic_writer_config(cfg, overlay: dict, config_file) -> None:
         spec.error = "academic corpus task feasibility exceeds plan-prose v1"
         return
 
-    dataset_value = env_or(
+    pinned_dataset_value = str(dataset.get("dataset_manifest_path") or "").strip()
+    if (
+        not pinned_dataset_value
+        or Path(pinned_dataset_value).is_absolute()
+        or Path(pinned_dataset_value).name != "dataset_manifest.json"
+    ):
+        spec.error = "academic writer dataset manifest must be manifest-relative dataset_manifest.json"
+        return
+    dataset_path = resolved_path(
+        pinned_dataset_value, relative_to=manifest_path.parent)
+    configured_dataset_value = env_or(
         "SPIRAL_ACADEMIC_WRITER_DATASET_MANIFEST", "dataset_manifest_path",
-        raw.get("dataset_manifest", dataset.get("dataset_manifest_path", "")))
-    dataset_path = resolved_path(dataset_value, relative_to=manifest_path.parent)
+        raw.get("dataset_manifest", ""))
+    if str(configured_dataset_value or "").strip():
+        configured_dataset_path = resolved_path(
+            configured_dataset_value, relative_to=manifest_path.parent)
+        if configured_dataset_path != dataset_path:
+            spec.error = (
+                "academic writer dataset_manifest_path is manifest-pinned and cannot be overridden")
+            return
     spec.dataset_manifest_path = str(dataset_path) if dataset_path else ""
-    if dataset_path is None or not dataset_path.is_file():
+    if dataset_path is None or dataset_path.is_symlink() or not dataset_path.is_file():
         spec.error = "academic writer requires its exact dataset_manifest_path"
         return
     try:
@@ -655,23 +788,22 @@ def _academic_writer_config(cfg, overlay: dict, config_file) -> None:
             spec.corpus_manifest_sha256):
         spec.error = "academic dataset corpus-manifest identity does not match training"
         return
-    dataset_corpus_manifest = resolved_path(
-        dataset_manifest.get("source_corpus_manifest"), relative_to=dataset_path.parent)
-    if dataset_corpus_manifest != corpus_path:
-        spec.error = "academic dataset points at a different corpus manifest"
+    # These two paths record where training originally happened.  Deployment
+    # authenticates the staged, manifest-relative corpus/dataset manifests above;
+    # it must not dereference a removable-volume provenance path during serving.
+    source_manifest_provenance = str(
+        dataset_manifest.get("source_corpus_manifest") or "").strip()
+    source_corpus_provenance = str(
+        dataset_manifest.get("source_corpus") or "").strip()
+    if (
+        not source_manifest_provenance
+        or Path(source_manifest_provenance).name != corpus_path.name
+        or not source_corpus_provenance
+        or Path(source_corpus_provenance).name != corpus_output_filename
+    ):
+        spec.error = "academic dataset provenance filenames do not match staged identities"
         return
-    source_path = resolved_path(
-        dataset_manifest.get("source_corpus"), relative_to=dataset_path.parent)
-    spec.source_corpus_path = str(source_path) if source_path else ""
-    if source_path is None or not source_path.is_file():
-        spec.error = "academic source corpus is missing"
-        return
-    if file_sha256(source_path) != spec.source_corpus_file_sha256:
-        spec.error = "academic source corpus changed after its adapter was trained"
-        return
-    if str(corpus_manifest.get("output_filename") or "") != source_path.name:
-        spec.error = "academic corpus manifest does not identify the trained source corpus"
-        return
+    spec.source_corpus_path = source_corpus_provenance
     prepared_splits = dataset_manifest.get("splits")
     expected_prepared_splits = ("train", "valid", "test")
     if not isinstance(prepared_splits, dict) or set(prepared_splits) != set(
@@ -782,6 +914,708 @@ def _academic_writer_config(cfg, overlay: dict, config_file) -> None:
     spec.ready = True
 
 
+def _academic_planner_config(cfg, overlay: dict, config_file) -> None:
+    """Authenticate the optional paper-architecture route without model I/O.
+
+    This deliberately does not reuse the prose route alias or environment
+    namespace.  A complete cryptographic chain from adapter bundle through
+    structure corpus is required before the alias becomes visible.
+    """
+
+    import hashlib
+    import json
+    import math
+    import os
+    import re
+    import struct
+    from datetime import date
+    from pathlib import Path
+
+    spec = cfg.academic_planner
+    expected_route = f"academic-planner::{ACADEMIC_PLANNER_PROFILE_ID}"
+    spec.name = expected_route
+
+    # Reserve every planner-only alias before examining `enabled` or any
+    # manifest bytes.  A stale/manual provider entry must never survive a
+    # disabled or malformed planner configuration and become a general API
+    # provider.  Ordinary roles that were pointed at such an entry are restored
+    # to the known local model rather than treating the private alias as Ollama.
+    providers = dict(cfg.providers) if isinstance(cfg.providers, dict) else {}
+    restricted_names = {
+        name
+        for name, provider in providers.items()
+        if name == expected_route
+        or (
+            isinstance(provider, dict)
+            and provider.get("academic_planner_only") is True
+        )
+    }
+    for name in restricted_names:
+        providers.pop(name, None)
+    cfg.providers = providers
+    general_specs = (
+        cfg.worker, cfg.planner, cfg.escalation, cfg.critic,
+        cfg.research_auditor, cfg.janitor, cfg.academic_writer,
+    )
+    collided_roles = []
+    for role_spec in general_specs:
+        if role_spec.name in restricted_names or role_spec.name == expected_route:
+            collided_roles.append(role_spec.name)
+            role_spec.name = "qwen3.8:27b"
+
+    raw = overlay.get("academic_planner") or {}
+    if not isinstance(raw, dict):
+        spec.error = "academic_planner must be an object"
+        return
+
+    def env_or(name: str, key: str, default=""):
+        return os.environ.get(name, raw.get(key, default))
+
+    def truthy(value) -> bool:
+        if isinstance(value, bool):
+            return value
+        return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+    def resolved_path(value, *, relative_to: Path) -> Path | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        path = Path(text).expanduser()
+        return (relative_to / path).resolve() if not path.is_absolute() else path.resolve()
+
+    def file_sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    def read_object(path: Path, label: str) -> tuple[dict, bytes] | None:
+        try:
+            payload = path.read_bytes()
+            value = json.loads(payload)
+        except (OSError, TypeError, ValueError) as exc:
+            spec.error = f"invalid {label}: {type(exc).__name__}"
+            return None
+        if not isinstance(value, dict):
+            spec.error = f"{label} must be an object"
+            return None
+        return value, payload
+
+    def positive_int(value) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+    def adapter_bundle(path: Path, rows) -> tuple[str, tuple[dict, ...]]:
+        if not isinstance(rows, list):
+            raise TypeError("adapter.required_files must be a list")
+        if [str(row.get("path") or "") for row in rows if isinstance(row, dict)] != [
+            "adapter_config.json", "adapters.safetensors",
+        ]:
+            raise ValueError(
+                "adapter.required_files must be adapter_config.json then adapters.safetensors")
+        root = path.resolve()
+        verified = []
+        lines = []
+        for row in rows:
+            if not isinstance(row, dict):
+                raise TypeError("adapter.required_files entries must be objects")
+            relative = str(row.get("path") or "")
+            candidate = root / relative
+            if candidate.is_symlink() or not candidate.is_file():
+                raise ValueError(f"missing immutable adapter file: {relative}")
+            resolved = candidate.resolve()
+            if resolved.parent != root:
+                raise ValueError(f"adapter file escapes bundle: {relative}")
+            size = resolved.stat().st_size
+            digest = file_sha256(resolved)
+            if size != int(row.get("size_bytes", -1)) or digest != str(
+                    row.get("sha256") or "").lower():
+                raise ValueError(f"adapter file identity mismatch: {relative}")
+            verified.append({"path": relative, "size_bytes": size, "sha256": digest})
+            lines.append(f"{relative}\0{size}\0{digest}\n")
+        return (
+            hashlib.sha256("".join(sorted(lines)).encode("utf-8")).hexdigest(),
+            tuple(verified),
+        )
+
+    def canonical_sha256(value) -> str:
+        payload = (
+            json.dumps(
+                value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    def expected_tensor_names() -> set[str]:
+        targets_by_layer = {
+            **{
+                str(layer): (
+                    "linear_attn.in_proj_qkv", "linear_attn.out_proj",
+                    "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj",
+                )
+                for layer in (60, 61, 62)
+            },
+            "63": (
+                "self_attn.q_proj", "self_attn.v_proj",
+                "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj",
+            ),
+        }
+        names = set()
+        for layer, targets in targets_by_layer.items():
+            for target in targets:
+                prefix = f"language_model.model.layers.{layer}.{target}"
+                names.update((f"{prefix}.lora_a", f"{prefix}.lora_b"))
+        return names
+
+    def safetensors_header(path: Path) -> dict:
+        try:
+            size = path.stat().st_size
+            with path.open("rb") as handle:
+                raw_length = handle.read(8)
+                if len(raw_length) != 8:
+                    raise ValueError("truncated safetensors header")
+                header_length = struct.unpack("<Q", raw_length)[0]
+                if header_length <= 1 or header_length > min(
+                        size - 8, 128 * 1024 * 1024):
+                    raise ValueError("invalid safetensors header length")
+                header = json.loads(handle.read(header_length))
+        except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError,
+                struct.error) as exc:
+            raise ValueError(f"invalid adapters.safetensors: {exc}") from exc
+        if not isinstance(header, dict):
+            raise TypeError("safetensors header must be an object")
+        maximum_end = 0
+        for name, tensor in header.items():
+            if name == "__metadata__":
+                continue
+            if not isinstance(tensor, dict):
+                raise TypeError(f"invalid tensor entry {name!r}")
+            offsets = tensor.get("data_offsets")
+            if (not isinstance(offsets, list) or len(offsets) != 2
+                    or any(not isinstance(value, int) or isinstance(value, bool)
+                           for value in offsets)):
+                raise ValueError(f"invalid tensor offsets for {name!r}")
+            start, end = offsets
+            if start < 0 or end < start:
+                raise ValueError(f"invalid tensor range for {name!r}")
+            maximum_end = max(maximum_end, end)
+        if 8 + header_length + maximum_end != size:
+            raise ValueError("safetensors payload length does not match its header")
+        return header
+
+    def validate_lora_topology(adapter_path: Path, training: dict) -> str:
+        config_path = adapter_path / "adapter_config.json"
+        try:
+            adapter_config = json.loads(config_path.read_bytes())
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"invalid adapter_config.json: {exc}") from exc
+        if not isinstance(adapter_config, dict):
+            raise TypeError("adapter_config.json must be an object")
+        lora = adapter_config.get("lora_parameters")
+        if (adapter_config.get("fine_tune_type") != "lora"
+                or adapter_config.get("num_layers") != 4
+                or not isinstance(lora, dict)):
+            raise ValueError("adapter_config.json is not the exact four-layer LoRA topology")
+        try:
+            scale = float(lora.get("scale"))
+            dropout = float(lora.get("dropout"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("LoRA scale/dropout must be finite numbers") from exc
+        if (lora.get("keys") != list(ACADEMIC_STRUCTURE_LORA_KEYS)
+                or lora.get("rank") != 16
+                or not math.isfinite(scale) or scale != 32.0
+                or not math.isfinite(dropout) or dropout != 0.0):
+            raise ValueError(
+                "adapter_config.json LoRA keys/rank/scale/dropout changed")
+        expected_training = {
+            "trainable_layers": list(ACADEMIC_STRUCTURE_TRAINABLE_LAYERS),
+            "trainable_target_paths": list(ACADEMIC_STRUCTURE_LORA_KEYS),
+            "target_path_counts": dict(ACADEMIC_STRUCTURE_TARGET_PATH_COUNTS),
+            "total_target_modules": 20,
+        }
+        for key, expected in expected_training.items():
+            if training.get(key) != expected:
+                raise ValueError(f"training.{key} does not match the LoRA topology")
+
+        header = safetensors_header(adapter_path / "adapters.safetensors")
+        observed = {name for name in header if name != "__metadata__"}
+        expected_names = expected_tensor_names()
+        if observed != expected_names:
+            missing = sorted(expected_names - observed)
+            extra = sorted(observed - expected_names)
+            detail = []
+            if missing:
+                detail.append("missing " + ", ".join(missing[:3]))
+            if extra:
+                detail.append("unexpected " + ", ".join(extra[:3]))
+            raise ValueError(
+                "adapter tensor inventory changed"
+                + (": " + "; ".join(detail) if detail else ""))
+        for name in sorted(observed):
+            tensor = header[name]
+            shape = tensor.get("shape") if isinstance(tensor, dict) else None
+            dtype = tensor.get("dtype") if isinstance(tensor, dict) else None
+            if (not isinstance(shape, list) or len(shape) != 2
+                    or any(not isinstance(value, int) or isinstance(value, bool)
+                           or value <= 0 for value in shape)):
+                raise ValueError(f"adapter tensor {name!r} has an invalid shape")
+            if ((name.endswith(".lora_a") and shape[-1] != 16)
+                    or (name.endswith(".lora_b") and shape[0] != 16)):
+                raise ValueError(f"adapter tensor {name!r} has the wrong LoRA rank")
+            if dtype != "F32":
+                raise ValueError(f"adapter tensor {name!r} is not F32")
+        topology = {
+            "num_layers": 4,
+            "keys": list(ACADEMIC_STRUCTURE_LORA_KEYS),
+            "rank": 16,
+            "scale": 32.0,
+            "dropout": 0.0,
+            "tensor_names": sorted(expected_names),
+        }
+        return canonical_sha256(topology)
+
+    def validate_lineage(manifest: dict, topology_sha256: str) -> tuple[str, dict]:
+        lineage = manifest.get("lineage")
+        if not isinstance(lineage, dict):
+            raise TypeError("structure adapter manifest requires authenticated lineage")
+        if set(lineage) != {"schema_version", "generation", "parent"}:
+            raise ValueError("structure adapter lineage has unexpected fields")
+        if lineage.get("schema_version") != ACADEMIC_ADAPTER_LINEAGE_SCHEMA:
+            raise ValueError("structure adapter lineage schema is incompatible")
+        generation = lineage.get("generation")
+        if generation != 1:
+            raise ValueError("structure adapter must directly descend from generation one")
+        parent = lineage.get("parent")
+        if not isinstance(parent, dict):
+            raise TypeError("structure adapter lineage has no parent identity")
+        required = {
+            "schema_version", "generation", "manifest_sha256", "profile_id",
+            "prompt_contract", "base_weight_inventory_sha256",
+            "adapter_tree_sha256", "adapter_config_sha256",
+            "adapter_weights_sha256", "lora_topology_sha256",
+        }
+        if set(parent) != required:
+            raise ValueError("structure adapter parent identity has unexpected fields")
+        if (parent.get("schema_version") != ACADEMIC_PARENT_ADAPTER_SCHEMA
+                or parent.get("generation") != generation
+                or parent.get("profile_id") != ACADEMIC_PROFILE_ID
+                or parent.get("prompt_contract") != ACADEMIC_PROMPT_CONTRACT
+                or parent.get("base_weight_inventory_sha256")
+                != ACADEMIC_BASE_WEIGHT_INVENTORY_SHA256):
+            raise ValueError("structure adapter parent ancestry is incompatible")
+        digest_re = re.compile(r"^[0-9a-f]{64}$")
+        for digest_field in (
+            "manifest_sha256", "base_weight_inventory_sha256",
+            "adapter_tree_sha256", "adapter_config_sha256",
+            "adapter_weights_sha256", "lora_topology_sha256",
+        ):
+            if not digest_re.fullmatch(str(parent.get(digest_field) or "")):
+                raise ValueError(
+                    f"structure adapter parent has invalid {digest_field}")
+        if parent.get("lora_topology_sha256") != topology_sha256:
+            raise ValueError("structure adapter changed its parent LoRA topology")
+        return canonical_sha256(lineage), dict(parent)
+
+    spec.enabled = truthy(env_or(
+        "SPIRAL_ACADEMIC_PLANNER_ENABLED", "enabled", False))
+    if collided_roles:
+        spec.error = (
+            "reserved academic planner aliases were removed from ordinary roles/providers")
+    config_dir = Path(config_file).parent if config_file else Path.cwd()
+    manifest_path = resolved_path(
+        env_or(
+            "SPIRAL_ACADEMIC_PLANNER_MANIFEST", "manifest_path",
+            raw.get("manifest", ""),
+        ),
+        relative_to=config_dir,
+    )
+    spec.manifest_path = str(manifest_path) if manifest_path else ""
+    if collided_roles:
+        return
+    if not spec.enabled:
+        return
+    if manifest_path is None or not manifest_path.is_file():
+        spec.error = "enabled academic planner requires a readable manifest_path"
+        return
+    loaded = read_object(manifest_path, "academic planner manifest")
+    if loaded is None:
+        return
+    manifest, manifest_bytes = loaded
+    if manifest.get("schema_version") != ACADEMIC_ADAPTER_SCHEMA:
+        spec.error = f"academic planner manifest schema must be {ACADEMIC_ADAPTER_SCHEMA}"
+        return
+    if manifest.get("profile_id") != ACADEMIC_PLANNER_PROFILE_ID:
+        spec.error = f"academic planner profile must be {ACADEMIC_PLANNER_PROFILE_ID}"
+        return
+    if manifest.get("prompt_contract") != ACADEMIC_PLANNER_PROMPT_CONTRACT:
+        spec.error = (
+            "academic planner prompt contract must be "
+            f"{ACADEMIC_PLANNER_PROMPT_CONTRACT}")
+        return
+    spec.manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+    spec.profile_id = ACADEMIC_PLANNER_PROFILE_ID
+    spec.prompt_contract = ACADEMIC_PLANNER_PROMPT_CONTRACT
+
+    runtime = manifest.get("runtime")
+    base = manifest.get("base_model")
+    adapter = manifest.get("adapter")
+    training = manifest.get("training")
+    dataset_receipt = manifest.get("dataset")
+    if not all(isinstance(value, dict) for value in (
+            runtime, base, adapter, training, dataset_receipt)):
+        spec.error = "academic planner manifest identity sections must be objects"
+        return
+    immutable_runtime = {
+        "model": ACADEMIC_PLANNER_RUNTIME_MODEL,
+        "provider": ACADEMIC_PROVIDER,
+        "transport_adapter": ACADEMIC_TRANSPORT_ADAPTER,
+        "scope": ACADEMIC_PLANNER_SCOPE,
+        "spiralchat_eligible": False,
+        "default_adapter_strength": ACADEMIC_ADAPTER_STRENGTH,
+    }
+    for key, expected in immutable_runtime.items():
+        if runtime.get(key) != expected:
+            spec.error = f"academic planner runtime.{key} must be immutable {expected!r}"
+            return
+    immutable_overrides = {
+        "profile_id": (
+            "SPIRAL_ACADEMIC_PLANNER_PROFILE", manifest.get("profile_id")),
+        "model": ("SPIRAL_ACADEMIC_PLANNER_MODEL", runtime.get("model")),
+        "provider": ("SPIRAL_ACADEMIC_PLANNER_PROVIDER", runtime.get("provider")),
+        "transport_adapter": (
+            "SPIRAL_ACADEMIC_PLANNER_TRANSPORT", runtime.get("transport_adapter")),
+    }
+    for key, (env_name, pinned) in immutable_overrides.items():
+        requested = str(env_or(env_name, key, pinned) or "").strip()
+        if requested != str(pinned or "").strip():
+            spec.error = f"academic planner {key} is manifest-pinned and cannot be overridden"
+            return
+    spec.runtime_model = str(runtime["model"])
+    spec.provider = str(runtime["provider"])
+    spec.transport_adapter = str(runtime["transport_adapter"])
+    manifest_base_url = str(runtime.get("base_url") or "").strip()
+    spec.base_url = str(env_or(
+        "SPIRAL_ACADEMIC_PLANNER_BASE_URL", "base_url", manifest_base_url) or "").strip()
+    if not spec.base_url:
+        spec.error = "academic planner requires an explicit serving endpoint"
+        return
+    spec.api_key_env = str(env_or(
+        "SPIRAL_ACADEMIC_PLANNER_API_KEY_ENV", "api_key_env",
+        runtime.get("api_key_env", "")) or "").strip()
+    spec.api_key_required = truthy(raw.get(
+        "api_key_required", runtime.get("api_key_required", bool(spec.api_key_env))))
+    spec.adapter_strength = ACADEMIC_ADAPTER_STRENGTH
+    spec.num_ctx = int(raw.get("num_ctx", runtime.get("num_ctx", 8192)))
+    spec.think = False
+
+    expected_base = {
+        "model_id": ACADEMIC_BASE_MODEL_ID,
+        "revision": ACADEMIC_BASE_MODEL_REVISION,
+        "model_type": ACADEMIC_BASE_MODEL_TYPE,
+        "architecture": ACADEMIC_BASE_MODEL_ARCHITECTURE,
+        "config_sha256": ACADEMIC_BASE_MODEL_CONFIG_SHA256,
+        "weight_index_sha256": ACADEMIC_BASE_WEIGHT_INDEX_SHA256,
+        "weight_inventory_sha256": ACADEMIC_BASE_WEIGHT_INVENTORY_SHA256,
+        "quantization": {"bits": 4, "group_size": 64, "mode": "affine"},
+        "weight_files": [dict(row) for row in ACADEMIC_BASE_WEIGHT_FILES],
+    }
+    for key, expected in expected_base.items():
+        if base.get(key) != expected:
+            spec.error = f"academic planner base_model.{key} does not match the pinned Qwen3.8 base"
+            return
+    spec.base_model_id = str(base["model_id"])
+    spec.base_model_revision = str(base["revision"])
+    spec.base_model_type = str(base["model_type"])
+    spec.base_model_architecture = str(base["architecture"])
+    spec.base_model_config_sha256 = str(base["config_sha256"])
+    spec.base_weight_index_sha256 = str(base["weight_index_sha256"])
+    spec.base_weight_inventory_sha256 = str(base["weight_inventory_sha256"])
+    spec.base_weight_files = tuple(dict(row) for row in base["weight_files"])
+    spec.base_model_quantization = dict(base["quantization"])
+
+    spec.adapter_format = str(adapter.get("format") or "")
+    spec.adapter_sha256 = str(adapter.get("sha256") or "").lower()
+    if spec.adapter_format != ACADEMIC_ADAPTER_FORMAT:
+        spec.error = f"academic planner adapter format must be {ACADEMIC_ADAPTER_FORMAT}"
+        return
+    if adapter.get("sha256_semantics") != ACADEMIC_ADAPTER_SHA256_SEMANTICS:
+        spec.error = "academic planner adapter has unsupported SHA-256 semantics"
+        return
+    adapter_path = resolved_path(adapter.get("path"), relative_to=manifest_path.parent)
+    spec.adapter_path = str(adapter_path) if adapter_path else ""
+    if adapter_path is None or not adapter_path.is_dir():
+        spec.error = "academic planner adapter path is missing"
+        return
+    try:
+        bundle_digest, required_files = adapter_bundle(
+            adapter_path, adapter.get("required_files"))
+    except (OSError, TypeError, ValueError) as exc:
+        spec.error = f"invalid academic planner adapter bundle: {exc}"
+        return
+    if bundle_digest != spec.adapter_sha256:
+        spec.error = "academic planner adapter SHA-256 does not match the manifest"
+        return
+    spec.adapter_required_files = required_files
+    try:
+        spec.lora_topology_sha256 = validate_lora_topology(adapter_path, training)
+        spec.lineage_sha256, spec.parent_adapter_identity = validate_lineage(
+            manifest, spec.lora_topology_sha256)
+    except (OSError, TypeError, ValueError) as exc:
+        spec.error = f"invalid academic planner lineage/topology: {exc}"
+        return
+
+    corpus_path = resolved_path(env_or(
+        "SPIRAL_ACADEMIC_PLANNER_CORPUS_MANIFEST", "corpus_manifest_path",
+        raw.get("corpus_manifest", training.get("corpus_manifest_path", "")),
+    ), relative_to=manifest_path.parent)
+    spec.corpus_manifest_path = str(corpus_path) if corpus_path else ""
+    if corpus_path is None or not corpus_path.is_file():
+        spec.error = "academic planner requires its exact structure corpus manifest"
+        return
+    loaded = read_object(corpus_path, "academic structure corpus manifest")
+    if loaded is None:
+        return
+    corpus, corpus_bytes = loaded
+    spec.corpus_manifest_sha256 = hashlib.sha256(corpus_bytes).hexdigest()
+    if spec.corpus_manifest_sha256 != str(
+            training.get("corpus_manifest_sha256") or "").lower():
+        spec.error = "academic structure corpus manifest SHA-256 does not match training"
+        return
+    if corpus.get("schema_version") != ACADEMIC_STRUCTURE_MANIFEST_SCHEMA:
+        spec.error = (
+            "academic structure corpus manifest schema must be "
+            f"{ACADEMIC_STRUCTURE_MANIFEST_SCHEMA}")
+        return
+    if (corpus.get("corpus_schema_version") != ACADEMIC_STRUCTURE_CORPUS_SCHEMA
+            or corpus.get("prompt_contract") != ACADEMIC_PLANNER_PROMPT_CONTRACT):
+        spec.error = "academic structure corpus contract does not match the planner"
+        return
+    spec.source_strata = tuple(sorted(str(value) for value in (
+        corpus.get("source_strata") or [])))
+    if spec.source_strata != tuple(sorted(ACADEMIC_SOURCE_STRATA)):
+        spec.error = "academic structure corpus must contain the exact three source strata"
+        return
+    if (corpus.get("trainable") is not True
+            or corpus.get("non_trainable_reasons") not in ([], None)):
+        spec.error = "academic structure corpus is not marked trainable"
+        return
+    try:
+        corpus_cutoff = date.fromisoformat(str(corpus.get("cutoff") or ""))
+    except ValueError:
+        spec.error = "academic structure corpus cutoff must be an ISO date"
+        return
+    if corpus_cutoff > date(2021, 12, 31):
+        spec.error = "academic structure corpus cutoff must not be later than 2021-12-31"
+        return
+    intended = corpus.get("intended_use")
+    if (not isinstance(intended, dict)
+            or intended.get("planner_only") is not True
+            or intended.get("target_modality") != "json_paper_architecture"
+            or intended.get("excluded_component") != "spiralchat_general_conversation"):
+        spec.error = "academic structure corpus is not attested planner-only"
+        return
+    if corpus.get("split_policy") != ACADEMIC_STRUCTURE_SPLIT_POLICY:
+        spec.error = "academic structure corpus lacks the connected author-safe split policy"
+        return
+    counts = corpus.get("counts")
+    diagnostics = corpus.get("split_diagnostics")
+    if not isinstance(counts, dict) or not isinstance(diagnostics, dict):
+        spec.error = "academic structure corpus split diagnostics are missing"
+        return
+    expected_tasks = set(ACADEMIC_STRUCTURE_TASKS) | {ACADEMIC_STRUCTURE_REPLAY_TASK}
+    task_counts = counts.get("by_task_type")
+    if (not isinstance(task_counts, dict) or set(task_counts) != expected_tasks
+            or not all(positive_int(task_counts.get(name)) for name in expected_tasks)):
+        spec.error = "academic structure corpus task inventory is incomplete"
+        return
+    if abs(float(counts.get("prose_replay_ratio", -1)) - 0.2) > 1e-12:
+        spec.error = "academic structure corpus must preserve exactly 20% prose replay"
+        return
+    component_splits = diagnostics.get("component_counts_by_split")
+    if (not positive_int(diagnostics.get("components"))
+            or not isinstance(component_splits, dict)
+            or set(component_splits) != {"train", "validation", "test"}
+            or not all(positive_int(component_splits.get(name))
+                       for name in ("train", "validation", "test"))):
+        spec.error = "academic structure corpus lacks three-way author components"
+        return
+    expected_coverage = {
+        f"{stratum}|{split}"
+        for stratum in ACADEMIC_SOURCE_STRATA
+        for split in ("train", "validation", "test")
+    }
+    for key in ("documents_by_stratum_split", "examples_by_stratum_split"):
+        coverage = counts.get(key)
+        if (not isinstance(coverage, dict) or set(coverage) != expected_coverage
+                or not all(positive_int(coverage.get(item)) for item in expected_coverage)):
+            spec.error = "academic structure corpus lacks per-stratum split coverage"
+            return
+
+    dataset_path = resolved_path(env_or(
+        "SPIRAL_ACADEMIC_PLANNER_DATASET_MANIFEST", "dataset_manifest_path",
+        raw.get("dataset_manifest", dataset_receipt.get("dataset_manifest_path", "")),
+    ), relative_to=manifest_path.parent)
+    spec.dataset_manifest_path = str(dataset_path) if dataset_path else ""
+    if dataset_path is None or not dataset_path.is_file():
+        spec.error = "academic planner requires its exact dataset manifest"
+        return
+    loaded = read_object(dataset_path, "academic structure dataset manifest")
+    if loaded is None:
+        return
+    dataset, dataset_bytes = loaded
+    spec.dataset_manifest_sha256 = hashlib.sha256(dataset_bytes).hexdigest()
+    if spec.dataset_manifest_sha256 != str(
+            dataset_receipt.get("manifest_sha256") or "").lower():
+        spec.error = "academic structure dataset manifest SHA-256 does not match training"
+        return
+    if (dataset.get("schema_version") != ACADEMIC_DATASET_SCHEMA
+            or dataset.get("prompt_contract") != ACADEMIC_PLANNER_PROMPT_CONTRACT
+            or dataset.get("profile_id") != ACADEMIC_PLANNER_PROFILE_ID
+            or dataset.get("corpus_schema_version") != ACADEMIC_STRUCTURE_CORPUS_SCHEMA
+            or dataset.get("source_corpus_manifest_schema")
+            != ACADEMIC_STRUCTURE_MANIFEST_SCHEMA
+            or dataset.get("format") != "mlx_lm.completions"
+            or dataset.get("completion_only_loss") is not True
+            or training.get("completion_only_loss") is not True):
+        spec.error = "academic structure dataset contract is incompatible"
+        return
+    target_contract = dataset.get("target_contract")
+    if (not isinstance(target_contract, dict)
+            or target_contract.get("structure_tasks") != sorted(ACADEMIC_STRUCTURE_TASKS)
+            or target_contract.get("structure_target") != "canonical_json_object"
+            or target_contract.get("prose_replay_task") != ACADEMIC_STRUCTURE_REPLAY_TASK):
+        spec.error = "academic structure dataset target contract is incomplete"
+        return
+    if str(dataset.get("source_corpus_manifest_sha256") or "").lower() != (
+            spec.corpus_manifest_sha256):
+        spec.error = "academic structure dataset corpus-manifest identity changed"
+        return
+    dataset_corpus_manifest = resolved_path(
+        dataset.get("source_corpus_manifest"), relative_to=dataset_path.parent)
+    if dataset_corpus_manifest != corpus_path:
+        spec.error = "academic structure dataset points at a different corpus manifest"
+        return
+    source_path = resolved_path(dataset.get("source_corpus"), relative_to=dataset_path.parent)
+    spec.source_corpus_path = str(source_path) if source_path else ""
+    spec.source_corpus_sha256 = str(dataset_receipt.get("source_corpus_sha256") or "").lower()
+    spec.source_corpus_file_sha256 = str(
+        dataset_receipt.get("source_corpus_file_sha256") or "").lower()
+    if (source_path is None or not source_path.is_file()
+            or spec.source_corpus_sha256
+            != str(dataset.get("source_corpus_sha256") or "").lower()
+            or spec.source_corpus_file_sha256
+            != str(dataset.get("source_corpus_file_sha256") or "").lower()
+            or spec.source_corpus_file_sha256 != str(corpus.get("corpus_sha256") or "").lower()
+            or file_sha256(source_path) != spec.source_corpus_file_sha256
+            or str(corpus.get("output_filename") or "") != source_path.name):
+        spec.error = "academic structure source corpus identity changed"
+        return
+    splits = dataset.get("splits")
+    adapter_split_hashes = dataset_receipt.get("split_sha256")
+    if (not isinstance(splits, dict) or set(splits) != {"train", "valid", "test"}
+            or not isinstance(adapter_split_hashes, dict)):
+        spec.error = "academic structure dataset requires train/valid/test splits"
+        return
+    seen_tasks = set()
+    for split_name in ("train", "valid", "test"):
+        split = splits[split_name]
+        if not isinstance(split, dict) or not positive_int(split.get("count")):
+            spec.error = f"academic structure dataset {split_name} split is empty"
+            return
+        strata = split.get("source_strata")
+        tasks = split.get("task_types")
+        if (not isinstance(strata, dict) or set(strata) != set(ACADEMIC_SOURCE_STRATA)
+                or not all(positive_int(strata.get(name)) for name in ACADEMIC_SOURCE_STRATA)
+                or sum(strata.values()) != split["count"]
+                or not isinstance(tasks, dict) or not tasks
+                or not set(tasks).issubset(expected_tasks)
+                or not all(positive_int(value) for value in tasks.values())
+                or sum(tasks.values()) != split["count"]):
+            spec.error = f"academic structure dataset {split_name} coverage is invalid"
+            return
+        if str(adapter_split_hashes.get(split_name) or "").lower() != str(
+                split.get("sha256") or "").lower():
+            spec.error = f"academic structure dataset {split_name} hash receipt changed"
+            return
+        split_path = resolved_path(split.get("path"), relative_to=dataset_path.parent)
+        if (split_path is None or not split_path.is_file()
+                or file_sha256(split_path) != str(split.get("sha256") or "").lower()):
+            spec.error = f"academic structure dataset {split_name} bytes changed"
+            return
+        seen_tasks.update(tasks)
+    if seen_tasks != expected_tasks:
+        spec.error = "academic structure dataset does not preserve every planner task"
+        return
+
+    route_name = str(env_or(
+        "SPIRAL_ACADEMIC_PLANNER_ROUTE_NAME", "route_name", expected_route) or "").strip()
+    if route_name != expected_route:
+        spec.error = "academic planner route_name is identity-pinned and cannot be overridden"
+        return
+    orchestration_names = {
+        cfg.worker.name, cfg.planner.name, cfg.escalation.name, cfg.critic.name,
+        cfg.research_auditor.name, cfg.janitor.name, cfg.academic_writer.name,
+    }
+    if route_name in orchestration_names:
+        spec.error = "academic planner route_name must not collide with another role"
+        return
+    spec.name = route_name
+    spec.runtime_identity = {
+        "schema_version": ACADEMIC_RUNTIME_IDENTITY_SCHEMA,
+        "manifest_sha256": spec.manifest_sha256,
+        "adapter_tree_sha256": spec.adapter_sha256,
+        "base_model_id": spec.base_model_id,
+        "base_model_revision": spec.base_model_revision,
+        "base_weight_inventory_sha256": spec.base_weight_inventory_sha256,
+        "profile_id": spec.profile_id,
+        "provider": spec.provider,
+        "model": spec.runtime_model,
+        "transport_adapter": spec.transport_adapter,
+        "adapter_strength_supported": True,
+        "adapter_strength_min": ACADEMIC_ADAPTER_STRENGTH_MIN,
+        "adapter_strength_max": ACADEMIC_ADAPTER_STRENGTH_MAX,
+        "adapter_strength_step": ACADEMIC_ADAPTER_STRENGTH_STEP,
+        "adapter_strength_default": ACADEMIC_ADAPTER_STRENGTH,
+        "server_contract": ACADEMIC_SERVER_CONTRACT,
+        "weight_residency": ACADEMIC_WEIGHT_RESIDENCY,
+        "compute_lease": ACADEMIC_COMPUTE_LEASE,
+        "ollama_admission": ACADEMIC_OLLAMA_ADMISSION,
+        "unload_boundary": ACADEMIC_UNLOAD_BOUNDARY,
+        "scope": ACADEMIC_PLANNER_SCOPE,
+        "spiralchat_eligible": False,
+    }
+    provider_entry = {
+        "base_url": spec.base_url,
+        "model": spec.runtime_model,
+        "provider": spec.provider,
+        "transport_adapter": spec.transport_adapter,
+        "adapter_strength": spec.adapter_strength,
+        "api_key_env": spec.api_key_env,
+        "api_key_required": spec.api_key_required,
+        "academic_planner_profile_id": spec.profile_id,
+        "academic_planner_manifest_sha256": spec.manifest_sha256,
+        "academic_planner_adapter_sha256": spec.adapter_sha256,
+        "academic_planner_lineage_sha256": spec.lineage_sha256,
+        "academic_planner_lora_topology_sha256": spec.lora_topology_sha256,
+        "academic_planner_corpus_manifest_sha256": spec.corpus_manifest_sha256,
+        "academic_planner_dataset_manifest_sha256": spec.dataset_manifest_sha256,
+        "academic_planner_source_corpus_sha256": spec.source_corpus_sha256,
+        "academic_planner_source_corpus_file_sha256": spec.source_corpus_file_sha256,
+        "required_runtime_identity": dict(spec.runtime_identity),
+        "academic_planner_only": True,
+        "spiralchat_eligible": False,
+    }
+    providers = dict(cfg.providers) if isinstance(cfg.providers, dict) else {}
+    existing = providers.get(route_name)
+    if existing is not None and existing != provider_entry:
+        spec.error = "academic planner route_name already maps to another provider identity"
+        return
+    providers[route_name] = provider_entry
+    cfg.providers = providers
+    spec.ready = True
+
+
 @dataclass
 class Config:
     # backend seam — local-first. "ollama" today; another provider could slot in.
@@ -836,6 +1670,12 @@ class Config:
     academic_writer: AcademicWriterSpec = field(
         default_factory=lambda: AcademicWriterSpec("", num_ctx=24576, think=False)
     )
+    # Separately authenticated paper-architecture route. It is used only while
+    # write() constructs a section outline and word budget; it is never a
+    # general planner, chat, prose, tool, Builder, or judging role.
+    academic_planner: AcademicPlannerSpec = field(
+        default_factory=lambda: AcademicPlannerSpec("", num_ctx=8192, think=False)
+    )
 
     # The abliterated seat, used only when a run asks for it with --uncensored.
     # Never a default: refusal removal costs some instruction-following precision,
@@ -848,7 +1688,8 @@ class Config:
         model wherever it's used (worker vs escalation lanes)."""
         for spec in (
             self.worker, self.escalation, self.planner, self.critic,
-            self.research_auditor, self.academic_writer, self.janitor,
+            self.research_auditor, self.academic_writer,
+            self.academic_planner, self.janitor,
         ):
             if spec.name == model_name:
                 return spec
@@ -1010,6 +1851,8 @@ class Config:
                  SPIRAL_CRITIC / SPIRAL_JANITOR / SPIRAL_BASE_URL
                  SPIRAL_ACADEMIC_WRITER_ENABLED / SPIRAL_ACADEMIC_WRITER_MANIFEST /
                  SPIRAL_ACADEMIC_WRITER_BASE_URL
+                 SPIRAL_ACADEMIC_PLANNER_ENABLED / SPIRAL_ACADEMIC_PLANNER_MANIFEST /
+                 SPIRAL_ACADEMIC_PLANNER_BASE_URL
           file:  ~/.config/spiral/config.json →
                  {"models": {"worker": "...", ...}, "num_ctx": {...}, "hooks": {...}}
         """
@@ -1229,6 +2072,14 @@ class Config:
             cfg.academic_writer.ready = False
             cfg.academic_writer.error = (
                 f"academic writer configuration failed: {type(exc).__name__}")
+        # The structure adapter is independently opt-in and cannot inherit the
+        # prose writer's manifest, alias, endpoint, or environment variables.
+        try:
+            _academic_planner_config(cfg, overlay, config_file)
+        except Exception as exc:  # noqa: BLE001 - optional route fails closed
+            cfg.academic_planner.ready = False
+            cfg.academic_planner.error = (
+                f"academic planner configuration failed: {type(exc).__name__}")
         # This safety policy deliberately runs *after* the broad compatibility
         # catch. A malformed config must fall back to one resident local model,
         # not silently restore the historical qwen+gemma+llama RAM pile-up.

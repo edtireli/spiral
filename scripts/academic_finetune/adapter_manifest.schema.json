@@ -17,8 +17,8 @@
   ],
   "properties": {
     "schema_version": {"const": "spiral.academic-adapter.v1"},
-    "profile_id": {"const": "academic-hep-pubmed-v1"},
-    "prompt_contract": {"const": "spiral.academic-plan-prose.v1"},
+    "profile_id": {"enum": ["academic-hep-pubmed-v1", "academic-hep-pubmed-structure-v1"]},
+    "prompt_contract": {"enum": ["spiral.academic-plan-prose.v1", "spiral.academic-paper-blueprint.v1"]},
     "base_model": {
       "type": "object",
       "required": ["model_id", "revision", "model_type", "architecture", "config_sha256", "weight_inventory_sha256", "weight_files", "quantization"],
@@ -99,18 +99,82 @@
       }
     },
     "environment": {"type": "object"},
+    "lineage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "generation", "parent"],
+      "properties": {
+        "schema_version": {"const": "spiral.academic-adapter-lineage.v1"},
+        "generation": {"type": "integer", "minimum": 1},
+        "parent": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schema_version", "generation", "manifest_sha256", "profile_id",
+            "prompt_contract", "base_weight_inventory_sha256",
+            "adapter_tree_sha256", "adapter_config_sha256",
+            "adapter_weights_sha256", "lora_topology_sha256"
+          ],
+          "properties": {
+            "schema_version": {"const": "spiral.academic-parent-adapter.v1"},
+            "generation": {"type": "integer", "minimum": 1},
+            "manifest_sha256": {"$ref": "#/$defs/sha256"},
+            "profile_id": {"enum": ["academic-hep-pubmed-v1", "academic-hep-pubmed-structure-v1"]},
+            "prompt_contract": {"enum": ["spiral.academic-plan-prose.v1", "spiral.academic-paper-blueprint.v1"]},
+            "base_weight_inventory_sha256": {"$ref": "#/$defs/sha256"},
+            "adapter_tree_sha256": {"$ref": "#/$defs/sha256"},
+            "adapter_config_sha256": {"$ref": "#/$defs/sha256"},
+            "adapter_weights_sha256": {"$ref": "#/$defs/sha256"},
+            "lora_topology_sha256": {"$ref": "#/$defs/sha256"},
+            "parent_lineage_sha256": {"$ref": "#/$defs/sha256"}
+          }
+        }
+      }
+    },
     "runtime": {
       "type": "object",
       "required": ["provider", "model", "base_url", "transport_adapter"],
       "properties": {
         "provider": {"const": "mlx_lm"},
-        "model": {"const": "qwen3.8-27b-academic"},
+        "model": {"enum": ["qwen3.8-27b-academic", "qwen3.8-27b-academic-structure"]},
         "base_url": {"type": "string", "const": "http://127.0.0.1:8080/v1"},
         "transport_adapter": {"const": "openai-compatible"},
-        "default_adapter_strength": {"const": 1.0}
+        "default_adapter_strength": {"const": 1.0},
+        "scope": {"const": "spiral_paper_planner_only"},
+        "spiralchat_eligible": {"const": false}
       }
     }
   },
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "properties": {
+            "profile_id": {"const": "academic-hep-pubmed-v1"},
+            "prompt_contract": {"const": "spiral.academic-plan-prose.v1"},
+            "runtime": {
+              "properties": {"model": {"const": "qwen3.8-27b-academic"}}
+            }
+          }
+        },
+        {
+          "required": ["lineage"],
+          "properties": {
+            "profile_id": {"const": "academic-hep-pubmed-structure-v1"},
+            "prompt_contract": {"const": "spiral.academic-paper-blueprint.v1"},
+            "runtime": {
+              "required": ["scope", "spiralchat_eligible"],
+              "properties": {
+                "model": {"const": "qwen3.8-27b-academic-structure"},
+                "scope": {"const": "spiral_paper_planner_only"},
+                "spiralchat_eligible": {"const": false}
+              }
+            }
+          }
+        }
+      ]
+    }
+  ],
   "$defs": {
     "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
   }

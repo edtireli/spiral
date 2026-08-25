@@ -26,6 +26,14 @@ from __future__ import annotations
 
 import base64
 import json
+from spiral.academic_structure_contract import (
+    BRIEF_TO_BLUEPRINT_TASK,
+    MAX_BLUEPRINT_SECTIONS,
+    MIN_BLUEPRINT_SECTIONS,
+    STRUCTURE_REQUEST_SYSTEM_MARKER,
+    brief_to_blueprint_input,
+    format_structure_prompt,
+)
 from spiral.nullsafe import pick_str
 import hashlib
 import os
@@ -648,6 +656,10 @@ class ResearchLoop:
             spec = getattr(self.cfg, "academic_writer", None)
             if spec is not None and hasattr(spec, "identity"):
                 identity["academic_writer"] = spec.identity()
+        elif role == "academic_planner":
+            spec = getattr(self.cfg, "academic_planner", None)
+            if spec is not None and hasattr(spec, "identity"):
+                identity["academic_planner"] = spec.identity()
         return identity
 
     def _audit_model_call(self, *, model: str, role: str, variant: str,
@@ -1116,12 +1128,14 @@ class ResearchLoop:
         temperature: float = 0.4, num_predict: int | None = None,
         context_limit: int | None = None,
     ) -> tuple[str, int]:
-        """Use the academic adapter for finished-paper content prose at full strength.
+        """Use the academic adapter for paper-only writing and planning.
 
         Section drafting and semantic body revisions are composed from sentence/paragraph
-        units, so they use the prose adapter. Planning, structured judging, deterministic
-        layout repair, LaTeX-compilation-only repair, tools, and Builder work remain on
-        their established roles. Unsupported phases stay there even if a future caller
+        units, so they use the prose adapter.  The same selected adapter may also shape
+        the writing blueprint and section outline, but only through the two explicit
+        publication phases below.  Research planning, structured judging, deterministic
+        layout repair, LaTeX-compilation-only repair, tools, chat, and Builder work remain
+        on their established roles. Unsupported phases stay there even if a future caller
         reaches this seam.
         A failed academic attempt is audited under its exact identity, announced, and
         then handed to the caller's established writer role.  The provider adapter's
@@ -1129,7 +1143,12 @@ class ResearchLoop:
         model/endpoint swap cannot be mistaken for a successful specialized write.
         """
 
-        supported_phases = {"abstract", "body-coherence-revision"}
+        supported_phases = {
+            "abstract",
+            "body-coherence-revision",
+            "paper-writing-blueprint",
+            "paper-outline",
+        }
         supported_prefixes = (
             "section-draft:",
             "referee-revision:",
@@ -1237,6 +1256,403 @@ class ResearchLoop:
             max_chars=max_chars, temperature=temperature,
             num_predict=num_predict, context_limit=context_limit,
         )
+
+    def _synthesize_paper_plan_json(
+        self, system: str, user: str, *, phase: str,
+        max_chars: int = 12_000, required: tuple[str, ...] = (),
+        max_tokens: int | None = None,
+    ) -> dict:
+        """Run one paper-only planning call through the selected prose adapter.
+
+        The prose endpoint intentionally accepts text chat rather than OpenAI's JSON
+        response mode, so its object is parsed and checked here.  A malformed specialized
+        answer is visible in the audit log and receives one explicit retry on the ordinary
+        planner.  This helper is deliberately unavailable to general research planning.
+        """
+
+        if phase not in {"paper-writing-blueprint", "paper-outline"}:
+            raise ValueError(f"unsupported academic paper-planning phase: {phase}")
+        json_system = (
+            system
+            + "\nReturn exactly one compact JSON object. No Markdown, no prose outside "
+              "JSON, and no derivation transcript."
+        )
+        predict = max_tokens or max(2048, min(self.cfg.planner_max_tokens, 8192))
+        try:
+            text, _ = self._synthesize_prose(
+                json_system,
+                user,
+                phase=phase,
+                fallback_role="planner",
+                think=False,
+                max_chars=max_chars,
+                temperature=0.1,
+                num_predict=predict,
+            )
+        except ResearchModelError as exc:
+            self._say(f"  model · paper planning failed ({str(exc)[:140]})")
+            return {}
+        data = _extract_json(text)
+        valid = isinstance(data, dict) and all(
+            str(data.get(key, "")).strip() for key in required)
+        if valid:
+            return data
+        self._say("  model · academic paper plan malformed · existing planner retry")
+        self._log_thought(
+            "academic-writer-plan-fallback",
+            f"{phase}: specialized response was not a complete JSON object",
+            fallback_role="planner",
+            required=list(required),
+        )
+        return self._think_json(
+            system,
+            user,
+            role="planner",
+            max_chars=max_chars,
+            required=required,
+            max_tokens=predict,
+            reasoning=True,
+        )
+
+    @staticmethod
+    def _apply_paper_outline_budget(
+        outline: dict, proposal: dict, *, target_words: int,
+    ) -> dict:
+        """Preserve a proposed relative section budget while enforcing an exact total."""
+
+        normalised = dict(outline or {})
+        sections = [dict(row) for row in normalised.get("sections") or []]
+        normalised["sections"] = sections
+        if not sections:
+            return normalised
+        proposed_rows = proposal.get("sections") if isinstance(proposal, dict) else []
+        raw_weights: dict[str, int] = {}
+        if isinstance(proposed_rows, list):
+            for row in proposed_rows:
+                if not isinstance(row, dict):
+                    continue
+                name = " ".join(str(row.get("name") or "").split()).casefold()
+                value = row.get("target_words", row.get("words"))
+                if (
+                    name
+                    and isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and value > 0
+                ):
+                    raw_weights[name] = value
+        default_weight = (
+            max(1, round(sum(raw_weights.values()) / len(raw_weights)))
+            if raw_weights else 1
+        )
+        weights = [
+            raw_weights.get(
+                " ".join(str(row.get("name") or "").split()).casefold(),
+                default_weight,
+            )
+            for row in sections
+        ]
+        target = max(len(sections), int(target_words))
+        minimum = 120 if target >= 120 * len(sections) else 1
+        distributable = target - minimum * len(sections)
+        total_weight = sum(weights)
+        exact = [distributable * weight / total_weight for weight in weights]
+        allocation = [minimum + int(value) for value in exact]
+        remainder = target - sum(allocation)
+        order = sorted(
+            range(len(sections)),
+            key=lambda index: (-(exact[index] - int(exact[index])), index),
+        )
+        for offset in range(remainder):
+            allocation[order[offset % len(order)]] += 1
+        for row, words in zip(sections, allocation, strict=True):
+            row["target_words"] = words
+        normalised["paper_outline_budget"] = {
+            "requested_words": target,
+            "proposed_words": sum(raw_weights.values()),
+            "adapter_supplied_weights": bool(raw_weights),
+            "normalization": "deterministic_largest_remainder",
+        }
+        return normalised
+
+    def _academic_structure_outline(
+        self, system: str, user: str, *, deterministic_blueprint: dict,
+        target_words: int, title_seed: str, route_receipt: dict | None = None,
+    ) -> dict | None:
+        """Call the authenticated structure adapter for one paper outline only.
+
+        No ordinary planner, chat, prose, tool or audit call reaches this seam.
+        The specialized attempt has provider fallback disabled; failure is
+        publicly audited and the caller explicitly invokes its existing planner.
+        """
+
+        def record_outcome(
+            status: str, *, attempted: bool, fallback_reason: str = "",
+        ) -> None:
+            if route_receipt is not None:
+                route_receipt.update({
+                    "attempted": attempted,
+                    "status": status,
+                    "fallback_reason": fallback_reason,
+                    "fallback_used": status != "success",
+                })
+
+        spec = getattr(self.cfg, "academic_planner", None)
+        if spec is None or not getattr(spec, "enabled", False):
+            record_outcome(
+                "disabled", attempted=False,
+                fallback_reason="academic planner is disabled",
+            )
+            return None
+
+        def reject(reason: str, *, status: str, attempted: bool) -> None:
+            record_outcome(
+                status, attempted=attempted, fallback_reason=reason[:500])
+            self._say(
+                "  model · academic planner unavailable for paper outline; "
+                f"using existing planner ({reason[:140]})")
+            self._log_thought(
+                "academic-planner-fallback",
+                f"paper-outline: {reason[:500]}",
+                status=status,
+                attempted=attempted,
+                fallback_role="planner",
+                allowed_scope=["paper section outline", "section word budget"],
+                excluded_scope=[
+                    "general chat", "paper prose", "tools", "builder",
+                    "research planning", "judging and audits",
+                ],
+                academic_planner=(
+                    spec.identity() if hasattr(spec, "identity") else {}),
+            )
+
+        if not getattr(spec, "ready", False):
+            reject(
+                str(getattr(spec, "error", "") or "route is not ready"),
+                status="not_ready", attempted=False,
+            )
+            return None
+        provider = (getattr(self.ol, "providers", {}) or {}).get(spec.name)
+        expected = {
+            "base_url": str(spec.base_url).rstrip("/"),
+            "model": spec.runtime_model,
+            "provider": spec.provider,
+            "transport_adapter": spec.transport_adapter,
+            "adapter_strength": spec.adapter_strength,
+            "api_key_env": spec.api_key_env,
+            "api_key_required": spec.api_key_required,
+            "academic_planner_profile_id": spec.profile_id,
+            "academic_planner_manifest_sha256": spec.manifest_sha256,
+            "academic_planner_adapter_sha256": spec.adapter_sha256,
+            "academic_planner_lineage_sha256": spec.lineage_sha256,
+            "academic_planner_lora_topology_sha256": spec.lora_topology_sha256,
+            "academic_planner_corpus_manifest_sha256": spec.corpus_manifest_sha256,
+            "academic_planner_dataset_manifest_sha256": spec.dataset_manifest_sha256,
+            "academic_planner_source_corpus_sha256": spec.source_corpus_sha256,
+            "academic_planner_source_corpus_file_sha256": (
+                spec.source_corpus_file_sha256),
+            "required_runtime_identity": dict(spec.runtime_identity),
+            "academic_planner_only": True,
+            "spiralchat_eligible": False,
+        }
+
+        def provider_matches(key: str, expected_value) -> bool:
+            observed = provider.get(key) if isinstance(provider, dict) else None
+            if key == "base_url":
+                return str(observed or "").rstrip("/") == str(expected_value or "").rstrip("/")
+            return observed == expected_value
+
+        if not isinstance(provider, dict) or any(
+                not provider_matches(key, value) for key, value in expected.items()):
+            reject(
+                "runtime provider identity does not match the academic planner manifest",
+                status="identity_mismatch", attempted=False,
+            )
+            return None
+        server_attempted = False
+        try:
+            evict_owned = getattr(self.ol, "evict_owned_local_models_except", None)
+            if not callable(evict_owned):
+                raise ResearchModelError(
+                    "runtime cannot release run-owned local model receipts")
+            try:
+                evict_owned(
+                    set(),
+                    log=lambda name: self._say(
+                        f"  model · unloaded {name} before academic outline inference"),
+                    strict=True,
+                )
+            except Exception as exc:
+                raise ResearchModelError(
+                    "could not release run-owned local model receipts: "
+                    f"{type(exc).__name__}") from exc
+            server_attempted = True
+            text, _ = self._think(
+                system + (
+                    "\nReturn exactly one compact JSON object. No Markdown or prose "
+                    "outside JSON. This call is only for the section outline and word budget."),
+                user,
+                think=False,
+                role="academic_planner",
+                fmt="json",
+                max_chars=12_000,
+                temperature=0.0,
+                num_predict=2048,
+                context_limit=min(int(getattr(spec, "num_ctx", 8192)), 8192),
+                allow_provider_fallback=False,
+            )
+        except ResearchModelError as exc:
+            reject(
+                str(exc),
+                status=("server_error" if server_attempted else "runtime_unavailable"),
+                attempted=server_attempted,
+            )
+            return None
+        payload = _extract_json(text)
+        try:
+            outline = self._normalise_academic_structure_outline(
+                payload,
+                deterministic_blueprint=deterministic_blueprint,
+                target_words=target_words,
+                title_seed=title_seed,
+            )
+        except (TypeError, ValueError) as exc:
+            reject(
+                f"invalid structure JSON: {exc}",
+                status="invalid_json", attempted=True,
+            )
+            return None
+        record_outcome("success", attempted=True)
+        return outline
+
+    @staticmethod
+    def _normalise_academic_structure_outline(
+        payload, *, deterministic_blueprint: dict, target_words: int,
+        title_seed: str,
+    ) -> dict:
+        """Strictly validate and deterministically bridge blueprint JSON to write()."""
+
+        # Admission of this route already binds a planner-only adapter trained on
+        # observed section order.  The ordinary planner normalizer intentionally
+        # reorders roles and caps them at eight; applying it here would destroy the
+        # learned structure contract (the exact-gated corpus includes nine-section
+        # targets).  Keep that deterministic blueprint only for the audited fallback.
+        del deterministic_blueprint
+
+        if not isinstance(payload, dict):
+            raise TypeError("response is not a JSON object")
+        if not {"paper_counts", "sections"}.issubset(payload):
+            raise ValueError("paper_counts and sections are required")
+        if set(payload) - {"paper_counts", "sections", "title"}:
+            raise ValueError("unexpected top-level fields")
+        counts = payload.get("paper_counts")
+        rows = payload.get("sections")
+        expected_count_keys = {
+            "abstract_words", "section_words", "section_paragraphs",
+            "unsectioned_words", "figures", "tables",
+        }
+        if not isinstance(counts, dict) or set(counts) != expected_count_keys:
+            raise ValueError("paper_counts has an incompatible schema")
+        if any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+            for value in counts.values()
+        ) or counts["section_words"] <= 0:
+            raise ValueError("paper counts must be nonnegative integers")
+        if (
+            not isinstance(rows, list)
+            or not MIN_BLUEPRINT_SECTIONS <= len(rows) <= MAX_BLUEPRINT_SECTIONS
+        ):
+            raise ValueError(
+                "sections must contain "
+                f"{MIN_BLUEPRINT_SECTIONS} through {MAX_BLUEPRINT_SECTIONS} entries")
+        allowed_roles = {
+            "introduction", "background", "methods", "method_or_setup",
+            "experimental_setup", "formalism", "analysis", "results",
+            "discussion", "conclusion", "limitations", "domain_development",
+            "domain_section",
+        }
+        role_map = {
+            "introduction": "introduction",
+            "background": "setup",
+            "methods": "methods",
+            "method_or_setup": "setup",
+            "experimental_setup": "methods",
+            "formalism": "setup",
+            "analysis": "results",
+            "results": "results",
+            "discussion": "discussion",
+            "conclusion": "conclusion",
+            "limitations": "discussion",
+            "domain_development": "other",
+            "domain_section": "other",
+        }
+        seen_headings = set()
+        seen_ids = set()
+        raw_outline = {
+            "title": " ".join(str(payload.get("title") or title_seed).split())[:180],
+            "sections": [],
+        }
+        raw_weights: dict[str, int] = {}
+        for row in rows:
+            if not isinstance(row, dict) or set(row) != {"heading", "id", "role", "words"}:
+                raise ValueError("section entries must contain heading, id, role and words")
+            heading = " ".join(str(row.get("heading") or "").split())[:100]
+            section_id = str(row.get("id") or "").strip()
+            role = str(row.get("role") or "").strip()
+            words = row.get("words")
+            heading_key = heading.casefold()
+            if (not heading or not section_id or role not in allowed_roles
+                    or not isinstance(words, int) or isinstance(words, bool) or words <= 0
+                    or heading_key in seen_headings or section_id in seen_ids):
+                raise ValueError("section identity, role or budget is invalid")
+            seen_headings.add(heading_key)
+            seen_ids.add(section_id)
+            mapped_role = role_map[role]
+            raw_outline["sections"].append({
+                "name": heading,
+                "rhetorical_role": mapped_role,
+                "intent": (
+                    f"Fulfil the observed {role.replace('_', ' ')} function; "
+                    f"relative source budget {words} words."),
+            })
+            raw_weights[heading_key] = words
+        if sum(raw_weights.values()) != counts["section_words"]:
+            raise ValueError("section budgets do not sum to paper_counts.section_words")
+
+        normalised = {
+            "title": raw_outline["title"],
+            "sections": raw_outline["sections"],
+            "rhetorical_contract": {
+                "introduction": ["introduction"],
+                "foundations": ["methods", "setup"],
+                "contribution": ["proof", "results"],
+                "scope": ["conclusion", "discussion"],
+            },
+        }
+        sections = normalised["sections"]
+        target = max(len(sections), int(target_words))
+        weights = [max(1, raw_weights.get(str(row.get("name") or "").casefold(), 1))
+                   for row in sections]
+        total_weight = sum(weights)
+        minimum = 120 if target >= 120 * len(sections) else 1
+        distributable = target - minimum * len(sections)
+        exact = [distributable * weight / total_weight for weight in weights]
+        allocation = [minimum + int(value) for value in exact]
+        difference = target - sum(allocation)
+        if difference > 0:
+            order = sorted(
+                range(len(sections)),
+                key=lambda index: (-(exact[index] - int(exact[index])), index),
+            )
+            for offset in range(difference):
+                allocation[order[offset % len(order)]] += 1
+        for row, words in zip(sections, allocation, strict=True):
+            row["target_words"] = words
+        normalised["academic_planner_budget"] = {
+            "requested_section_words": target,
+            "source_section_words": counts["section_words"],
+            "normalization": "deterministic_largest_remainder",
+        }
+        return normalised
 
     def _think_json(self, system: str, user: str, *, role: str = "critic",
                     max_chars: int = 12_000, required: tuple[str, ...] = (),
@@ -4598,11 +5014,13 @@ class ResearchLoop:
             "schema_version": "spiral.academic-writer-route-receipt.v1",
             "configured_selection": (
                 "explicit_uncensored_writer" if uncensored_writer_active
-                else "academic_paper_prose_writer" if writer_identity.get("ready")
+                else "academic_paper_writer_and_planner" if writer_identity.get("ready")
                 else "existing_writer"),
             "explicit_uncensored_bypass": uncensored_writer_active,
             "identity": writer_identity,
             "allowed_scope": [
+                "paper-specific writing blueprint",
+                "paper-specific section outline and word budget",
                 "research-paper section drafts",
                 "semantic full-body prose revisions",
                 "citation and claim-scope prose revisions",
@@ -4610,7 +5028,7 @@ class ResearchLoop:
                 "abstract claim-scope repair",
             ],
             "excluded_scope": [
-                "planning and outlines", "structured JSON/referee audits",
+                "research planning outside write()", "structured JSON/referee audits",
                 "deterministic layout-only repair", "LaTeX compile-only repair",
                 "tools", "builder", "all prose while explicit uncensored mode is active",
             ],
@@ -4655,11 +5073,13 @@ class ResearchLoop:
             "are examples, not text to copy: set required=true only for a chosen form genuinely "
             "needed in this paper."
         )
-        model_blueprint = self._think_json(
+        model_blueprint = self._synthesize_paper_plan_json(
             bp_sys,
             f"QUESTION: {self.state.question}\n\nVERIFIED:\n{findings_txt}\n\n"
             f"DETERMINISTIC CORPUS BLUEPRINT:\n{blueprint_md[:12000]}",
-            role="planner", max_chars=10_000, reasoning=True)
+            phase="paper-writing-blueprint",
+            max_chars=10_000,
+            required=("section_arc",))
         if not model_blueprint:
             model_blueprint = {
                 "_fallback": True,
@@ -4700,19 +5120,33 @@ class ResearchLoop:
                   else "Plan a focused arXiv-style original research paper. ") + "Reply ONLY JSON "
                  '{"title":"<concise specific title>","sections":[{"name":"...",'
                  '"rhetorical_role":"introduction|setup|methods|results|proof|discussion|'
-                 'conclusion|other","intent":"..."}]}. '
+                 'conclusion|other","intent":"...","target_words":123}]}. '
                  "Use an actual section arc observed in the CORPUS STYLE GUIDE as the genre "
                  "template, adapting subject-specific names to this result. Do not flatten every "
                  "paper into generic Introduction/Setup/Results/Discussion/Conclusion headings. "
                  "The complete arc must still provide context, foundations, the VERIFIED "
                  "contribution, and an honest scope/limitations synthesis. The title is plain "
-                 "text, concise, specific, and never the raw prompt.")
-        outline = self._think_json(
-            o_sys, f"QUESTION: {self.state.question}\n\nVERIFIED:\n{findings_txt}\n\n"
-            f"CORPUS STYLE GUIDE:\n{style_guide}\n\nWRITING BLUEPRINT:\n{model_blueprint_txt}\n\n"
-            f"CORPUS:\n{corpus_digest}",
-            role="planner", max_chars=12_000, reasoning=True)
-        outline = normalise_outline(outline, blueprint)
+                 "text, concise, specific, and never the raw prompt. Assign a positive integer "
+                 f"target_words to every section so the proposed total is exactly {target_paper_words}; "
+                 "use the budget to express the real argumentative emphasis, not equal slices.")
+        outline_user = (
+            f"QUESTION: {self.state.question}\n\nVERIFIED:\n{findings_txt}\n\n"
+            f"CORPUS STYLE GUIDE:\n{style_guide}\n\n"
+            f"WRITING BLUEPRINT:\n{model_blueprint_txt}\n\nCORPUS:\n{corpus_digest}"
+        )
+        # One selected academic adapter owns both the paper's prose and its
+        # paper-specific architecture.  This explicit helper does not affect
+        # ordinary research planning, chat, tools, Builder, or referee calls.
+        proposed_outline = self._synthesize_paper_plan_json(
+            o_sys,
+            outline_user,
+            phase="paper-outline",
+            max_chars=12_000,
+            required=("title", "sections"),
+        )
+        outline = normalise_outline(proposed_outline, blueprint)
+        outline = self._apply_paper_outline_budget(
+            outline, proposed_outline, target_words=target_paper_words)
         title = " ".join((outline.get("title") or self.state.question or self.state.topic).split())[:180]
         sections = outline["sections"]
         blueprint["selected_section_contract"] = sections
@@ -4733,8 +5167,12 @@ class ResearchLoop:
         else:
             # 2. DRAFT each section (focused, verified findings as the factual backbone)
             parts = []
-            section_target = max(120, target_paper_words // max(1, len(sections)))
             for s in sections:
+                section_target = max(
+                    120,
+                    int(s.get("target_words") or (
+                        target_paper_words // max(1, len(sections)))),
+                )
                 s_sys = ("Write ONE LaTeX section (\\section{...} + content; NO preamble/title/abstract) "
                          "for the paper in the OUTLINE. Follow the CORPUS STYLE GUIDE and WRITING "
                          "BLUEPRINT for structure, vocabulary, notation, equation conventions, citation "

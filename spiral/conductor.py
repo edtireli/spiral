@@ -34,7 +34,7 @@ from spiral import tools
 from spiral.agent import Atom, TaskSpec
 from spiral.appicon import TOKEN_COLORS, write_android_icon, write_android_tokens
 from spiral.banner import Spinner
-from spiral.config import Config
+from spiral.config import Config, general_api_providers
 from spiral.contracts import lint_contracts
 from spiral.execution import (
     EvidenceLevel, EvidenceRecord, OrchestrationPolicy, TaskEvidenceDAG, TaskState,
@@ -1223,10 +1223,7 @@ class Conductor:
         highest-value observations. Local models are scope-limited (per-task
         files); this spends the big model's context reading everything, then asks
         for a lot of insight in few output tokens — the cheap, high-leverage call."""
-        general_providers = {
-            name: provider for name, provider in (self.cfg.providers or {}).items()
-            if not (isinstance(provider, dict) and provider.get("academic_writer_only"))
-        }
+        general_providers = general_api_providers(self.cfg.providers)
         if not general_providers:
             self.c.print("  [yellow]no API provider configured.[/] Add one to "
                          "~/.config/spiral/config.json and export its api_key_env. See README.")
