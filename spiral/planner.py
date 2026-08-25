@@ -911,23 +911,32 @@ def _plan_chat(
     → think OFF [→ fallback model, think OFF]. The think-off rungs cannot ramble,
     so this never returns empty."""
     name = model or cfg.planner.name
-    # Remote reasoning calls already perform one low-effort final-answer recovery
-    # inside the provider adapter. Repeating the identical expensive rung here can
-    # spend tens of thousands of tokens without adding a new recovery strategy.
-    ladder: list[tuple[str, bool]] = (
-        [(name, think), (name, False)]
-        if name in getattr(ol, "providers", {})
-        else [(name, think), (name, think), (name, False)]
-    )
+    requested_tokens = max_tokens or cfg.planner_max_tokens
+    # Structured JSON does not benefit from repeating an identical thinking rung.
+    # On local models a long hidden-reasoning allowance can consume tens of minutes
+    # without emitting one byte of the required object, so the optional reasoning
+    # probe is finite and falls through once to a full answer-only attempt.
+    if think:
+        thinking_tokens = (
+            requested_tokens
+            if name in getattr(ol, "providers", {})
+            else min(requested_tokens, 2048)
+        )
+        ladder: list[tuple[str, bool, int]] = [
+            (name, True, thinking_tokens),
+            (name, False, requested_tokens),
+        ]
+    else:
+        ladder = [(name, False, requested_tokens)]
     if fallback_model and fallback_model != name:
-        ladder.append((fallback_model, False))
+        ladder.append((fallback_model, False, requested_tokens))
     res = None
-    for m, th in ladder:
+    for m, th, token_cap in ladder:
         res = ol.chat(
             m,
             [{"role": "system", "content": system}, {"role": "user", "content": user}],
             think=th,
-            num_predict=max_tokens or cfg.planner_max_tokens,
+            num_predict=token_cap,
             temperature=temperature,
             fmt=schema or PLAN_SCHEMA,
             num_ctx=cfg.spec_for(m).num_ctx,
@@ -976,7 +985,13 @@ def make_plan(goal: str, repomap: str, gate: str = "", cfg: Config | None = None
     cfg = cfg or Config.load()
     ol = ol or Ollama(cfg.base_url)
     user = f"{_gate_line(gate)}GOAL:\n{goal}\n\nREPO:\n{repomap}\n\nProduce the execution plan as JSON."
-    res = _plan_chat(PLANNER_SYSTEM, user, cfg, ol, temperature=0.3, progress=progress)
+    # The schema itself makes the model externalize its reasoning as understanding,
+    # milestones, dependencies, and verification. Hidden thinking here used to burn
+    # the complete local token budget before a single JSON byte reached the caller.
+    res = _plan_chat(
+        PLANNER_SYSTEM, user, cfg, ol, temperature=0.3, think=False,
+        max_tokens=min(cfg.planner_max_tokens, 6144), progress=progress,
+    )
     return parse_plan(_extract_json(res.text)), res
 
 
@@ -986,8 +1001,8 @@ def extract_spec(goal: str, cfg: Config | None = None, ol: Ollama | None = None,
     cfg = cfg or Config.load()
     ol = ol or Ollama(cfg.base_url)
     res = _plan_chat(SPEC_SYSTEM, f"GOAL:\n{goal}\n\nExtract the requirements checklist as JSON.",
-                     cfg, ol, temperature=0.2, schema=SPEC_SCHEMA,
-                     max_tokens=min(cfg.planner_max_tokens, 8192),
+                     cfg, ol, temperature=0.2, schema=SPEC_SCHEMA, think=False,
+                     max_tokens=min(cfg.planner_max_tokens, 4096),
                      progress=progress)
     return _extract_json(res.text).get("requirements", []), res
 
