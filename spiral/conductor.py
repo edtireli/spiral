@@ -1223,11 +1223,15 @@ class Conductor:
         highest-value observations. Local models are scope-limited (per-task
         files); this spends the big model's context reading everything, then asks
         for a lot of insight in few output tokens — the cheap, high-leverage call."""
-        if not self.cfg.providers:
+        general_providers = {
+            name: provider for name, provider in (self.cfg.providers or {}).items()
+            if not (isinstance(provider, dict) and provider.get("academic_writer_only"))
+        }
+        if not general_providers:
             self.c.print("  [yellow]no API provider configured.[/] Add one to "
                          "~/.config/spiral/config.json and export its api_key_env. See README.")
             return
-        model = next(iter(self.cfg.providers))
+        model = next(iter(general_providers))
         # full dump — big model, big context: whole files, generous budget
         repo = build_repomap(self.ws, max_file_bytes=24_000, max_total=350_000)
         pf = self._dir() / "plan.json"

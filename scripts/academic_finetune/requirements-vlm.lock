@@ -1,0 +1,29 @@
+# Exact direct runtime set proven with the full Qwen3.8 vision-language checkpoint.
+# Install only into the isolated VLM environment described in TRAINING.md.
+mlx==0.32.1
+mlx-metal==0.32.1
+mlx-vlm==0.6.16
+transformers==5.15.1
+numpy==2.5.2
+sentencepiece==0.2.2
+miniaudio==1.71
+tqdm==4.70.0
+Pillow==12.3.0
+requests==2.34.2
+llguidance==1.8.0
+mlx-audio==0.5.0
+opencv-python==5.0.0.93
+fastapi==0.141.1
+python-multipart==0.0.32
+starlette==1.6.0
+uvicorn==0.52.4
+websockets==17.0.1
+huggingface-hub==1.28.0
+packaging==26.3
+PyYAML==6.0.3
+regex==2026.7.19
+tokenizers==0.22.2
+typer==0.27.1
+safetensors==0.8.0
+Jinja2==3.1.6
+pydantic==2.13.4

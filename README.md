@@ -471,6 +471,15 @@ and can be edited directly:
   "research_git": true,
   "research_living_papers": true,
   "research_living_recheck_days": 30,
+  "academic_writer": {
+    "enabled": false,
+    "manifest_path": "/absolute/path/academic-adapter.manifest.json",
+    "corpus_manifest_path": "/absolute/path/academic_corpus.jsonl.manifest.json",
+    "dataset_manifest_path": "/absolute/path/dataset_manifest.json",
+    "base_url": "http://127.0.0.1:8080/v1",
+    "transport_adapter": "openai-compatible",
+    "adapter_strength": 1.0
+  },
   "providers": {
     "kimi-k3": { "base_url": "https://api.moonshot.ai/v1", "api_key_env": "MOONSHOT_API_KEY" }
   },
@@ -495,6 +504,39 @@ and can be edited directly:
   acquisition. Limits are checked against the resolved selection before transfer;
   zero-trust model execution remains offline.
 - `research_notes_model` — optional local model for broad per-paper reading notes. If unset, research uses the local worker model even when `--api` routes the main reasoning roles to an API provider.
+- `academic_writer` — optional finished-paper prose route, disabled by default.
+  Enabling it requires an authenticated `spiral.academic-adapter.v1` manifest, its
+  exact `spiral.academic-mlx-dataset.v1` prepared-dataset manifest and
+  `spiral.academic-corpus-manifest.v1` source manifest (the explicit `arxiv:hep-th`,
+  `arxiv:hep-ph`, and `pubmed` strata), and an explicit serving endpoint. Spiral
+  verifies the author-safe, pre-2022 source corpus and MLX adapter bundle and records
+  provider, endpoint, runtime model, profile, base inventory, adapter, dataset, and
+  corpus digests. This route is pinned to `mlx-community/Qwen3.8-27B-4bit` revision
+  `3e6447f082e89cc7f0bc6e5441afd38dfce760ff` and its exact affine q4/group-64
+  three-shard inventory; Qwen3.8 intentionally reports the underlying `qwen3_5`
+  architecture name. It writes section drafts, semantic full-body revisions, citation/
+  claim-scope prose repairs, and the final abstract. Planning/outlines, structured JSON
+  audits and referee decisions, deterministic layout-only repairs, LaTeX compile-only
+  repairs, vision/uploads, tools, and Builder are not silently captured by the prose
+  route. The companion authenticated MLX-VLM lane can nevertheless run this same
+  adapter on the complete checkpoint for image/upload and tool turns. Explicit
+  `--uncensored` runs bypass the academic route so the abliterated generating seats remain
+  authoritative. `adapter_strength` (or `SPIRAL_ACADEMIC_WRITER_STRENGTH`) is a true
+  per-request LoRA contribution multiplier from 0.0 through 2.0 in 0.05 steps: 0.0 removes
+  the adapter contribution, 1.0 preserves the trained MLX scale (32), and values above one
+  amplify it. The default is 1.0. The serving response must attest the
+  exact manifest, adapter tree, base inventory, profile, runtime identity, one-request
+  child-process residency, shared compute lease, strict-empty Ollama admission, and
+  child-exit-before-lease-release boundary and separately echo the exact applied strength.
+  `spiral-academic-vlm-serve` exposes that full-checkpoint lane at loopback
+  `POST /api/chat`: it preserves per-turn image placement, live Ollama NDJSON content and
+  thinking, official Qwen tool-call parsing and second-round tool history. Every chunk
+  echoes the requested strength. Its startup receipt cryptographically hashes all base,
+  adapter and VLM frontend assets; request workers then compare the bound inode/size/time
+  snapshot so the 15 GB checkpoint is not reread several times before every first token.
+  A stock OpenAI-compatible endpoint cannot
+  satisfy that receipt; any missing/mismatched attestation, owned-model unload failure,
+  or serving failure visibly falls back to the existing writer.
 - `research_search_results_per_query` — breadth requested from each independent keyword route before citation-graph expansion (default 8).
 - `research_reading_limit` / `research_deep_read_limit` — cap broad paper notes and later zoom-in reads so long corpora stay context-manageable.
 - `research_blind_replication` / `research_replication_attempts` — require a

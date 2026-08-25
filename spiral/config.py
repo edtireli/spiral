@@ -25,6 +25,763 @@ class ModelSpec:
     think: bool = False
 
 
+ACADEMIC_ADAPTER_SCHEMA = "spiral.academic-adapter.v1"
+ACADEMIC_CORPUS_SCHEMA = "spiral.academic-corpus-manifest.v1"
+ACADEMIC_DATASET_SCHEMA = "spiral.academic-mlx-dataset.v1"
+ACADEMIC_PROMPT_CONTRACT = "spiral.academic-plan-prose.v1"
+ACADEMIC_ADAPTER_SHA256_SEMANTICS = (
+    "sha256(sorted(relative_path\\0size_bytes\\0file_sha256\\n))"
+)
+ACADEMIC_SOURCE_STRATA = (
+    "arxiv:hep-th",
+    "arxiv:hep-ph",
+    "pubmed",
+)
+ACADEMIC_PROFILE_ID = "academic-hep-pubmed-v1"
+ACADEMIC_RUNTIME_MODEL = "qwen3.8-27b-academic"
+ACADEMIC_PROVIDER = "mlx_lm"
+ACADEMIC_TRANSPORT_ADAPTER = "openai-compatible"
+ACADEMIC_BASE_MODEL_ID = "mlx-community/Qwen3.8-27B-4bit"
+ACADEMIC_BASE_MODEL_REVISION = "3e6447f082e89cc7f0bc6e5441afd38dfce760ff"
+ACADEMIC_BASE_MODEL_TYPE = "qwen3_5"
+ACADEMIC_BASE_MODEL_ARCHITECTURE = "Qwen3_5ForConditionalGeneration"
+ACADEMIC_BASE_MODEL_CONFIG_SHA256 = (
+    "14b65a0ee06517060a6bbd979bb1a8ff54e7b304b1a1f01d54344b88b8285e85"
+)
+ACADEMIC_BASE_WEIGHT_INDEX_SHA256 = (
+    "13b840162b4cb35c66fef7df072f7dbb4717908204364f5e5d9f9655a2758fa8"
+)
+ACADEMIC_BASE_WEIGHT_INVENTORY_SHA256 = (
+    "8126a3fd4aef3346254965791eedc5a5468bf7fcf46bdd95ef29dd13266ed589"
+)
+ACADEMIC_BASE_WEIGHT_FILES = (
+    {
+        "path": "model-00001-of-00003.safetensors",
+        "size_bytes": 5_343_268_662,
+        "sha256": "6cc1508e96fb5d0865dfd5753a79f4ec60651bf3e2a82844a7e8ae9c60528c0d",
+    },
+    {
+        "path": "model-00002-of-00003.safetensors",
+        "size_bytes": 5_354_185_130,
+        "sha256": "83f2a20ca8058f486a3634a27faf99587f4cd3c156a83dee34fb99e6ac178670",
+    },
+    {
+        "path": "model-00003-of-00003.safetensors",
+        "size_bytes": 5_357_087_557,
+        "sha256": "31b8c91ef899f79efaaa69e3d2c096f6e2ebeb2ff20e29222abbd9ebc79e560a",
+    },
+)
+ACADEMIC_ADAPTER_FORMAT = "mlx_lm_lora"
+ACADEMIC_RUNTIME_IDENTITY_SCHEMA = "spiral.academic-runtime-identity.v1"
+ACADEMIC_SERVER_CONTRACT = "spiral.academic-one-request-server.v1"
+ACADEMIC_WEIGHT_RESIDENCY = "child-process-per-request"
+ACADEMIC_COMPUTE_LEASE = "spiral-compute-flock-v1"
+ACADEMIC_OLLAMA_ADMISSION = "strict-empty-no-eviction"
+ACADEMIC_UNLOAD_BOUNDARY = "child-exit-before-lease-release"
+ACADEMIC_ADAPTER_STRENGTH = 1.0
+ACADEMIC_ADAPTER_STRENGTH_MIN = 0.0
+ACADEMIC_ADAPTER_STRENGTH_MAX = 2.0
+ACADEMIC_ADAPTER_STRENGTH_STEP = 0.05
+ACADEMIC_AUTHOR_SAFE_SPLIT_POLICY = (
+    "connected document-author components; sha256 90/5/5 with deterministic "
+    "nonempty pilot repair"
+)
+
+
+@dataclass
+class AcademicWriterSpec(ModelSpec):
+    """An opt-in, identity-pinned final-prose route.
+
+    ``name`` is a private provider-map alias, not the model sent on the wire.  Keeping
+    those names separate prevents an academic endpoint from silently capturing planner,
+    tool, or Builder calls that happen to use the same base model id.
+    """
+
+    enabled: bool = False
+    ready: bool = False
+    profile_id: str = ""
+    runtime_model: str = ""
+    provider: str = ""
+    base_url: str = ""
+    transport_adapter: str = "openai-compatible"
+    api_key_env: str = ""
+    api_key_required: bool = False
+    manifest_path: str = ""
+    manifest_sha256: str = ""
+    prompt_contract: str = ""
+    base_model_id: str = ""
+    base_model_revision: str = ""
+    base_model_type: str = ""
+    base_model_architecture: str = ""
+    base_model_config_sha256: str = ""
+    base_weight_index_sha256: str = ""
+    base_weight_inventory_sha256: str = ""
+    base_weight_files: tuple[dict, ...] = ()
+    base_model_quantization: dict = field(default_factory=dict)
+    adapter_path: str = ""
+    adapter_format: str = ""
+    adapter_sha256: str = ""
+    adapter_required_files: tuple[dict, ...] = ()
+    corpus_manifest_path: str = ""
+    corpus_manifest_sha256: str = ""
+    dataset_manifest_path: str = ""
+    dataset_manifest_sha256: str = ""
+    source_corpus_path: str = ""
+    source_corpus_sha256: str = ""
+    source_corpus_file_sha256: str = ""
+    source_strata: tuple[str, ...] = ()
+    adapter_strength: float = ACADEMIC_ADAPTER_STRENGTH
+    runtime_identity: dict = field(default_factory=dict)
+    overrides: tuple[str, ...] = ()
+    error: str = ""
+
+    def identity(self) -> dict:
+        """Stable public receipt for every academic synthesis attempt."""
+
+        return {
+            "enabled": self.enabled,
+            "ready": self.ready,
+            "route_name": self.name,
+            "profile_id": self.profile_id,
+            "runtime_model": self.runtime_model,
+            "provider": self.provider,
+            "base_url": self.base_url,
+            "transport_adapter": self.transport_adapter,
+            "adapter_strength": self.adapter_strength,
+            "manifest_path": self.manifest_path,
+            "manifest_sha256": self.manifest_sha256,
+            "prompt_contract": self.prompt_contract,
+            "base_model": {
+                "model_id": self.base_model_id,
+                "revision": self.base_model_revision,
+                "model_type": self.base_model_type,
+                "architecture": self.base_model_architecture,
+                "config_sha256": self.base_model_config_sha256,
+                "weight_index_sha256": self.base_weight_index_sha256,
+                "weight_inventory_sha256": self.base_weight_inventory_sha256,
+                "weight_files": [dict(row) for row in self.base_weight_files],
+                "quantization": dict(self.base_model_quantization),
+            },
+            "adapter": {
+                "path": self.adapter_path,
+                "format": self.adapter_format,
+                "sha256": self.adapter_sha256,
+                "required_files": [dict(row) for row in self.adapter_required_files],
+            },
+            "corpus_manifest_path": self.corpus_manifest_path,
+            "corpus_manifest_sha256": self.corpus_manifest_sha256,
+            "dataset_manifest_path": self.dataset_manifest_path,
+            "dataset_manifest_sha256": self.dataset_manifest_sha256,
+            "source_corpus_path": self.source_corpus_path,
+            "source_corpus_sha256": self.source_corpus_sha256,
+            "source_corpus_file_sha256": self.source_corpus_file_sha256,
+            "source_strata": list(self.source_strata),
+            "runtime_identity": dict(self.runtime_identity),
+            "overrides": list(self.overrides),
+            "error": self.error,
+        }
+
+
+def _academic_writer_config(cfg, overlay: dict, config_file) -> None:
+    """Resolve and authenticate the optional academic route without model I/O."""
+
+    import hashlib
+    import json
+    import os
+    import re
+    from datetime import date
+    from pathlib import Path
+
+    spec = cfg.academic_writer
+    raw = overlay.get("academic_writer") or {}
+    if not isinstance(raw, dict):
+        spec.error = "academic_writer must be an object"
+        return
+
+    def env_or(name: str, key: str, default=""):
+        return os.environ.get(name, raw.get(key, default))
+
+    def truthy(value) -> bool:
+        if isinstance(value, bool):
+            return value
+        return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+    def resolved_path(value, *, relative_to: Path) -> Path | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        path = Path(text).expanduser()
+        return (relative_to / path).resolve() if not path.is_absolute() else path.resolve()
+
+    def file_sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    def adapter_bundle_sha256(path: Path, required_files) -> tuple[str, tuple[dict, ...]]:
+        """Authenticate the immutable MLX-LM adapter payload, not directory metadata."""
+
+        if not isinstance(required_files, list):
+            raise ValueError("adapter.required_files must be a list")
+        expected_paths = ["adapter_config.json", "adapters.safetensors"]
+        if [str(row.get("path") or "") for row in required_files
+                if isinstance(row, dict)] != expected_paths:
+            raise ValueError(
+                "adapter.required_files must be adapter_config.json then adapters.safetensors")
+        root = path.resolve()
+        verified = []
+        lines = []
+        for row in required_files:
+            if not isinstance(row, dict):
+                raise ValueError("adapter.required_files entries must be objects")
+            relative = str(row.get("path") or "")
+            candidate = root / relative
+            if candidate.is_symlink() or not candidate.is_file():
+                raise ValueError(f"missing immutable adapter file: {relative}")
+            resolved = candidate.resolve()
+            if resolved.parent != root:
+                raise ValueError(f"adapter file escapes bundle: {relative}")
+            size = resolved.stat().st_size
+            digest = file_sha256(resolved)
+            if size != int(row.get("size_bytes", -1)):
+                raise ValueError(f"adapter file size mismatch: {relative}")
+            if digest != str(row.get("sha256") or "").lower():
+                raise ValueError(f"adapter file SHA-256 mismatch: {relative}")
+            verified.append({
+                "path": relative,
+                "size_bytes": size,
+                "sha256": digest,
+            })
+            lines.append(f"{relative}\0{size}\0{digest}\n")
+        bundle_digest = hashlib.sha256("".join(sorted(lines)).encode("utf-8")).hexdigest()
+        return bundle_digest, tuple(verified)
+
+    spec.enabled = truthy(env_or(
+        "SPIRAL_ACADEMIC_WRITER_ENABLED", "enabled", False))
+    manifest_value = env_or(
+        "SPIRAL_ACADEMIC_WRITER_MANIFEST", "manifest_path",
+        raw.get("manifest", ""))
+    config_dir = Path(config_file).parent if config_file else Path.cwd()
+    manifest_path = resolved_path(manifest_value, relative_to=config_dir)
+    spec.manifest_path = str(manifest_path) if manifest_path else ""
+    if not spec.enabled:
+        return
+    if manifest_path is None or not manifest_path.is_file():
+        spec.error = "enabled academic writer requires a readable manifest_path"
+        return
+
+    try:
+        manifest_bytes = manifest_path.read_bytes()
+        manifest = json.loads(manifest_bytes)
+    except (OSError, ValueError, TypeError) as exc:
+        spec.error = f"invalid academic writer manifest: {type(exc).__name__}"
+        return
+    if not isinstance(manifest, dict):
+        spec.error = "academic writer manifest must be an object"
+        return
+    if manifest.get("schema_version") != ACADEMIC_ADAPTER_SCHEMA:
+        spec.error = f"academic writer manifest schema must be {ACADEMIC_ADAPTER_SCHEMA}"
+        return
+    if manifest.get("prompt_contract") != ACADEMIC_PROMPT_CONTRACT:
+        spec.error = f"academic writer prompt contract must be {ACADEMIC_PROMPT_CONTRACT}"
+        return
+
+    spec.manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+    spec.prompt_contract = str(manifest.get("prompt_contract") or "")
+    runtime = manifest.get("runtime") or {}
+    base_model = manifest.get("base_model") or {}
+    adapter = manifest.get("adapter") or {}
+    training = manifest.get("training") or {}
+    dataset = manifest.get("dataset") or {}
+    if not all(isinstance(value, dict) for value in (
+            runtime, base_model, adapter, training, dataset)):
+        spec.error = "academic writer manifest identity sections must be objects"
+        return
+
+    override_fields = []
+
+    def configured(env: str, key: str, manifest_value="") -> str:
+        value = env_or(env, key, manifest_value)
+        return str(value or "").strip()
+
+    def immutable(env: str, key: str, manifest_value="") -> str:
+        pinned = str(manifest_value or "").strip()
+        requested = configured(env, key, pinned)
+        if requested != pinned:
+            raise ValueError(
+                f"academic writer {key} is manifest-pinned and cannot be overridden")
+        return pinned
+
+    try:
+        spec.profile_id = immutable(
+            "SPIRAL_ACADEMIC_WRITER_PROFILE", "profile_id",
+            manifest.get("profile_id"))
+        spec.runtime_model = immutable(
+            "SPIRAL_ACADEMIC_WRITER_MODEL", "model", runtime.get("model"))
+        spec.provider = immutable(
+            "SPIRAL_ACADEMIC_WRITER_PROVIDER", "provider", runtime.get("provider"))
+        spec.transport_adapter = immutable(
+            "SPIRAL_ACADEMIC_WRITER_TRANSPORT", "transport_adapter",
+            runtime.get("transport_adapter"))
+    except ValueError as exc:
+        spec.error = str(exc)
+        return
+    manifest_base_url = str(runtime.get("base_url") or "").strip()
+    spec.base_url = configured(
+        "SPIRAL_ACADEMIC_WRITER_BASE_URL", "base_url", manifest_base_url)
+    if spec.base_url != manifest_base_url:
+        override_fields.append("base_url")
+    spec.api_key_env = configured(
+        "SPIRAL_ACADEMIC_WRITER_API_KEY_ENV", "api_key_env",
+        runtime.get("api_key_env"))
+    if spec.api_key_env != str(runtime.get("api_key_env") or "").strip():
+        override_fields.append("api_key_env")
+    spec.api_key_required = truthy(raw.get(
+        "api_key_required", runtime.get("api_key_required", bool(spec.api_key_env))))
+    # This multiplies the LoRA contribution around its trained MLX scale. It
+    # never rewrites adapter_config.json: 0.0 selects the base contribution,
+    # 1.0 preserves scale 32, and values above one amplify the learned delta.
+    manifest_adapter_strength = runtime.get(
+        "default_adapter_strength", ACADEMIC_ADAPTER_STRENGTH)
+    configured_adapter_strength = os.environ.get(
+        "SPIRAL_ACADEMIC_WRITER_STRENGTH",
+        raw.get("adapter_strength", manifest_adapter_strength))
+
+    def valid_adapter_strength(value) -> float | None:
+        try:
+            strength = float(value) if not isinstance(value, bool) else float("nan")
+        except (TypeError, ValueError):
+            return None
+        if not ACADEMIC_ADAPTER_STRENGTH_MIN <= strength <= ACADEMIC_ADAPTER_STRENGTH_MAX:
+            return None
+        steps = round(strength / ACADEMIC_ADAPTER_STRENGTH_STEP)
+        canonical = round(steps * ACADEMIC_ADAPTER_STRENGTH_STEP, 10)
+        return canonical if abs(strength - canonical) <= 1e-9 else None
+
+    manifest_default = valid_adapter_strength(manifest_adapter_strength)
+    if manifest_default != ACADEMIC_ADAPTER_STRENGTH:
+        spec.error = "academic writer manifest default adapter strength must be 1.0"
+        return
+    selected_strength = valid_adapter_strength(configured_adapter_strength)
+    if selected_strength is None:
+        spec.error = (
+            "academic writer adapter_strength must be from 0.0 through 2.0 "
+            "in 0.05 steps")
+        return
+    spec.adapter_strength = selected_strength
+    if spec.adapter_strength != manifest_default:
+        override_fields.append("adapter_strength")
+    spec.num_ctx = int(raw.get("num_ctx", runtime.get("num_ctx", 24_576)))
+    spec.think = truthy(raw.get("think", runtime.get("think", False)))
+    spec.base_model_id = str(base_model.get("model_id") or "").strip()
+    spec.base_model_revision = str(base_model.get("revision") or "").strip()
+    spec.base_model_type = str(base_model.get("model_type") or "").strip()
+    spec.base_model_architecture = str(base_model.get("architecture") or "").strip()
+    spec.base_model_config_sha256 = str(
+        base_model.get("config_sha256") or "").strip().lower()
+    spec.base_weight_index_sha256 = str(
+        base_model.get("weight_index_sha256") or "").strip().lower()
+    spec.base_weight_inventory_sha256 = str(
+        base_model.get("weight_inventory_sha256") or "").strip().lower()
+    quantization = base_model.get("quantization") or {}
+    spec.base_model_quantization = (
+        dict(quantization) if isinstance(quantization, dict) else {})
+
+    immutable_identity = {
+        "profile_id": (spec.profile_id, ACADEMIC_PROFILE_ID),
+        "runtime.model": (spec.runtime_model, ACADEMIC_RUNTIME_MODEL),
+        "runtime.provider": (spec.provider, ACADEMIC_PROVIDER),
+        "runtime.transport_adapter": (
+            spec.transport_adapter, ACADEMIC_TRANSPORT_ADAPTER),
+        "base_model.model_id": (spec.base_model_id, ACADEMIC_BASE_MODEL_ID),
+        "base_model.revision": (
+            spec.base_model_revision, ACADEMIC_BASE_MODEL_REVISION),
+        "base_model.model_type": (
+            spec.base_model_type, ACADEMIC_BASE_MODEL_TYPE),
+        "base_model.architecture": (
+            spec.base_model_architecture, ACADEMIC_BASE_MODEL_ARCHITECTURE),
+    }
+    for label, (actual, expected) in immutable_identity.items():
+        if actual != expected:
+            spec.error = f"academic writer {label} must be immutable {expected!r}"
+            return
+    if spec.base_model_quantization != {
+            "bits": 4, "group_size": 64, "mode": "affine"}:
+        spec.error = "academic writer base must be the pinned affine q4/group-64 model"
+        return
+    sha256_re = re.compile(r"^[0-9a-f]{64}$")
+    if not sha256_re.fullmatch(spec.base_model_config_sha256):
+        spec.error = "academic writer base config SHA-256 is missing or malformed"
+        return
+    if not sha256_re.fullmatch(spec.base_weight_index_sha256):
+        spec.error = "academic writer base weight-index SHA-256 is missing or malformed"
+        return
+    if not sha256_re.fullmatch(spec.base_weight_inventory_sha256):
+        spec.error = "academic writer base weight inventory SHA-256 is missing or malformed"
+        return
+    if spec.base_model_config_sha256 != ACADEMIC_BASE_MODEL_CONFIG_SHA256:
+        spec.error = "academic writer base config SHA-256 is not the pinned Qwen3.8 base"
+        return
+    if spec.base_weight_index_sha256 != ACADEMIC_BASE_WEIGHT_INDEX_SHA256:
+        spec.error = "academic writer base weight-index SHA-256 is not the pinned Qwen3.8 base"
+        return
+    if spec.base_weight_inventory_sha256 != ACADEMIC_BASE_WEIGHT_INVENTORY_SHA256:
+        spec.error = "academic writer base weight inventory SHA-256 is not the pinned Qwen3.8 base"
+        return
+    weight_files = base_model.get("weight_files")
+    if not isinstance(weight_files, list) or not weight_files:
+        spec.error = "academic writer base weight inventory is missing"
+        return
+    verified_weight_files = []
+    inventory_lines = []
+    seen_weight_paths = set()
+    for row in weight_files:
+        if not isinstance(row, dict):
+            spec.error = "academic writer base weight inventory entry is malformed"
+            return
+        relative = str(row.get("path") or "")
+        digest = str(row.get("sha256") or "").lower()
+        try:
+            size = int(row.get("size_bytes", -1))
+        except (TypeError, ValueError):
+            size = -1
+        if (not relative or Path(relative).name != relative or relative in seen_weight_paths
+                or size <= 0 or not sha256_re.fullmatch(digest)):
+            spec.error = "academic writer base weight inventory entry is malformed"
+            return
+        seen_weight_paths.add(relative)
+        verified_weight_files.append({
+            "path": relative, "size_bytes": size, "sha256": digest})
+        inventory_lines.append(f"{relative}\0{size}\0{digest}\n")
+    actual_inventory_sha = hashlib.sha256(
+        "".join(sorted(inventory_lines)).encode("utf-8")).hexdigest()
+    if actual_inventory_sha != spec.base_weight_inventory_sha256:
+        spec.error = "academic writer base weight inventory digest is inconsistent"
+        return
+    if tuple(verified_weight_files) != ACADEMIC_BASE_WEIGHT_FILES:
+        spec.error = "academic writer base weight shards are not the pinned Qwen3.8 inventory"
+        return
+    spec.base_weight_files = tuple(verified_weight_files)
+
+    adapter_value = env_or(
+        "SPIRAL_ACADEMIC_WRITER_ADAPTER", "adapter_path", adapter.get("path"))
+    if str(adapter_value or "").strip() != str(adapter.get("path") or "").strip():
+        override_fields.append("adapter_path")
+    adapter_path = resolved_path(adapter_value, relative_to=manifest_path.parent)
+    spec.adapter_path = str(adapter_path) if adapter_path else ""
+    spec.adapter_format = str(adapter.get("format") or "").strip()
+    spec.adapter_sha256 = str(adapter.get("sha256") or "").strip().lower()
+    if spec.adapter_format != ACADEMIC_ADAPTER_FORMAT:
+        spec.error = f"academic writer adapter format must be {ACADEMIC_ADAPTER_FORMAT}"
+        return
+    if adapter.get("sha256_semantics") != ACADEMIC_ADAPTER_SHA256_SEMANTICS:
+        spec.error = "academic writer adapter has unsupported SHA-256 semantics"
+        return
+    if adapter_path is None or not adapter_path.exists():
+        spec.error = "academic writer adapter path is missing"
+        return
+    try:
+        if not adapter_path.is_dir():
+            raise ValueError("MLX-LM adapter path must be an authenticated bundle directory")
+        actual_adapter_sha, required_files = adapter_bundle_sha256(
+            adapter_path, adapter.get("required_files"))
+        spec.adapter_required_files = required_files
+    except (OSError, TypeError, ValueError) as exc:
+        spec.error = f"invalid academic writer adapter bundle: {exc}"
+        return
+    if not spec.adapter_sha256 or actual_adapter_sha != spec.adapter_sha256:
+        spec.error = "academic writer adapter SHA-256 does not match the manifest"
+        return
+
+    corpus_value = env_or(
+        "SPIRAL_ACADEMIC_WRITER_CORPUS_MANIFEST", "corpus_manifest_path",
+        raw.get("corpus_manifest", training.get("corpus_manifest_path", "")))
+    corpus_path = resolved_path(corpus_value, relative_to=manifest_path.parent)
+    spec.corpus_manifest_path = str(corpus_path) if corpus_path else ""
+    if corpus_path is None or not corpus_path.is_file():
+        spec.error = "academic writer requires its exact corpus_manifest_path"
+        return
+    try:
+        corpus_bytes = corpus_path.read_bytes()
+        corpus_manifest = json.loads(corpus_bytes)
+    except (OSError, ValueError, TypeError) as exc:
+        spec.error = f"invalid academic corpus manifest: {type(exc).__name__}"
+        return
+    if not isinstance(corpus_manifest, dict) or (
+            corpus_manifest.get("schema_version", corpus_manifest.get("schema"))
+            != ACADEMIC_CORPUS_SCHEMA):
+        spec.error = f"academic corpus manifest schema must be {ACADEMIC_CORPUS_SCHEMA}"
+        return
+    spec.corpus_manifest_sha256 = hashlib.sha256(corpus_bytes).hexdigest()
+    expected_corpus_sha = str(training.get("corpus_manifest_sha256") or "").lower()
+    if not expected_corpus_sha or spec.corpus_manifest_sha256 != expected_corpus_sha:
+        spec.error = "academic corpus manifest SHA-256 does not match training identity"
+        return
+    strata = tuple(sorted(str(value) for value in corpus_manifest.get("source_strata") or []))
+    required_strata = tuple(sorted(ACADEMIC_SOURCE_STRATA))
+    spec.source_strata = strata
+    if strata != required_strata:
+        spec.error = (
+            "academic corpus source_strata must be exactly "
+            + ", ".join(required_strata))
+        return
+    if corpus_manifest.get("corpus_schema_version") != ACADEMIC_PROMPT_CONTRACT:
+        spec.error = "academic corpus examples do not match the plan-prose prompt contract"
+        return
+    if corpus_manifest.get("trainable") is not True:
+        spec.error = "academic corpus manifest is not marked trainable"
+        return
+    if corpus_manifest.get("non_trainable_reasons") not in ([], None):
+        spec.error = "academic corpus manifest has unresolved trainability failures"
+        return
+
+    def positive_int(value) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+    try:
+        corpus_cutoff = date.fromisoformat(str(corpus_manifest.get("cutoff") or ""))
+    except ValueError:
+        spec.error = "academic corpus cutoff must be an ISO date"
+        return
+    if corpus_cutoff > date(2021, 12, 31):
+        spec.error = "academic corpus cutoff must not be later than 2021-12-31"
+        return
+    if corpus_manifest.get("split_policy") != ACADEMIC_AUTHOR_SAFE_SPLIT_POLICY:
+        spec.error = "academic corpus must use the pinned author-safe split policy"
+        return
+    split_diagnostics = corpus_manifest.get("split_diagnostics")
+    component_splits = (
+        split_diagnostics.get("component_counts_by_split")
+        if isinstance(split_diagnostics, dict) else None)
+    if (not isinstance(split_diagnostics, dict)
+            or not positive_int(split_diagnostics.get("components"))
+            or not isinstance(component_splits, dict)
+            or set(component_splits) != {"train", "validation", "test"}
+            or not all(positive_int(component_splits.get(name))
+                       for name in ("train", "validation", "test"))):
+        spec.error = "academic corpus lacks author-component split diagnostics"
+        return
+    counts = corpus_manifest.get("counts")
+    if not isinstance(counts, dict):
+        spec.error = "academic corpus manifest counts are missing"
+        return
+
+    expected_corpus_splits = ("train", "validation", "test")
+    by_split = counts.get("by_split")
+    if (not isinstance(by_split, dict)
+            or set(by_split) != set(expected_corpus_splits)
+            or not all(positive_int(by_split.get(name)) for name in expected_corpus_splits)):
+        spec.error = "academic corpus requires positive train/validation/test counts"
+        return
+    task_counts = counts.get("by_task_type")
+    if (not isinstance(task_counts, dict)
+            or set(task_counts) != {"sentence", "paragraph"}
+            or not all(positive_int(task_counts.get(name))
+                       for name in ("sentence", "paragraph"))):
+        spec.error = "academic corpus must contain only sentence and paragraph tasks"
+        return
+    expected_stratum_splits = {
+        f"{stratum}|{split}"
+        for stratum in required_strata
+        for split in expected_corpus_splits
+    }
+    for field_name in ("documents_by_stratum_split", "examples_by_stratum_split"):
+        coverage = counts.get(field_name)
+        if (not isinstance(coverage, dict)
+                or set(coverage) != expected_stratum_splits
+                or not all(positive_int(coverage.get(key))
+                           for key in expected_stratum_splits)):
+            spec.error = (
+                "academic corpus requires every source stratum in every author-safe split")
+            return
+    feasibility = corpus_manifest.get("task_feasibility")
+    if not isinstance(feasibility, dict) or set(feasibility) != {"sentence", "paragraph"}:
+        spec.error = "academic corpus task feasibility exceeds plan-prose v1"
+        return
+
+    dataset_value = env_or(
+        "SPIRAL_ACADEMIC_WRITER_DATASET_MANIFEST", "dataset_manifest_path",
+        raw.get("dataset_manifest", dataset.get("dataset_manifest_path", "")))
+    dataset_path = resolved_path(dataset_value, relative_to=manifest_path.parent)
+    spec.dataset_manifest_path = str(dataset_path) if dataset_path else ""
+    if dataset_path is None or not dataset_path.is_file():
+        spec.error = "academic writer requires its exact dataset_manifest_path"
+        return
+    try:
+        dataset_bytes = dataset_path.read_bytes()
+        dataset_manifest = json.loads(dataset_bytes)
+    except (OSError, ValueError, TypeError) as exc:
+        spec.error = f"invalid academic dataset manifest: {type(exc).__name__}"
+        return
+    if not isinstance(dataset_manifest, dict) or (
+            dataset_manifest.get("schema_version") != ACADEMIC_DATASET_SCHEMA):
+        spec.error = f"academic dataset manifest schema must be {ACADEMIC_DATASET_SCHEMA}"
+        return
+    if dataset_manifest.get("prompt_contract") != ACADEMIC_PROMPT_CONTRACT:
+        spec.error = "academic dataset prompt contract does not match the adapter"
+        return
+    if dataset_manifest.get("completion_only_loss") is not True:
+        spec.error = "academic dataset does not guarantee completion-only training"
+        return
+    if training.get("completion_only_loss") is not True:
+        spec.error = "academic adapter training does not agree on completion-only loss"
+        return
+    if dataset_manifest.get("format") != "mlx_lm.completions":
+        spec.error = "academic dataset must use the MLX completion-only format"
+        return
+    spec.dataset_manifest_sha256 = hashlib.sha256(dataset_bytes).hexdigest()
+    expected_dataset_sha = str(dataset.get("manifest_sha256") or "").lower()
+    if not expected_dataset_sha or spec.dataset_manifest_sha256 != expected_dataset_sha:
+        spec.error = "academic dataset manifest SHA-256 does not match adapter identity"
+        return
+    spec.source_corpus_sha256 = str(dataset.get("source_corpus_sha256") or "").lower()
+    if (not spec.source_corpus_sha256 or spec.source_corpus_sha256
+            != str(dataset_manifest.get("source_corpus_sha256") or "").lower()):
+        spec.error = "academic source-corpus canonical digest does not match dataset identity"
+        return
+    spec.source_corpus_file_sha256 = str(
+        dataset.get("source_corpus_file_sha256") or "").lower()
+    if (not spec.source_corpus_file_sha256 or spec.source_corpus_file_sha256
+            != str(corpus_manifest.get("corpus_sha256") or "").lower()):
+        spec.error = "academic source-corpus file digest does not match corpus manifest"
+        return
+    if str(dataset_manifest.get("source_corpus_file_sha256") or "").lower() != (
+            spec.source_corpus_file_sha256):
+        spec.error = "academic dataset source-corpus bytes do not match adapter identity"
+        return
+    if str(dataset_manifest.get("source_corpus_manifest_sha256") or "").lower() != (
+            spec.corpus_manifest_sha256):
+        spec.error = "academic dataset corpus-manifest identity does not match training"
+        return
+    dataset_corpus_manifest = resolved_path(
+        dataset_manifest.get("source_corpus_manifest"), relative_to=dataset_path.parent)
+    if dataset_corpus_manifest != corpus_path:
+        spec.error = "academic dataset points at a different corpus manifest"
+        return
+    source_path = resolved_path(
+        dataset_manifest.get("source_corpus"), relative_to=dataset_path.parent)
+    spec.source_corpus_path = str(source_path) if source_path else ""
+    if source_path is None or not source_path.is_file():
+        spec.error = "academic source corpus is missing"
+        return
+    if file_sha256(source_path) != spec.source_corpus_file_sha256:
+        spec.error = "academic source corpus changed after its adapter was trained"
+        return
+    if str(corpus_manifest.get("output_filename") or "") != source_path.name:
+        spec.error = "academic corpus manifest does not identify the trained source corpus"
+        return
+    prepared_splits = dataset_manifest.get("splits")
+    expected_prepared_splits = ("train", "valid", "test")
+    if not isinstance(prepared_splits, dict) or set(prepared_splits) != set(
+            expected_prepared_splits):
+        spec.error = "academic dataset requires exact train/valid/test splits"
+        return
+    seen_task_types = set()
+    for split_name in expected_prepared_splits:
+        split = prepared_splits.get(split_name)
+        if not isinstance(split, dict) or not positive_int(split.get("count")):
+            spec.error = f"academic dataset {split_name} split must be nonempty"
+            return
+        split_count = split["count"]
+        split_strata = split.get("source_strata")
+        if (not isinstance(split_strata, dict)
+                or set(split_strata) != set(required_strata)
+                or not all(positive_int(split_strata.get(name))
+                           for name in required_strata)
+                or sum(split_strata.values()) != split_count):
+            spec.error = (
+                f"academic dataset {split_name} must contain all three exact source strata")
+            return
+        split_tasks = split.get("task_types")
+        if (not isinstance(split_tasks, dict) or not split_tasks
+                or not set(split_tasks).issubset({"sentence", "paragraph"})
+                or not all(positive_int(value) for value in split_tasks.values())
+                or sum(split_tasks.values()) != split_count):
+            spec.error = (
+                f"academic dataset {split_name} exceeds sentence/paragraph plan-prose tasks")
+            return
+        seen_task_types.update(split_tasks)
+    if seen_task_types != {"sentence", "paragraph"}:
+        spec.error = "academic dataset must preserve both sentence and paragraph tasks"
+        return
+
+    if not all((spec.profile_id, spec.runtime_model, spec.provider, spec.base_url,
+                spec.base_model_id, spec.base_model_revision, spec.base_model_type,
+                spec.base_model_architecture, spec.base_model_config_sha256,
+                spec.base_weight_index_sha256,
+                spec.base_weight_inventory_sha256, spec.adapter_format)):
+        spec.error = "academic writer manifest has incomplete model/provider identity"
+        return
+    if spec.transport_adapter != ACADEMIC_TRANSPORT_ADAPTER:
+        spec.error = "only the explicit openai-compatible academic transport is supported"
+        return
+    expected_route_name = f"academic-writer::{spec.profile_id}"
+    route_name = configured(
+        "SPIRAL_ACADEMIC_WRITER_ROUTE_NAME", "route_name", expected_route_name)
+    if route_name != expected_route_name:
+        spec.error = "academic writer route_name is identity-pinned and cannot be overridden"
+        return
+    if route_name in {
+            cfg.worker.name, cfg.planner.name, cfg.escalation.name,
+            cfg.critic.name, cfg.research_auditor.name, cfg.janitor.name}:
+        spec.error = "academic writer route_name must not collide with an orchestration role"
+        return
+    spec.name = route_name
+    spec.overrides = tuple(sorted(set(override_fields)))
+
+    spec.runtime_identity = {
+        "schema_version": ACADEMIC_RUNTIME_IDENTITY_SCHEMA,
+        "manifest_sha256": spec.manifest_sha256,
+        "adapter_tree_sha256": spec.adapter_sha256,
+        "base_model_id": spec.base_model_id,
+        "base_model_revision": spec.base_model_revision,
+        "base_weight_inventory_sha256": spec.base_weight_inventory_sha256,
+        "profile_id": spec.profile_id,
+        "provider": spec.provider,
+        "model": spec.runtime_model,
+        "transport_adapter": spec.transport_adapter,
+        "adapter_strength_supported": True,
+        "adapter_strength_min": ACADEMIC_ADAPTER_STRENGTH_MIN,
+        "adapter_strength_max": ACADEMIC_ADAPTER_STRENGTH_MAX,
+        "adapter_strength_step": ACADEMIC_ADAPTER_STRENGTH_STEP,
+        "adapter_strength_default": ACADEMIC_ADAPTER_STRENGTH,
+        "server_contract": ACADEMIC_SERVER_CONTRACT,
+        "weight_residency": ACADEMIC_WEIGHT_RESIDENCY,
+        "compute_lease": ACADEMIC_COMPUTE_LEASE,
+        "ollama_admission": ACADEMIC_OLLAMA_ADMISSION,
+        "unload_boundary": ACADEMIC_UNLOAD_BOUNDARY,
+    }
+
+    providers = dict(cfg.providers) if isinstance(cfg.providers, dict) else {}
+    provider_entry = {
+        "base_url": spec.base_url,
+        "model": spec.runtime_model,
+        "provider": spec.provider,
+        "transport_adapter": spec.transport_adapter,
+        "adapter_strength": spec.adapter_strength,
+        "api_key_env": spec.api_key_env,
+        "api_key_required": spec.api_key_required,
+        "academic_profile_id": spec.profile_id,
+        "academic_manifest_sha256": spec.manifest_sha256,
+        "academic_adapter_sha256": spec.adapter_sha256,
+        "academic_corpus_manifest_sha256": spec.corpus_manifest_sha256,
+        "academic_dataset_manifest_sha256": spec.dataset_manifest_sha256,
+        "academic_source_corpus_sha256": spec.source_corpus_sha256,
+        "academic_source_corpus_file_sha256": spec.source_corpus_file_sha256,
+        "required_runtime_identity": dict(spec.runtime_identity),
+        "academic_writer_only": True,
+    }
+    existing = providers.get(route_name)
+    if existing is not None and existing != provider_entry:
+        spec.error = "academic writer route_name already maps to a different provider identity"
+        return
+    providers[route_name] = provider_entry
+    cfg.providers = providers
+    spec.ready = True
+
+
 @dataclass
 class Config:
     # backend seam — local-first. "ollama" today; another provider could slot in.
@@ -73,6 +830,12 @@ class Config:
     research_auditor: ModelSpec = field(
         default_factory=lambda: ModelSpec("qwen3.8:27b", num_ctx=16384, think=True)
     )
+    # Optional publication-only route. It never participates in planning, tools,
+    # Builder, or judging, and remains inert until an authenticated manifest plus an
+    # explicit serving endpoint are configured.
+    academic_writer: AcademicWriterSpec = field(
+        default_factory=lambda: AcademicWriterSpec("", num_ctx=24576, think=False)
+    )
 
     # The abliterated seat, used only when a run asks for it with --uncensored.
     # Never a default: refusal removal costs some instruction-following precision,
@@ -85,7 +848,7 @@ class Config:
         model wherever it's used (worker vs escalation lanes)."""
         for spec in (
             self.worker, self.escalation, self.planner, self.critic,
-            self.research_auditor, self.janitor,
+            self.research_auditor, self.academic_writer, self.janitor,
         ):
             if spec.name == model_name:
                 return spec
@@ -245,10 +1008,14 @@ class Config:
 
           env:   SPIRAL_WORKER / SPIRAL_PLANNER / SPIRAL_ESCALATION /
                  SPIRAL_CRITIC / SPIRAL_JANITOR / SPIRAL_BASE_URL
+                 SPIRAL_ACADEMIC_WRITER_ENABLED / SPIRAL_ACADEMIC_WRITER_MANIFEST /
+                 SPIRAL_ACADEMIC_WRITER_BASE_URL
           file:  ~/.config/spiral/config.json →
                  {"models": {"worker": "...", ...}, "num_ctx": {...}, "hooks": {...}}
         """
         cfg = cls()
+        overlay = {}
+        config_file = None
         try:
             import json
             import os
@@ -263,8 +1030,8 @@ class Config:
                 "janitor": cfg.janitor,
             }
 
-            f = Path.home() / ".config" / "spiral" / "config.json"
-            overlay = json.loads(f.read_text()) if f.is_file() else {}
+            config_file = Path.home() / ".config" / "spiral" / "config.json"
+            overlay = json.loads(config_file.read_text()) if config_file.is_file() else {}
             for role, name in overlay.get("models", {}).items():
                 if role in roles:
                     roles[role].name = str(name)
@@ -453,6 +1220,15 @@ class Config:
             cfg.providers = overlay.get("providers", cfg.providers)
         except Exception:
             pass  # a broken overlay must never break spiral
+        # Academic serving is a separate, fail-closed route: an invalid or incomplete
+        # manifest disables only that optional writer and leaves the established writer
+        # untouched. The resolver performs no model or network access.
+        try:
+            _academic_writer_config(cfg, overlay, config_file)
+        except Exception as exc:
+            cfg.academic_writer.ready = False
+            cfg.academic_writer.error = (
+                f"academic writer configuration failed: {type(exc).__name__}")
         # This safety policy deliberately runs *after* the broad compatibility
         # catch. A malformed config must fall back to one resident local model,
         # not silently restore the historical qwen+gemma+llama RAM pile-up.

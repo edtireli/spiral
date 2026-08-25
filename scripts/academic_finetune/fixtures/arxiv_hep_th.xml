@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"
+      xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/"
+      xmlns:arxiv="http://arxiv.org/schemas/atom">
+  <opensearch:totalResults>3</opensearch:totalResults>
+  <opensearch:startIndex>0</opensearch:startIndex>
+  <entry>
+    <id>https://arxiv.org/abs/2101.00001v2</id>
+    <updated>2021-11-03T09:00:00Z</updated>
+    <published>2021-01-02T09:00:00Z</published>
+    <title>A controlled argument about quantum geometry</title>
+    <summary>We show that a constrained geometric construction preserves the relevant boundary symmetry while avoiding an additional dynamical assumption. However, the approximation remains reliable only when the curvature scale is parametrically larger than the microscopic cutoff.</summary>
+    <author><name>Ada Example</name></author>
+    <author><name>Theodore Shared</name></author>
+    <category term="hep-th"/>
+    <arxiv:license>http://arxiv.org/licenses/nonexclusive-distrib/1.0/</arxiv:license>
+  </entry>
+  <entry>
+    <id>https://arxiv.org/abs/1911.00004v1</id>
+    <updated>2019-11-07T09:00:00Z</updated>
+    <published>2019-11-07T09:00:00Z</published>
+    <title>Conditional consistency of an effective description</title>
+    <summary>The effective description reproduces the expected infrared response under the stated hierarchy of scales. This agreement does not determine the ultraviolet completion, but it supplies a controlled consistency check.</summary>
+    <author><name>Helena Independent</name></author>
+    <category term="hep-th"/>
+  </entry>
+  <entry>
+    <id>https://arxiv.org/abs/2102.00002v3</id>
+    <updated>2022-01-01T00:00:01Z</updated>
+    <published>2021-02-02T09:00:00Z</published>
+    <title>A post-cutoff revision that must be excluded</title>
+    <summary>This otherwise plausible abstract was revised after the frozen knowledge cutoff and must therefore never enter the training corpus.</summary>
+    <author><name>Future Author</name></author>
+    <category term="hep-th"/>
+  </entry>
+</feed>

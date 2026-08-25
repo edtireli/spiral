@@ -43,6 +43,7 @@ from pathlib import Path
 # proof or numeric certificate is the bar; see _qualifying_strengths().
 _QUALIFYING_MATH = frozenset({"formal", "exact", "computational"})
 _QUALIFYING_EMPIRICAL = frozenset({"grounded"})
+_ACADEMIC_WRITER_MAX_PREDICT = 8_192
 
 
 @dataclass
@@ -617,6 +618,38 @@ class ResearchLoop:
         except Exception:
             pass
 
+    def _model_route_identity(self, model: str, role: str) -> dict:
+        """Record the exact endpoint/model adapter selected for a public call."""
+
+        providers = getattr(self.ol, "providers", {}) or {}
+        provider = providers.get(model) if isinstance(providers, dict) else None
+        if isinstance(provider, dict):
+            identity = {
+                "route_model": model,
+                "runtime_model": str(provider.get("model") or model),
+                "provider": str(provider.get("provider") or "openai-compatible"),
+                "base_url": str(provider.get("base_url") or "").rstrip("/"),
+                "transport_adapter": str(
+                    provider.get("transport_adapter") or "openai-compatible"),
+                "api_key_env": str(provider.get("api_key_env") or ""),
+                "api_key_required": bool(provider.get("api_key_required", True)),
+            }
+        else:
+            identity = {
+                "route_model": model,
+                "runtime_model": model,
+                "provider": "ollama",
+                "base_url": str(getattr(self.ol, "base_url", self.cfg.base_url)).rstrip("/"),
+                "transport_adapter": "ollama-chat",
+                "api_key_env": "",
+                "api_key_required": False,
+            }
+        if role == "academic_writer":
+            spec = getattr(self.cfg, "academic_writer", None)
+            if spec is not None and hasattr(spec, "identity"):
+                identity["academic_writer"] = spec.identity()
+        return identity
+
     def _audit_model_call(self, *, model: str, role: str, variant: str,
                           system: str, user: str, result=None, error: str = "",
                           reasoning_requested: bool = False) -> None:
@@ -630,6 +663,7 @@ class ResearchLoop:
             "model": model,
             "role": role,
             "variant": variant,
+            "route_identity": self._model_route_identity(model, role),
             "system_sha256": hashlib.sha256(system.encode("utf-8", "ignore")).hexdigest(),
             "user_sha256": hashlib.sha256(user.encode("utf-8", "ignore")).hexdigest(),
             "system_chars": len(system),
@@ -1009,12 +1043,13 @@ class ResearchLoop:
     def _think(self, system: str, user: str, think: bool | None = None, *, role: str = "planner",
                fmt=None, max_chars: int = 18_000, temperature: float = 0.4,
                num_predict: int | None = None,
-               context_limit: int | None = None) -> tuple[str, int]:
+               context_limit: int | None = None,
+               allow_provider_fallback: bool = True) -> tuple[str, int]:
         spec = getattr(self.cfg, role, self.cfg.planner)
         think = spec.think if think is None else think
         selected_ctx = min(spec.num_ctx, context_limit) if context_limit else spec.num_ctx
         attempts = [(spec.name, selected_ctx, role)]
-        if spec.name in getattr(self.ol, "providers", {}):
+        if allow_provider_fallback and spec.name in getattr(self.ol, "providers", {}):
             try:
                 from spiral.config import Config
                 fallback = Config().planner
@@ -1074,6 +1109,134 @@ class ResearchLoop:
                 last = f"{label}:{model} returned no text ({self._model_error(res)})"
                 self._say(f"  model · {last}")
         raise ResearchModelError(last or "reasoning backend returned no text")
+
+    def _synthesize_prose(
+        self, system: str, user: str, *, phase: str, fallback_role: str,
+        think: bool | None = None, max_chars: int = 18_000,
+        temperature: float = 0.4, num_predict: int | None = None,
+        context_limit: int | None = None,
+    ) -> tuple[str, int]:
+        """Use the academic adapter for finished-paper content prose at full strength.
+
+        Section drafting and semantic body revisions are composed from sentence/paragraph
+        units, so they use the prose adapter. Planning, structured judging, deterministic
+        layout repair, LaTeX-compilation-only repair, tools, and Builder work remain on
+        their established roles. Unsupported phases stay there even if a future caller
+        reaches this seam.
+        A failed academic attempt is audited under its exact identity, announced, and
+        then handed to the caller's established writer role.  The provider adapter's
+        generic local fallback is deliberately disabled for the academic attempt so a
+        model/endpoint swap cannot be mistaken for a successful specialized write.
+        """
+
+        supported_phases = {"abstract", "body-coherence-revision"}
+        supported_prefixes = (
+            "section-draft:",
+            "referee-revision:",
+            "strong-referee-revision:",
+            "citation-support-revision:",
+            "evidence-regression-revision:",
+            "claim-scope-revision:",
+            "citation-regression-revision:",
+            "final-referee-revision:",
+            "abstract-scope-repair:",
+        )
+        phase_supported = (
+            phase in supported_phases
+            or any(phase.startswith(prefix) for prefix in supported_prefixes))
+        uncensored_active = str(os.environ.get(
+            "SPIRAL_UNCENSORED_ACTIVE", "")).strip().lower() in {
+                "1", "true", "yes", "on",
+            }
+        if not phase_supported or uncensored_active:
+            return self._think(
+                system, user, think=think, role=fallback_role,
+                max_chars=max_chars, temperature=temperature,
+                num_predict=num_predict, context_limit=context_limit,
+            )
+
+        spec = getattr(self.cfg, "academic_writer", None)
+        reason = ""
+        if spec is not None and getattr(spec, "enabled", False):
+            if not getattr(spec, "ready", False):
+                reason = str(getattr(spec, "error", "") or "route is not ready")
+            else:
+                provider = (getattr(self.ol, "providers", {}) or {}).get(spec.name)
+                expected = {
+                    "base_url": str(spec.base_url).rstrip("/"),
+                    "model": spec.runtime_model,
+                    "provider": spec.provider,
+                    "transport_adapter": spec.transport_adapter,
+                    "adapter_strength": spec.adapter_strength,
+                    "academic_manifest_sha256": spec.manifest_sha256,
+                    "academic_adapter_sha256": spec.adapter_sha256,
+                    "academic_corpus_manifest_sha256": spec.corpus_manifest_sha256,
+                    "academic_dataset_manifest_sha256": spec.dataset_manifest_sha256,
+                    "academic_source_corpus_sha256": spec.source_corpus_sha256,
+                    "academic_source_corpus_file_sha256": (
+                        spec.source_corpus_file_sha256),
+                    "required_runtime_identity": dict(spec.runtime_identity),
+                }
+                def provider_matches(key: str, value) -> bool:
+                    observed = provider.get(key) if isinstance(provider, dict) else None
+                    if key == "base_url":
+                        return str(observed or "").rstrip("/") == str(value or "").rstrip("/")
+                    return observed == value
+
+                if not isinstance(provider, dict) or any(
+                    not provider_matches(key, value)
+                    for key, value in expected.items()
+                ):
+                    reason = "runtime provider identity does not match the academic manifest"
+                else:
+                    try:
+                        evict_owned = getattr(
+                            self.ol, "evict_owned_local_models_except", None)
+                        if not callable(evict_owned):
+                            raise ResearchModelError(
+                                "runtime cannot release run-owned local model receipts")
+                        try:
+                            evict_owned(
+                                set(),
+                                log=lambda name: self._say(
+                                    f"  model · unloaded {name} before academic prose inference"),
+                                strict=True,
+                            )
+                        except Exception as exc:
+                            raise ResearchModelError(
+                                "could not release run-owned local model receipts: "
+                                f"{type(exc).__name__}") from exc
+                        return self._think(
+                            system, user, think=think, role="academic_writer",
+                            max_chars=max_chars, temperature=temperature,
+                            # The authenticated MLX prose service deliberately caps one
+                            # completion at 8192 tokens. Planner defaults may be larger;
+                            # clamp this route explicitly so paper sections and abstracts
+                            # do not receive HTTP 400 and silently fall back to Ollama.
+                            num_predict=min(
+                                num_predict or self.cfg.planner_max_tokens,
+                                _ACADEMIC_WRITER_MAX_PREDICT,
+                            ),
+                            context_limit=context_limit,
+                            allow_provider_fallback=False,
+                        )
+                    except ResearchModelError as exc:
+                        reason = str(exc)
+            self._say(
+                f"  model · academic writer unavailable during {phase}; "
+                f"using existing {fallback_role} writer ({reason[:140]})")
+            self._log_thought(
+                "academic-writer-fallback",
+                f"{phase}: {reason[:500]}",
+                fallback_role=fallback_role,
+                academic_writer=(
+                    spec.identity() if hasattr(spec, "identity") else {}),
+            )
+        return self._think(
+            system, user, think=think, role=fallback_role,
+            max_chars=max_chars, temperature=temperature,
+            num_predict=num_predict, context_limit=context_limit,
+        )
 
     def _think_json(self, system: str, user: str, *, role: str = "critic",
                     max_chars: int = 12_000, required: tuple[str, ...] = (),
@@ -4421,6 +4584,41 @@ class ResearchLoop:
         blueprint_md = blueprint_markdown(blueprint)
         style_guide = corpus_style_guide(papers)
         out.mkdir(parents=True, exist_ok=True)
+        writer_spec = getattr(self.cfg, "academic_writer", None)
+        writer_identity = (
+            writer_spec.identity() if writer_spec is not None
+            and hasattr(writer_spec, "identity") else {
+                "enabled": False, "ready": False,
+            })
+        uncensored_writer_active = str(os.environ.get(
+            "SPIRAL_UNCENSORED_ACTIVE", "")).strip().lower() in {
+                "1", "true", "yes", "on",
+            }
+        (out / "academic-writer-route.json").write_text(_json.dumps({
+            "schema_version": "spiral.academic-writer-route-receipt.v1",
+            "configured_selection": (
+                "explicit_uncensored_writer" if uncensored_writer_active
+                else "academic_paper_prose_writer" if writer_identity.get("ready")
+                else "existing_writer"),
+            "explicit_uncensored_bypass": uncensored_writer_active,
+            "identity": writer_identity,
+            "allowed_scope": [
+                "research-paper section drafts",
+                "semantic full-body prose revisions",
+                "citation and claim-scope prose revisions",
+                "research-paper abstract",
+                "abstract claim-scope repair",
+            ],
+            "excluded_scope": [
+                "planning and outlines", "structured JSON/referee audits",
+                "deterministic layout-only repair", "LaTeX compile-only repair",
+                "tools", "builder", "all prose while explicit uncensored mode is active",
+            ],
+            "fallback": (
+                "each call atomically returns to its explicit existing worker/planner role; "
+                "the academic provider cannot invoke a hidden local fallback"),
+            "runtime_attempts": "see model-calls.jsonl and thoughts.jsonl",
+        }, indent=2, ensure_ascii=False), encoding="utf-8")
         paper_obligation_id = self.obligations.ensure(
             "artifact", "Publication-grade paper and reproducibility bundle",
             node_id="artifact:paper", stage="publication", required=True,
@@ -4551,13 +4749,16 @@ class ResearchLoop:
                          f"QUESTION: {self.state.question}\nVERIFIED:\n{findings_txt}\n\n"
                          f"CORPUS STYLE GUIDE:\n{style_guide}\n\nWRITING BLUEPRINT:\n{model_blueprint_txt}\n\n"
                          f"CORPUS:\n{corpus_digest}")
-                part, _ = self._think(s_sys, s_usr, think=False, role="worker")
+                part, _ = self._synthesize_prose(
+                    s_sys, s_usr, think=False,
+                    phase=f"section-draft:{s.get('name', 'Section')}",
+                    fallback_role="worker")
                 parts.append(normalise_section_fragment(part, s.get("name", "Section")))
                 self._say(f"  draft · {s.get('name','section')}")
             body = "\n\n".join(parts)
 
             # 3. REVISE the assembled draft into one coherent paper
-            body, _ = self._think(
+            body, _ = self._synthesize_prose(
                 "Revise this assembled LaTeX body into ONE coherent paper: cut cross-section "
                 "repetition, fix transitions and notation consistency, keep every \\cite and "
                 "equation, follow the CORPUS STYLE GUIDE and WRITING BLUEPRINT, and ensure "
@@ -4565,7 +4766,8 @@ class ResearchLoop:
                 "and its order in the selected corpus-shaped outline contract. "
                 "Delete duplicated derivations and unsupported extrapolations. Return the full revised LaTeX body only.",
                 f"CORPUS STYLE GUIDE:\n{style_guide}\n\nWRITING BLUEPRINT:\n{model_blueprint_txt}\n\nBODY:\n{body[:body_prompt_chars]}",
-                think=revision_think, role="planner", num_predict=revision_tokens)
+                think=revision_think, phase="body-coherence-revision",
+                fallback_role="planner", num_predict=revision_tokens)
             body = strip_latex_wrappers(body)
             self._say("  revise · coherence pass")
 
@@ -4697,13 +4899,15 @@ class ResearchLoop:
                 break
             if referee_round == 2:
                 break
-            body, _ = self._think(
+            body, _ = self._synthesize_prose(
                 "Revise the LaTeX body according to the referee issues. Preserve valid citations "
                 "and equations; do not invent stronger results than the VERIFIED block supports. "
                 f"Maintain at least {min_paper_words} substantive words without filler. "
                 "Return the full revised LaTeX body only.",
                 f"REFEREE:\n{json.dumps(qa)[:1600]}\n\nWRITING BLUEPRINT:\n{model_blueprint_txt}\n\nBODY:\n{body[:body_prompt_chars]}",
-                think=revision_think, role="planner", num_predict=revision_tokens)
+                think=revision_think,
+                phase=f"referee-revision:{referee_round}",
+                fallback_role="planner", num_predict=revision_tokens)
             body = strip_latex_wrappers(body)
             post_fast_issues = audit_body(
                 body, papers, confirmed, blueprint=blueprint, min_words=min_paper_words)
@@ -4741,7 +4945,7 @@ class ResearchLoop:
                 break
             if strong_round == 2:
                 break
-            body, _ = self._think(
+            body, _ = self._synthesize_prose(
                 "Repair the full LaTeX body according to the strong referee. Preserve the exact "
                 "corpus-shaped section contract, valid \\cite{arXiv:ID} citations, equations, and evidence scope. "
                 "Use corpus citations only for background/method lineage, never as the proof of the "
@@ -4751,7 +4955,9 @@ class ResearchLoop:
                 "Do not add an Appendix or literal [n] citations. Return the full body only.",
                 f"STRONG REFEREE:\n{json.dumps(qa)[:2200]}\n\nVERIFIED:\n{findings_txt}\n\n"
                 f"BODY:\n{body[:body_prompt_chars]}",
-                think=revision_think, role="planner", num_predict=revision_tokens)
+                think=revision_think,
+                phase=f"strong-referee-revision:{strong_round}",
+                fallback_role="planner", num_predict=revision_tokens)
             body = strip_latex_wrappers(body)
             strong_det_issues = audit_body(
                 body, papers, confirmed, blueprint=blueprint, min_words=min_paper_words)
@@ -4893,7 +5099,7 @@ class ResearchLoop:
                 "citation_issues": list(citation_issues),
                 "deterministic_issues": list(final_issues),
             })
-            body, _ = self._think(
+            body, _ = self._synthesize_prose(
                 "Jointly repair this paper's citation and deterministic issues. Retain at least one "
                 "held-corpus citation for a genuine background or method-lineage statement, because "
                 "the corpus is part of this note. Every retained citation context must be directly "
@@ -4906,7 +5112,9 @@ class ResearchLoop:
                 + "\n".join(f"- {i}" for i in final_issues)
                 + "\n\nEVIDENCE PACKET:\n" + _json.dumps(citation_packet, ensure_ascii=False)[:14_000]
                 + f"\n\nBODY:\n{body[:body_prompt_chars]}",
-                think=revision_think, role="planner", num_predict=revision_tokens)
+                think=revision_think,
+                phase=f"citation-support-revision:{citation_round}",
+                fallback_role="planner", num_predict=revision_tokens)
             body = strip_latex_wrappers(body)
             final_issues = audit_body(
                 body, papers, confirmed, blueprint=blueprint, min_words=min_paper_words)
@@ -5128,7 +5336,7 @@ class ResearchLoop:
                     "claim_scope_issues": list(current_scope_issues),
                     "deterministic_issues": list(current_det_issues),
                 })
-                current_body, _ = self._think(
+                current_body, _ = self._synthesize_prose(
                     "Repair the exact evidence regressions introduced by a later prose edit. "
                     "Delete unsupported statements instead of generalizing. Retain at least one "
                     "held-corpus citation only for a background or method statement directly "
@@ -5148,7 +5356,9 @@ class ResearchLoop:
                     + "\n\nCITATION EVIDENCE PACKET:\n"
                     + _json.dumps(current_citation_packet, ensure_ascii=False)[:14_000]
                     + f"\n\nVERIFIED:\n{findings_txt}\n\nBODY:\n{current_body[:body_prompt_chars]}",
-                    think=revision_think, role="planner", num_predict=revision_tokens,
+                    think=revision_think,
+                    phase=f"evidence-regression-revision:{phase}:{evidence_round}",
+                    fallback_role="planner", num_predict=revision_tokens,
                     max_chars=36_000)
                 current_body = strip_latex_wrappers(current_body)
                 current_det_issues = audit_body(
@@ -5227,7 +5437,7 @@ class ResearchLoop:
                 row for row in (scope_packet.get("claims") or [])
                 if row.get("claim_id") in issue_ids
             ]
-            body, _ = self._think(
+            body, _ = self._synthesize_prose(
                 "Repair this paper so every substantive assertion stays within the verified "
                 "findings or exact source-supported citation contexts. Remove false extrapolations, "
                 "especially claims that an identity fails when an unneeded assumption is removed. "
@@ -5243,7 +5453,9 @@ class ResearchLoop:
                 + _json.dumps(disputed, ensure_ascii=False, indent=2)[:12_000]
                 + "\n\nAUDIT:\n" + _json.dumps(scope_audit, ensure_ascii=False)[:10_000]
                 + f"\n\nVERIFIED:\n{findings_txt}\n\nBODY:\n{body[:body_prompt_chars]}",
-                think=revision_think, role="planner", num_predict=revision_tokens,
+                think=revision_think,
+                phase=f"claim-scope-revision:{scope_round}",
+                fallback_role="planner", num_predict=revision_tokens,
                 max_chars=32_000)
             body = strip_latex_wrappers(body)
             final_issues = audit_body(
@@ -5261,7 +5473,7 @@ class ResearchLoop:
                         "citation_issues": list(citation_issues),
                         "deterministic_issues": list(final_issues),
                     })
-                    body, _ = self._think(
+                    body, _ = self._synthesize_prose(
                         "Repair the citation and deterministic regressions introduced by the "
                         "claim-scope rewrite. Keep at least one exact-anchor-supported citation "
                         "for background or method lineage; never cite it as proof of the current "
@@ -5272,7 +5484,12 @@ class ResearchLoop:
                         + "\n\nEVIDENCE PACKET:\n"
                         + _json.dumps(citation_packet, ensure_ascii=False)[:14_000]
                         + f"\n\nVERIFIED:\n{findings_txt}\n\nBODY:\n{body[:body_prompt_chars]}",
-                        think=revision_think, role="planner", num_predict=revision_tokens,
+                        think=revision_think,
+                        phase=(
+                            f"citation-regression-revision:{scope_round}:"
+                            f"{post_scope_citation_round}"),
+                        fallback_role="planner",
+                        num_predict=revision_tokens,
                         max_chars=32_000)
                     body = strip_latex_wrappers(body)
                     final_issues = audit_body(
@@ -5347,7 +5564,7 @@ class ResearchLoop:
             good_scope_audit = scope_audit
             good_scope_issues = list(scope_issues)
 
-            candidate_body, _ = self._think(
+            candidate_body, _ = self._synthesize_prose(
                 "Apply the authoritative referee's semantic revisions to this full LaTeX body. "
                 "The deterministic layout and exact evidence audits were already green. Preserve "
                 "the core roles and valid background citations. The VERIFIED block is the hard "
@@ -5359,7 +5576,9 @@ class ResearchLoop:
                 + "\n\nPRIOR REJECTED-CANDIDATE ERRORS:\n"
                 + "\n".join(f"- {issue}" for issue in last_revalidation_issues[:12])
                 + f"\n\nVERIFIED:\n{findings_txt}\n\nBODY:\n{body[:body_prompt_chars]}",
-                think=revision_think, role="planner", num_predict=revision_tokens,
+                think=revision_think,
+                phase=f"final-referee-revision:{final_review_round}",
+                fallback_role="planner", num_predict=revision_tokens,
                 max_chars=30_000)
             body = strip_latex_wrappers(candidate_body)
             final_issues = audit_body(
@@ -5449,13 +5668,13 @@ class ResearchLoop:
             raise RuntimeError("paper failed final referee gate after evidence repairs")
 
         # 4. ABSTRACT last, from the finished body
-        abstract, _ = self._think(
+        abstract, _ = self._synthesize_prose(
             "Write a 4-7 sentence abstract for this finished paper: the question, what was "
             "established and its exact evidence scope, why it matters. Do not mention failure "
             "outside assumptions, novelty, completeness, or conjectures unless VERIFIED. Match the mathematical "
             "register in the CORPUS STYLE GUIDE. Plain text, no \\begin{abstract}.",
             f"TITLE: {title}\n\nCORPUS STYLE GUIDE:\n{style_guide}\n\nWRITING BLUEPRINT:\n{model_blueprint_txt}\n\nBODY:\n{body[:body_prompt_chars]}",
-            think=False, role="planner")
+            think=False, phase="abstract", fallback_role="planner")
 
         abstract_history = []
         abstract_packet = {}
@@ -5483,7 +5702,7 @@ class ResearchLoop:
                 row for row in (abstract_packet.get("claims") or [])
                 if row.get("claim_id") in issue_ids
             ]
-            abstract, _ = self._think(
+            abstract, _ = self._synthesize_prose(
                 "Rewrite this abstract so every result claim is exactly supported by the VERIFIED "
                 "findings. Remove claims about failure outside assumptions, completeness, novelty, "
                 "uniqueness, or future consequences unless independently established. A documented "
@@ -5493,7 +5712,8 @@ class ResearchLoop:
                 + "\n\nEXACT DISPUTED SENTENCES:\n"
                 + _json.dumps(disputed, ensure_ascii=False, indent=2)[:6000]
                 + f"\n\nVERIFIED:\n{findings_txt}\n\nABSTRACT:\n{abstract}",
-                think=False, role="worker", num_predict=2048)
+                think=False, phase=f"abstract-scope-repair:{abstract_round}",
+                fallback_role="worker", num_predict=2048)
         if abstract_issues:
             (out / "paper-audit.json").write_text(_json.dumps({
                 "stage": "abstract-claim-scope",
@@ -5546,7 +5766,8 @@ class ResearchLoop:
             body, _ = self._think(
                 "This LaTeX fails to compile with the ERRORS shown. Return the corrected full "
                 "LaTeX body (sections only, no preamble); fix ONLY what breaks compilation.",
-                f"ERRORS:\n{errs}\n\nBODY:\n{body[:body_prompt_chars]}", think=False, role="worker")
+                f"ERRORS:\n{errs}\n\nBODY:\n{body[:body_prompt_chars]}", think=False,
+                role="worker")
             body = strip_latex_wrappers(body)
             final_issues = audit_body(
                 body, papers, confirmed, blueprint=blueprint, min_words=min_paper_words)

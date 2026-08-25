@@ -99,6 +99,15 @@ class OfflineModelAccess(RuntimeError):
     """A test attempted to reach an inference service in hard-offline mode."""
 
 
+class OwnedLocalModelEvictionError(RuntimeError):
+    """A run-owned Ollama receipt could not be unloaded for a strict handoff."""
+
+    def __init__(self, models: list[str] | tuple[str, ...]):
+        self.models = tuple(sorted(set(models)))
+        super().__init__(
+            "could not unload run-owned local model(s): " + ", ".join(self.models))
+
+
 def _reject_offline_request(request: httpx.Request) -> httpx.Response:
     raise OfflineModelAccess(
         f"SPIRAL_OFFLINE_TESTS forbids model-service access: {request.method} {request.url}"
@@ -124,6 +133,34 @@ def _prompt_token_reserve(messages: list[dict]) -> int:
     except (TypeError, ValueError):
         encoded = str(messages).encode("utf-8", errors="replace")
     return len(encoded) + 64 * len(messages) + 128
+
+
+def _runtime_identity_error(required: Any, observed: Any) -> str | None:
+    """Require an exact adapter-manifest runtime receipt before accepting prose."""
+
+    if not isinstance(required, dict) or not required:
+        return None
+    if not isinstance(observed, dict):
+        return "provider omitted spiral_runtime_identity"
+    if observed == required:
+        return None
+    changed = sorted({
+        key for key in set(required) | set(observed)
+        if observed.get(key) != required.get(key)
+    })
+    return "provider runtime identity mismatch: " + ", ".join(changed)
+
+
+def _adapter_strength_attestation_error(required: Any, observed: Any) -> str | None:
+    """Require the endpoint to echo the actual per-request LoRA multiplier."""
+
+    if required is None:
+        return None
+    if (isinstance(observed, bool)
+            or not isinstance(observed, (int, float))
+            or float(observed) != float(required)):
+        return "provider adapter strength does not match the request"
+    return None
 
 
 class InferenceLeaseTimeout(TimeoutError):
@@ -452,14 +489,16 @@ class Ollama:
             return False
 
     def evict_owned_local_models_except(
-        self, keep: set[str], log=None,
+        self, keep: set[str], log=None, *, strict: bool = False,
     ) -> list[str]:
         """Evict only prior local models receipted by this CLI run.
 
         This is the safe role-switch seam for an intentional multi-model run.  It
         never asks Ollama what else is resident, so another app's model cannot be
         mistaken for memory owned by Spiral.  Without an active run receipt it is
-        deliberately a no-op.
+        deliberately a no-op.  ``strict=True`` turns any false/exceptional unload
+        into ``OwnedLocalModelEvictionError``; therefore an empty successful result
+        means there were no matching owned receipts, not an ignored unload failure.
         """
         endpoint = self.base_url.rstrip("/")
         with _owned_local_models_lock:
@@ -474,23 +513,29 @@ class Ollama:
             # some Ollama versions satisfy by loading A just to unload it again).
             _owned_local_models.difference_update(claimed)
         evicted: list[str] = []
+        failed: list[str] = []
         for receipt in sorted(claimed):
             _, model = receipt
             try:
                 released = self.evict(model)
-            except BaseException:
+            except BaseException as exc:
                 with _owned_local_models_lock:
                     if _track_owned_local_models:
                         _owned_local_models.add(receipt)
+                if strict and isinstance(exc, Exception):
+                    raise OwnedLocalModelEvictionError([model]) from exc
                 raise
             if not released:
                 with _owned_local_models_lock:
                     if _track_owned_local_models:
                         _owned_local_models.add(receipt)
+                failed.append(model)
                 continue
             evicted.append(model)
             if log:
                 log(model)
+        if strict and failed:
+            raise OwnedLocalModelEvictionError(failed)
         return evicted
 
     def resident(self) -> list[str]:
@@ -817,18 +862,41 @@ class Ollama:
         import time
 
         base = provider["base_url"].rstrip("/")
-        key_env = provider.get("api_key_env", "OPENAI_API_KEY")
-        key = os.environ.get(key_env, "")
-        if not key:
+        key_env = str(provider.get("api_key_env") or "")
+        key_required = bool(provider.get("api_key_required", True))
+        if not key_env and key_required:
+            key_env = "OPENAI_API_KEY"
+        key = os.environ.get(key_env, "") if key_env else ""
+        if key_required and not key:
             return ChatResult(text="", prompt_tokens=0, completion_tokens=0,
                               raw={"error": f"missing ${key_env}", "status": 401})
-        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json"}
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
 
-        body: dict[str, Any] = {"model": model, "messages": messages}
+        required_runtime_identity = provider.get("required_runtime_identity")
+        if required_runtime_identity and on_delta is not None:
+            return ChatResult(
+                text="", prompt_tokens=0, completion_tokens=0,
+                raw={
+                    "error": (
+                        "identity-pinned provider requires a non-streaming response "
+                        "with spiral_runtime_identity"),
+                    "status": 409,
+                },
+            )
+
+        wire_model = str(provider.get("model") or model)
+        body: dict[str, Any] = {"model": wire_model, "messages": messages}
+        if "adapter_strength" in provider:
+            # Identity-pinned academic providers use this explicit request field
+            # to prevent a gateway from silently weakening or amplifying the LoRA.
+            # A value of 1.0 preserves the adapter_config's trained scale.
+            body["adapter_strength"] = provider["adapter_strength"]
         # some reasoning models FIX temperature (kimi-k3: only 1) — provider wins
         body["temperature"] = provider["temperature"] if "temperature" in provider else temperature
-        is_kimi = "moonshot" in base.lower() or model.lower().startswith("kimi-")
-        is_kimi_k3 = model.lower().startswith("kimi-k3")
+        is_kimi = "moonshot" in base.lower() or wire_model.lower().startswith("kimi-")
+        is_kimi_k3 = wire_model.lower().startswith("kimi-k3")
         minimum_completion = self._provider_minimum_completion(model, think=think)
         completion_field = provider.get(
             "completion_token_field",
@@ -935,6 +1003,42 @@ class Ollama:
                         ))
                         content = msg.get("content", "") or ""
                         finish_reason = choice.get("finish_reason")
+                        identity_error = _runtime_identity_error(
+                            required_runtime_identity,
+                            d.get("spiral_runtime_identity") if isinstance(d, dict) else None,
+                        )
+                        if identity_error:
+                            return ChatResult(
+                                text="",
+                                prompt_tokens=spent_prompt,
+                                completion_tokens=spent_completion,
+                                raw={
+                                    **(d if isinstance(d, dict) else {}),
+                                    "error": identity_error,
+                                    "status": 409,
+                                    "finish_reason": finish_reason,
+                                    "provider_attempts": attempt,
+                                },
+                            )
+                        strength_error = _adapter_strength_attestation_error(
+                            body.get("adapter_strength")
+                            if "adapter_strength" in provider else None,
+                            d.get("spiral_adapter_strength")
+                            if isinstance(d, dict) else None,
+                        )
+                        if strength_error:
+                            return ChatResult(
+                                text="",
+                                prompt_tokens=spent_prompt,
+                                completion_tokens=spent_completion,
+                                raw={
+                                    **(d if isinstance(d, dict) else {}),
+                                    "error": strength_error,
+                                    "status": 409,
+                                    "finish_reason": finish_reason,
+                                    "provider_attempts": attempt,
+                                },
+                            )
                         if content.strip():
                             return ChatResult(
                                 text=content,

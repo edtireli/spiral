@@ -1,0 +1,12 @@
+# Exact direct runtime set audited for the Qwen3.8 checkpoint's qwen3_5 text-tuner seam.
+# Install only into the isolated environment described in TRAINING.md.
+mlx==0.31.2
+mlx-lm[train]==0.31.3
+numpy==2.5.2
+transformers==5.15.1
+sentencepiece==0.2.2
+protobuf==7.36.0
+PyYAML==6.0.3
+Jinja2==3.1.6
+datasets==5.0.1
+tqdm==4.70.0
