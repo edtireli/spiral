@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"
+      xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/"
+      xmlns:arxiv="http://arxiv.org/schemas/atom">
+  <opensearch:totalResults>2</opensearch:totalResults>
+  <opensearch:startIndex>0</opensearch:startIndex>
+  <entry>
+    <id>https://arxiv.org/abs/2012.00003v1</id>
+    <updated>2020-12-04T10:30:00Z</updated>
+    <published>2020-12-04T10:30:00Z</published>
+    <title>Calibrated evidence in a particle search</title>
+    <summary>The observed spectrum is compatible with the specified background model across the complete fitted interval. Consequently, the measurement constrains the interaction strength without establishing evidence for a new resonance.</summary>
+    <author><name>Priya Example</name></author>
+    <category term="hep-ph"/>
+  </entry>
+  <entry>
+    <id>https://arxiv.org/abs/1806.00005v2</id>
+    <updated>2018-10-14T10:30:00Z</updated>
+    <published>2018-06-04T10:30:00Z</published>
+    <title>A systematic comparison of production channels</title>
+    <summary>Several production channels yield compatible parameter estimates when evaluated with the same perturbative prescription. The combined constraint is therefore more precise, although correlated uncertainties remain important.</summary>
+    <author><name>Leon Independent</name></author>
+    <category term="hep-ph"/>
+  </entry>
+</feed>

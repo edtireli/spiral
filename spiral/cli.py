@@ -58,13 +58,19 @@ def _apply_tier(cfg, console, tier, api_key: str | None = None):
     ``api_key_env`` for THIS process only — never written to any file."""
     if not tier:
         return cfg
-    if not cfg.providers:
+    general_providers = {
+        name: provider for name, provider in (cfg.providers or {}).items()
+        if not (isinstance(provider, dict) and provider.get("academic_writer_only"))
+    }
+    if not general_providers:
         raise SystemExit(f"--{tier} needs an API provider in ~/.config/spiral/config.json "
-                         "(see README: providers). Also export its api_key_env.")
-    model = next(iter(cfg.providers))
+                         "(the publication-only academic writer does not count). "
+                         "Also export its api_key_env.")
+    model = next(iter(general_providers))
     if api_key:
         import os
-        key_env = (cfg.providers.get(model) or {}).get("api_key_env", "OPENAI_API_KEY")
+        key_env = (general_providers.get(model) or {}).get(
+            "api_key_env", "OPENAI_API_KEY")
         os.environ[key_env] = api_key
         reveal(console, f"  [dim]◆ api key → ${key_env} (this process only)[/]\n")
     targets = (cfg.worker, cfg.planner, cfg.escalation, cfg.critic) if tier == "api" else (cfg.escalation, cfg.critic)
@@ -100,6 +106,10 @@ def _apply_uncensored(console) -> None:
             f"--uncensored wants '{model}', which ollama does not have.\n"
             f"    install it, or point elsewhere with SPIRAL_UNCENSORED_MODEL=<name>."
         )
+    # Persist the user's explicit mode choice across Config.load() boundaries.
+    # ResearchLoop uses this marker to keep publication prose on the abliterated
+    # generating seats instead of silently diverting it through the academic LoRA.
+    os.environ["SPIRAL_UNCENSORED_ACTIVE"] = "1"
     for role in ("worker", "planner", "escalation"):
         os.environ[f"SPIRAL_{role.upper()}"] = model
     reveal(console, f"  [rgb(217,119,87)]◆ uncensored[/] — {model} on: "

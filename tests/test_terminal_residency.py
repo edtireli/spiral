@@ -105,13 +105,14 @@ def test_deliberate_role_switch_evicts_only_prior_run_owned_model(monkeypatch):
             AssertionError("owned role switch enumerated unrelated residents")
         ),
     )
-    assert client.evict_owned_local_models_except({"next:12b"}) == ["prior:27b"]
+    assert client.evict_owned_local_models_except(
+        {"next:12b"}, strict=True) == ["prior:27b"]
     assert evicted == ["prior:27b"]
 
     assert client.chat(
         "next:12b", [{"role": "user", "content": "work"}], num_predict=4,
     ).text == "done"
-    assert client.evict_owned_local_models_except({"next:12b"}) == []
+    assert client.evict_owned_local_models_except({"next:12b"}, strict=True) == []
     assert evicted == ["prior:27b"]
     assert not hasattr(client, "free_foreign")
 
@@ -132,6 +133,33 @@ def test_failed_owned_role_switch_restores_receipt_for_terminal_cleanup(monkeypa
     monkeypatch.setattr(client, "evict", lambda _model: False)
 
     assert client.evict_owned_local_models_except({"next:12b"}) == []
+    with pytest.raises(llm.OwnedLocalModelEvictionError, match="prior:27b"):
+        client.evict_owned_local_models_except({"next:12b"}, strict=True)
+    released, events = _release_with_fake(monkeypatch)
+    assert released == [("http://ollama.test", "prior:27b")]
+    assert any(
+        event[:3] == ("evict", "http://ollama.test", "prior:27b")
+        for event in events
+    )
+
+
+def test_strict_owned_role_switch_wraps_unload_exception_and_restores_receipt(
+        monkeypatch):
+    llm.begin_owned_local_model_run()
+    client = Ollama("http://ollama.test", providers={})
+    client._client = types.SimpleNamespace(post=lambda *_args, **_kwargs: _Response())
+    assert client.chat(
+        "prior:27b", [{"role": "user", "content": "work"}], num_predict=4,
+    ).text == "done"
+
+    def broken_evict(_model):
+        raise RuntimeError("transport failed")
+
+    monkeypatch.setattr(client, "evict", broken_evict)
+    with pytest.raises(llm.OwnedLocalModelEvictionError, match="prior:27b") as failure:
+        client.evict_owned_local_models_except(set(), strict=True)
+    assert isinstance(failure.value.__cause__, RuntimeError)
+
     released, events = _release_with_fake(monkeypatch)
     assert released == [("http://ollama.test", "prior:27b")]
     assert any(

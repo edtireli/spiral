@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<PubmedArticleSet>
+  <PubmedArticle>
+    <MedlineCitation>
+      <PMID Version="1">31415926</PMID>
+      <Article>
+        <Journal><JournalIssue><PubDate><Year>2020</Year><Month>Oct</Month><Day>12</Day></PubDate></JournalIssue></Journal>
+        <ArticleTitle>Reasoned interpretation of a longitudinal intervention</ArticleTitle>
+        <Abstract>
+          <AbstractText Label="BACKGROUND">Longitudinal evidence can distinguish a persistent association from a transient response to measurement.</AbstractText>
+          <AbstractText Label="RESULTS">The intervention group retained a modest improvement after adjustment for the prespecified baseline differences. Nevertheless, uncertainty in the final estimate limits strong causal interpretation of this association.</AbstractText>
+        </Abstract>
+        <AuthorList>
+          <Author><ForeName>Mina</ForeName><LastName>Example</LastName></Author>
+          <Author><ForeName>Theodore</ForeName><LastName>Shared</LastName></Author>
+        </AuthorList>
+        <ArticleDate><Year>2020</Year><Month>10</Month><Day>12</Day></ArticleDate>
+      </Article>
+    </MedlineCitation>
+    <PubmedData>
+      <History><PubMedPubDate PubStatus="revised"><Year>2021</Year><Month>1</Month><Day>5</Day></PubMedPubDate></History>
+      <ArticleIdList><ArticleId IdType="pubmed">31415926</ArticleId><ArticleId IdType="pmc">PMC7654321</ArticleId></ArticleIdList>
+    </PubmedData>
+    <DateRevised><Year>2023</Year><Month>01</Month><Day>05</Day></DateRevised>
+  </PubmedArticle>
+  <PubmedArticle>
+    <MedlineCitation>
+      <PMID Version="1">16180339</PMID>
+      <Article>
+        <Journal><JournalIssue><PubDate><Year>2018</Year><Month>Mar</Month><Day>9</Day></PubDate></JournalIssue></Journal>
+        <ArticleTitle>Independent replication across clinical settings</ArticleTitle>
+        <Abstract>
+          <AbstractText>The replicated association remained directionally consistent across three independently sampled clinical settings. Because the confidence intervals overlap, the apparent heterogeneity should be interpreted cautiously rather than as decisive evidence of effect modification.</AbstractText>
+        </Abstract>
+        <AuthorList><Author><ForeName>Omar</ForeName><LastName>Independent</LastName></Author></AuthorList>
+        <ArticleDate><Year>2018</Year><Month>3</Month><Day>9</Day></ArticleDate>
+      </Article>
+    </MedlineCitation>
+    <PubmedData><ArticleIdList><ArticleId IdType="pubmed">16180339</ArticleId></ArticleIdList></PubmedData>
+  </PubmedArticle>
+  <PubmedArticle>
+    <MedlineCitation>
+      <PMID Version="2">27182818</PMID>
+      <DateRevised><Year>2022</Year><Month>02</Month><Day>02</Day></DateRevised>
+      <Article>
+        <Journal><JournalIssue><PubDate><Year>2019</Year></PubDate></JournalIssue></Journal>
+        <ArticleTitle>A record revised beyond the allowed boundary</ArticleTitle>
+        <Abstract><AbstractText>This sufficiently long abstract must be rejected because its latest recorded revision occurred beyond the fixed cutoff.</AbstractText></Abstract>
+        <AuthorList><Author><CollectiveName>Future Consortium</CollectiveName></Author></AuthorList>
+        <PublicationTypeList><PublicationType>Published Erratum</PublicationType></PublicationTypeList>
+      </Article>
+    </MedlineCitation>
+  </PubmedArticle>
+</PubmedArticleSet>
