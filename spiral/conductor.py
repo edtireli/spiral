@@ -42,6 +42,7 @@ from spiral.execution import (
 )
 from spiral.ladder import is_python_gate, venv_prefix
 from spiral.llm import Ollama
+from spiral.runtime_control import checkpoint as runtime_checkpoint
 from spiral.planner import (
     Milestone, Plan, Task, analyze_deliverables, coverage_gaps, critique_plan,
     default_output_globs, design_brief, design_tokens, enrich_deliverable_spec,
@@ -2194,6 +2195,7 @@ class Conductor:
     def build(self, goal: str, resume: bool = False, approve: bool = False) -> None:
         from spiral.dash import Dash
 
+        runtime_checkpoint()
         c = self.c
         t0 = time.time()
         self._preflight()
@@ -2373,8 +2375,10 @@ class Conductor:
             # ---- the grind: every task keeps the gate green ---------------------
             done = 0
             for mi, m in enumerate(plan.milestones, 1):
+                runtime_checkpoint()
                 dash.print(f"[bold {CLAY}]━━ M{mi}/{len(plan.milestones)}: {m.title} ━━[/]")
                 for ti, t in enumerate(m.tasks, 1):
+                    runtime_checkpoint()
                     done += 1
                     task_key = f"{mi}.{ti}"
                     if resume and self._task_is_resumably_done(task_key, t):
@@ -2573,6 +2577,7 @@ class Conductor:
             )],
         )])
         for finish_round in range(1, finish_rounds + 1):
+            runtime_checkpoint()
             c.print(f"[bold {CLAY}]━━ finish pass {finish_round}/{finish_rounds} ━━[/]")
             with Dash(console=c, plan=qa_plan, gate=self.gate,
                       thought_log=self._dir() / "thoughts.jsonl") as qa_dash:

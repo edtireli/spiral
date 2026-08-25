@@ -34,6 +34,7 @@ from spiral.skillpack import load_skills, match_skills, render_for_prompt
 from spiral.theme import make_console
 from spiral.edits import apply_edits, parse_edits
 from spiral.llm import Ollama
+from spiral.runtime_control import checkpoint as runtime_checkpoint
 
 SYSTEM = (
     "You are spiral's worker — a focused coding agent that edits code to make a "
@@ -1520,6 +1521,7 @@ class Atom:
         scratch.mkdir(parents=True, exist_ok=True)
         attempt = 0
         while attempt < budget:
+            runtime_checkpoint()
             if self.budget_exhausted:
                 ui.print("  [red]■ run execution budget reached before next model attempt[/]")
                 break

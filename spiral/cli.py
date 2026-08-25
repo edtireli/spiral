@@ -907,6 +907,9 @@ def main() -> None:
 
 def entry() -> None:
     from spiral.harness_check import HarnessFault
+    from spiral.runtime_control import get_runtime_control
+
+    runtime_control = get_runtime_control()
 
     # The host stops detached jobs with SIGTERM. Translate that request into a
     # normal Python unwind so the same exact-owned-model cleanup used for Ctrl-C
@@ -916,6 +919,7 @@ def entry() -> None:
         previous_sigterm = signal.getsignal(signal.SIGTERM)
 
         def terminate(signum, _frame):
+            runtime_control.cancel()
             raise SystemExit(128 + signum)
 
         signal.signal(signal.SIGTERM, terminate)
@@ -934,6 +938,7 @@ def entry() -> None:
             )
             raise SystemExit(3)
         except KeyboardInterrupt:
+            runtime_control.cancel()
             make_console().print(
                 "\n  [rgb(217,119,87)]⠿ interrupted[/] — green work is committed, banked "
                 "checkpoints kept. [dim]Resume with the same command + --resume[/]\n"
@@ -943,8 +948,11 @@ def entry() -> None:
         try:
             release_owned_local_models()
         finally:
-            if previous_sigterm is not None:
-                signal.signal(signal.SIGTERM, previous_sigterm)
+            try:
+                runtime_control.close()
+            finally:
+                if previous_sigterm is not None:
+                    signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 if __name__ == "__main__":

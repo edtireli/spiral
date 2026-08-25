@@ -256,64 +256,91 @@ class InferenceLease:
     @contextlib.contextmanager
     def hold(self, *, model: str, operation: str = "chat",
              timeout: float | None = None):
+        from spiral.runtime_control import get_runtime_control
+
+        control = get_runtime_control()
+        # With no cross-process lease there is still a real inference request. It
+        # must drain before cooperative pause can be acknowledged.
         if self.path is None or fcntl is None:
-            yield
+            with control.activity("inference"):
+                yield
             return
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         with self._thread_lock:
             fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
-            acquired = False
             try:
                 os.chmod(self.path, 0o600)
                 wait_for = self.timeout if timeout is None else min(self.timeout, max(0.0, timeout))
-                deadline = time.monotonic() + wait_for
+                wait_started = time.monotonic()
+                paused_started = control.paused_seconds()
+
+                def remaining_wait() -> float:
+                    paused = max(
+                        0.0, control.paused_seconds() - paused_started)
+                    elapsed = max(0.0, time.monotonic() - wait_started - paused)
+                    return max(0.0, wait_for - elapsed)
+
                 while True:
+                    # Waiting for the model lane is itself a safe point. Register the
+                    # activity only around a non-blocking acquire attempt and retain it
+                    # after success, closing the pause/acquire race without pinning a
+                    # pause behind somebody else's lease.
+                    control.checkpoint()
                     if self._interactive_waiting():
-                        if time.monotonic() >= deadline:
+                        remaining = remaining_wait()
+                        if remaining <= 0:
                             raise InferenceLeaseTimeout(
                                 f"interactive chat kept local model priority for {wait_for:g}s")
-                        time.sleep(min(self.poll, max(0.0, deadline - time.monotonic())))
+                        time.sleep(min(self.poll, remaining))
                         continue
-                    try:
-                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        acquired = True
-                        # Close the race where a chat ticket arrived between the check
-                        # above and flock. Background calls yield at this inference edge.
-                        if self._interactive_waiting():
+                    acquired = False
+                    with control.activity("inference"):
+                        try:
+                            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            acquired = True
+                        except BlockingIOError:
+                            pass
+                        if acquired and self._interactive_waiting():
+                            # Close the race where a chat ticket arrived between the
+                            # check above and flock. Background calls yield here.
                             fcntl.flock(fd, fcntl.LOCK_UN)
                             acquired = False
-                            time.sleep(self.poll)
-                            continue
-                        break
-                    except BlockingIOError:
-                        if time.monotonic() >= deadline:
-                            raise InferenceLeaseTimeout(
-                                f"local model lane stayed busy for {wait_for:g}s")
-                        time.sleep(min(self.poll, max(0.0, deadline - time.monotonic())))
-                record = {
-                    "pid": os.getpid(),
-                    "acquired_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    **self.owner,
-                    "model": model,
-                    "operation": operation,
-                }
-                raw = json.dumps(record, separators=(",", ":")).encode("utf-8")[:4096]
-                os.ftruncate(fd, 0)
-                os.lseek(fd, 0, os.SEEK_SET)
-                view = memoryview(raw)
-                while view:
-                    written = os.write(fd, view)
-                    if written <= 0:
-                        raise OSError("could not persist model-lane owner")
-                    view = view[written:]
-                os.fsync(fd)
-                yield
+                        if acquired:
+                            try:
+                                record = {
+                                    "pid": os.getpid(),
+                                    "acquired_at": time.strftime(
+                                        "%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                                    **self.owner,
+                                    "model": model,
+                                    "operation": operation,
+                                }
+                                raw = json.dumps(
+                                    record, separators=(",", ":"),
+                                ).encode("utf-8")[:4096]
+                                os.ftruncate(fd, 0)
+                                os.lseek(fd, 0, os.SEEK_SET)
+                                view = memoryview(raw)
+                                while view:
+                                    written = os.write(fd, view)
+                                    if written <= 0:
+                                        raise OSError(
+                                            "could not persist model-lane owner")
+                                    view = view[written:]
+                                os.fsync(fd)
+                                yield
+                            finally:
+                                try:
+                                    fcntl.flock(fd, fcntl.LOCK_UN)
+                                except OSError:
+                                    pass
+                            return
+                    remaining = remaining_wait()
+                    if remaining <= 0:
+                        raise InferenceLeaseTimeout(
+                            f"local model lane stayed busy for {wait_for:g}s")
+                    time.sleep(min(self.poll, remaining))
             finally:
-                if acquired:
-                    try:
-                        fcntl.flock(fd, fcntl.LOCK_UN)
-                    except OSError:
-                        pass
                 os.close(fd)
 
 

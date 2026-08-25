@@ -144,6 +144,52 @@ def test_dash_expands_and_logs_visible_thoughts(tmp_path):
     assert "corpus anchors" in log.read_text()
 
 
+def test_dash_emits_authenticated_full_ui_snapshots(monkeypatch, capsys):
+    from spiral.dash import Dash, UI_EVENT_PREFIX, UI_EVENT_SCHEMA
+    from spiral.planner import Milestone, Plan, Task
+
+    token = "a" * 32
+    monkeypatch.setenv("SPIRAL_UI_EVENT_TOKEN", token)
+    plan = Plan("build it", [Milestone("Working product", [
+        Task("Wire the real data path", "implementation"),
+        Task("Verify the complete flow", "tests"),
+    ])])
+    dash = Dash(plan=plan)
+    dash.phase("building", model="qwen3.8:27b")
+    dash.task(1, 1, "run")
+    dash.idea("Connecting the persisted state to the visible result.")
+    dash.task(1, 1, "done")
+    dash.task(1, 2, "blocked")
+    dash._emit_ui(final=True)
+
+    frames = []
+    for line in capsys.readouterr().out.splitlines():
+        prefix, got_token, raw = line.split(" ", 2)
+        assert prefix == UI_EVENT_PREFIX
+        assert got_token == token
+        frames.append(json.loads(raw))
+    assert frames
+    final = frames[-1]
+    assert final["schema_version"] == UI_EVENT_SCHEMA
+    assert final["phase"] == "building"
+    assert final["model"] == "qwen3.8:27b"
+    assert final["idea"].startswith("Connecting")
+    assert final["final"] is True
+    assert final["done"] == 1 and final["blocked"] == 1
+    assert final["milestones"] == [{
+        "index": 1,
+        "title": "Working product",
+        "status": "blocked",
+        "tasks": [
+            {"index": 1, "title": "Wire the real data path", "status": "done"},
+            {"index": 2, "title": "Verify the complete flow", "status": "blocked"},
+        ],
+    }]
+    assert [frame["sequence"] for frame in frames] == list(
+        range(1, len(frames) + 1)
+    )
+
+
 def test_watcher_hotkey_callback_is_consumed():
     from spiral.keys import Watcher
 
