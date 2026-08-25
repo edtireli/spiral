@@ -33,6 +33,7 @@ from spiral.route import norm_sig
 from spiral.skillpack import load_skills, match_skills, render_for_prompt
 from spiral.theme import make_console
 from spiral.edits import apply_edits, parse_edits
+from spiral.execution import BudgetExceeded
 from spiral.llm import Ollama
 from spiral.runtime_control import checkpoint as runtime_checkpoint
 
@@ -159,6 +160,7 @@ class Atom:
         self.skills = load_skills(self.ws)
         self._transaction = None
         self._task_promotions: list[Path] = []
+        self._budget_stop: BudgetExceeded | None = None
         from spiral.command_broker import CommandBroker
 
         self.command_broker = CommandBroker(self.ws, self.cfg)
@@ -236,12 +238,30 @@ class Atom:
 
     @property
     def budget_exhausted(self) -> bool:
+        if self._budget_stop is not None:
+            return True
         joint = getattr(self.ol, "budget", None)
         if joint is not None and joint.exhausted:
             return True
         explicit = int(getattr(self.cfg, "builder_token_budget", 0) or 0)
         limit = explicit if explicit > 0 else int(self.cfg.run_token_budget)
         return self.tokens >= max(1, limit)
+
+    def mark_budget_exceeded(self, error: BudgetExceeded) -> None:
+        """Make a provider admission refusal a durable run stop, not a crash.
+
+        A call can be impossible even while raw token usage is below the ceiling: the
+        remaining budget may not fit the next prompt reserve plus the provider's minimum
+        completion window. Remember that terminal admission result so the conductor does
+        not immediately try another lane with the same exhausted shared ledger.
+        """
+        self._budget_stop = error
+        self.ledger.log(
+            "budget_stop",
+            dimension=error.dimension,
+            detail=str(error)[:500],
+            snapshot=error.snapshot,
+        )
 
     def _record_generation(self, model: str, res, seconds: float) -> None:
         """Account for every model call, including malformed/no-edit replies."""
@@ -488,6 +508,25 @@ class Atom:
                 continue
         return digest.hexdigest()[:16]
 
+    def _effective_gate_command(self, command: str) -> str:
+        """Return the command exactly as the broker should execute it.
+
+        Planner checks and detected project gates must share one runtime contract.  Keeping
+        the normalization in a pure helper also lets harness adjudication inspect the real
+        command instead of blaming a portable ``python`` spelling which has already been
+        repaired by the host.
+        """
+        from spiral.ladder import is_python_gate, venv_prefix
+
+        if (is_python_gate(command)
+                and not command.lstrip().startswith("export PATH=")):
+            venv_bin = (
+                self.ws / ".spiral" / "dependency-cache" / "python"
+                / "venv" / "bin"
+            )
+            return venv_prefix(venv_bin) + command
+        return command
+
     def _run_gate(self, command: str, ui) -> tools.RunResult:
         """Provision declared dependencies, then run the deterministic gate.
 
@@ -498,6 +537,16 @@ class Atom:
         """
 
         from spiral.builder_tools import ensure_builder_dependencies
+        # Planner-authored task checks commonly use the portable-looking
+        # ``python -m ...`` spelling.  macOS installations frequently expose
+        # only ``python3`` and the command broker intentionally strips pyenv
+        # shims from its sandbox PATH.  Detected project gates already receive
+        # this interpreter prefix in conductor.detect_gates(); per-task verify
+        # commands take this direct Agent path and need the same treatment.
+        # Keep an existing exported prefix intact so composed ladder gates are
+        # not wrapped twice.
+        command = self._effective_gate_command(command)
+        self._last_gate_command = command
 
         key = (command, self._tree_hash())
         cached = getattr(self, "_gate_memo", None)
@@ -1425,6 +1474,32 @@ class Atom:
             ui.print(
                 "  [yellow]○ no native gate yet — structural verification mode[/]")
 
+        # A top-level command which the *effective* gate cannot resolve is a host
+        # instrument failure, not a coding task.  Asking a model to edit the repository
+        # cannot install a program outside it and previously burned every worker and
+        # escalation attempt on the identical exit 127.  Python gates have already been
+        # normalized above, and declared dependencies have already been provisioned, so
+        # this narrow static check is both deterministic and safe to act on immediately.
+        if verify is not None and not verify.ok and verify.code in {126, 127}:
+            effective = str(getattr(self, "_last_gate_command", task.verify_cmd) or "")
+            absent = harness_check.missing_tools(effective)
+            if absent:
+                faults = [harness_check.Fault(
+                    "missing-tool",
+                    "the effective gate names a program the host cannot resolve "
+                    f"(missing: {tool})",
+                    effective[:160],
+                ) for tool in absent]
+                ui.print("  [red]■ harness fault detected before model dispatch[/]")
+                for fault in faults:
+                    ui.print(f"     [dim]{fault.sentence()}[/]")
+                self.ledger.log(
+                    "harness_fault", task=task.goal[:60], kinds="missing-tool",
+                    claim="deterministic preflight",
+                )
+                self._harness_faults = faults
+                raise harness_check.HarnessFault(harness_check.report(faults))
+
         # ---- signature routing: history may already know this error is hard ----
         # Worker lane only (model is None): the ledger says whether this exact
         # signature class has ever been cleared by the fast lane. If it only ever
@@ -2083,6 +2158,35 @@ class Atom:
                 return True
 
         self._lane_tried = self._compact_tried(tried)[-8:]   # hand the map to the next lane
+
+        # A task can be useful and safe without yet being complete.  If its behavioral
+        # gate is green and only declared artifacts remain missing, bank the current tree
+        # before the lane returns false.  The transaction then rolls back to this new green
+        # checkpoint, so escalation (and later resume) sees the working code instead of an
+        # empty baseline.  Completion remains false until every declared artifact exists.
+        # This is the ordinary coding-assistant contract: preserve verified progress; do
+        # not confuse "not finished" with "must erase everything".
+        partial_missing = _missing() if verify is not None and verify.ok else []
+        transaction = getattr(self, "_transaction", None)
+        if partial_missing and transaction is not None and transaction.has_changes():
+            try:
+                head, moved = self._commit(
+                    "spiral: partial green checkpoint — " + task.goal[:48]
+                )
+                if moved:
+                    ui.print(
+                        f"  [rgb(217,119,87)]⚑ partial green work banked[/] "
+                        f"[dim]{head} · still missing {', '.join(partial_missing)[:180]}[/]"
+                    )
+                    self.ledger.log(
+                        "partial_checkpoint", task=task.goal[:80], head=head,
+                        missing=partial_missing[:20],
+                    )
+            except Exception as exc:
+                ui.print(
+                    "  [yellow]○ partial checkpoint could not be saved:[/] "
+                    f"[dim]{str(exc)[:180]}[/]"
+                )
         ui.print("  [red]✗ budget exhausted[/] — checkpoint saved")
         if verify is not None:
             self._checkpoint(task, verify)

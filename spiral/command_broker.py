@@ -7,6 +7,7 @@ shell commands cannot quietly become download or messaging channels.
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -40,6 +41,31 @@ _FORBIDDEN = (
     "reboot", "launchctl", "sudo ", "git push", "gh pr ", "gh issue ",
     "curl ", "wget ", "history -c", "chmod -r", "chown -r",
 )
+
+
+def _popen_with_headroom_retry(
+    argv: list[str], *, runtime_control, on_wait=None, **kwargs,
+) -> subprocess.Popen:
+    """Start a command without treating transient macOS fork pressure as bad code.
+
+    A resident 27B model can leave the kernel briefly unable to create another process
+    even though the command and repository are valid. Retry only EAGAIN/35, at safe
+    cooperative checkpoints, for a finite ~16 seconds. Every other spawn error keeps
+    its original deterministic failure semantics.
+    """
+    delays = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0)
+    for attempt in range(len(delays) + 1):
+        runtime_control.checkpoint()
+        try:
+            return subprocess.Popen(argv, **kwargs)
+        except OSError as exc:
+            if exc.errno not in {errno.EAGAIN, 35} or attempt >= len(delays):
+                raise
+            delay = delays[attempt]
+            if on_wait is not None:
+                on_wait(attempt + 1, delay, exc)
+            time.sleep(delay)
+    raise RuntimeError("unreachable command spawn retry state")
 
 # The backstop that survives even --full-access. Everything else opens up in that
 # mode — arbitrary paths, network, self-modification — but these are the actions
@@ -900,16 +926,33 @@ class CommandBroker:
         process: subprocess.Popen | None = None
         timed_out = False
         try:
+            def report_headroom_wait(attempt: int, delay: float, _exc: OSError) -> None:
+                message = (
+                    "waiting for Mac memory headroom before starting command "
+                    f"(retry {attempt}, {delay:g}s)"
+                )
+                lines.append(f"\n({message})\n")
+                if on_line:
+                    try:
+                        on_line(message)
+                    except Exception:
+                        pass
+
             # The detached process owns a separate session/process group. Keep it
             # registered until the complete group exits, not merely until its shell
             # leader does, so a cooperative pause cannot leave descendants mutating
             # the workspace behind a false "paused" acknowledgement.
+            # Process creation itself occurs before activity admission: while no child
+            # exists, a requested pause is a genuine safe point.
+            process = _popen_with_headroom_retry(
+                argv,
+                runtime_control=runtime_control,
+                on_wait=report_headroom_wait,
+                cwd=work, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, stdin=subprocess.DEVNULL, env=env,
+                start_new_session=(os.name == "posix"),
+            )
             with runtime_control.activity("command"):
-                process = subprocess.Popen(
-                    argv, cwd=work, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    text=True, stdin=subprocess.DEVNULL, env=env,
-                    start_new_session=(os.name == "posix"),
-                )
                 assert process.stdout is not None
                 deadline = time.monotonic() + max(1, timeout)
                 while True:

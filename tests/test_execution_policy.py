@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import fcntl
+import errno
 import httpx
 import json
 import os
@@ -11,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from spiral.edits import EditBlock, apply_edits
-from spiral.command_broker import CommandBroker
+from spiral.command_broker import CommandBroker, _popen_with_headroom_retry
 from spiral.config import Config
 from spiral.execution import (
     BudgetExceeded, BudgetLimits, EvidenceLevel, EvidenceRecord, RunBudget,
@@ -35,6 +36,40 @@ class Clock:
 
     def __call__(self):
         return self.now
+
+
+def test_command_spawn_retries_transient_mac_headroom_without_model_involvement(
+        monkeypatch):
+    calls = {"spawn": 0, "checkpoint": 0}
+    waits = []
+    child = object()
+
+    class Runtime:
+        def checkpoint(self):
+            calls["checkpoint"] += 1
+
+    def popen(*_args, **_kwargs):
+        calls["spawn"] += 1
+        if calls["spawn"] < 3:
+            raise BlockingIOError(errno.EAGAIN, "Resource temporarily unavailable")
+        return child
+
+    monkeypatch.setattr("spiral.command_broker.subprocess.Popen", popen)
+    monkeypatch.setattr(
+        "spiral.command_broker.time.sleep", lambda delay: waits.append(delay))
+
+    result = _popen_with_headroom_retry(
+        ["true"], runtime_control=Runtime(),
+        on_wait=lambda attempt, delay, error: waits.append(
+            (attempt, delay, error.errno)),
+    )
+
+    assert result is child
+    assert calls == {"spawn": 3, "checkpoint": 3}
+    assert waits == [
+        (1, 0.25, errno.EAGAIN), 0.25,
+        (2, 0.5, errno.EAGAIN), 0.5,
+    ]
 
 
 def test_joint_budget_is_finite_across_wall_tokens_and_calls():
