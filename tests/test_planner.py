@@ -322,6 +322,200 @@ def test_narrow_non_product_change_does_not_grow_scope():
 
 
 
+def test_deliverable_analyst_requests_only_typed_capability_families():
+    from spiral.planner import ARTIFACT_SCHEMA, ARTIFACT_SYSTEM
+
+    for convention in (
+            "python:REQUIREMENT", "node:PACKAGE", "brew:CORE_FORMULA",
+            "ollama:MODEL", "binary:NAME"):
+        assert convention in ARTIFACT_SYSTEM
+    description = ARTIFACT_SCHEMA["properties"]["deliverables"]["items"][
+        "properties"]["tool_families"]["description"]
+    assert "brew:CORE_FORMULA" in description and "ollama:MODEL" in description
+    assert "never a tap or cask" in ARTIFACT_SYSTEM
+    tool_schema = ARTIFACT_SCHEMA["properties"]["deliverables"]["items"][
+        "properties"]["tool_families"]
+    assert tool_schema["uniqueItems"] is True and tool_schema["maxItems"] == 24
+
+
+def test_deliverable_analyst_retries_token_capped_degenerate_manifest():
+    import json
+    from spiral.planner import analyze_deliverables
+
+    class Config(_PlannerConfig):
+        planner = SimpleNamespace(name="local-planner", think=False)
+        planner_max_tokens = 4096
+
+    bad = {
+        "primary_id": "env-deps",
+        "deliverables": [{
+            "id": "env-deps", "kind": "infrastructure",
+            "description": "Dependency manifest and test plugins", "root_hint": ".",
+            "output_globs": [], "visual": False, "interactive": False,
+            "acceptance_evidence": [],
+            "tool_families": ["python:pytest-cov"] * 203 + ["python:pytest-c"],
+        }],
+    }
+    good = {
+        "primary_id": "workbench",
+        "deliverables": [{
+            "id": "workbench", "kind": "cli",
+            "description": "Defensive audit command-line workbench", "root_hint": ".",
+            "output_globs": [], "visual": False, "interactive": True,
+            "acceptance_evidence": ["Run the complete CLI acceptance workflow"],
+            "tool_families": [
+                "python:typer", "brew:shellcheck", "ollama:qwen3.8:27b",
+                "binary:msfconsole",
+            ],
+        }],
+    }
+    models = _PlannerModels([
+        _reply(json.dumps(bad), reason="length"),
+        _reply(json.dumps(good)),
+    ])
+
+    manifest, result = analyze_deliverables(
+        "Build a command-line audit workbench", [{"id": "R1", "text": "works"}],
+        cfg=Config(), ol=models,
+    )
+
+    assert len(models.calls) == 2
+    assert result.done_reason == "stop"
+    assert manifest["primary_id"] == "workbench"
+    assert manifest["deliverables"][0]["tool_families"] == good[
+        "deliverables"][0]["tool_families"]
+    assert "DETERMINISTIC VALIDATOR REJECTED" in models.calls[1][1][0]["content"]
+
+
+def test_deliverable_analyst_retries_malformed_json_before_failing_closed():
+    import json
+    from spiral.planner import analyze_deliverables
+
+    class Config(_PlannerConfig):
+        planner = SimpleNamespace(name="local-planner", think=False)
+        planner_max_tokens = 4096
+
+    good = {
+        "primary_id": "cli",
+        "deliverables": [{
+            "id": "cli", "kind": "cli", "description": "Runnable CLI",
+            "root_hint": ".", "output_globs": [], "visual": False,
+            "interactive": True, "acceptance_evidence": ["Run its workflow"],
+            "tool_families": ["brew:shellcheck"],
+        }],
+    }
+    models = _PlannerModels([
+        _reply("not json"),
+        _reply(json.dumps(good)),
+    ])
+
+    manifest, _result = analyze_deliverables(
+        "Build a CLI", [{"id": "R1", "text": "works"}],
+        cfg=Config(), ol=models,
+    )
+
+    assert len(models.calls) == 2
+    assert manifest["primary_id"] == "cli"
+    assert "response was not valid JSON" in models.calls[1][1][0]["content"]
+
+
+def test_deliverable_analyst_raises_distinct_error_after_two_bad_manifests():
+    import pytest
+    from spiral.planner import DeliverableManifestError, analyze_deliverables
+
+    class Config(_PlannerConfig):
+        planner = SimpleNamespace(name="local-planner", think=False)
+        planner_max_tokens = 4096
+
+    models = _PlannerModels([_reply("not json"), _reply("still not json")])
+
+    with pytest.raises(DeliverableManifestError, match="after two attempts"):
+        analyze_deliverables(
+            "Build a CLI", [{"id": "R1", "text": "works"}],
+            cfg=Config(), ol=models,
+        )
+    assert len(models.calls) == 2
+
+
+def test_deliverable_correction_outage_cannot_turn_invalid_output_into_fallback():
+    import pytest
+    from spiral.planner import DeliverableManifestError, analyze_deliverables
+
+    class Config(_PlannerConfig):
+        planner = SimpleNamespace(name="local-planner", think=False)
+        planner_max_tokens = 4096
+
+    class Models(_PlannerModels):
+        def chat(self, model, messages, **kwargs):
+            self.calls.append((model, messages, kwargs))
+            reply = self.replies.pop(0)
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
+
+    models = Models([_reply("not json"), RuntimeError("model offline")])
+
+    with pytest.raises(DeliverableManifestError, match="corrective attempt failed"):
+        analyze_deliverables(
+            "Build a CLI", [{"id": "R1", "text": "works"}],
+            cfg=Config(), ol=models,
+        )
+
+
+def test_conductor_does_not_fallback_after_invalid_manifest_repair_fails(
+        tmp_path, monkeypatch):
+    import pytest
+    from spiral import conductor as conductor_module
+    from spiral.conductor import Conductor
+    from spiral.planner import DeliverableManifestError
+
+    runner = object.__new__(Conductor)
+    runner.ws = tmp_path
+    runner.c = SimpleNamespace(print=lambda *_args, **_kwargs: None)
+    runner.cfg = SimpleNamespace(planner=SimpleNamespace(name="planner"))
+    runner.ol = object()
+    runner.gate_disp = "none"
+    runner.ledger = SimpleNamespace(
+        log=lambda *_args, **_kwargs: None,
+        thinking=lambda *_args, **_kwargs: None,
+    )
+    runner._raw_goal = lambda goal: goal
+    monkeypatch.setattr(conductor_module, "build_repomap", lambda *_args: "")
+    monkeypatch.setattr(conductor_module, "list_files", lambda *_args: [])
+    monkeypatch.setattr(
+        conductor_module, "extract_spec",
+        lambda *_args, **_kwargs: (
+            [{"id": "R1", "text": "works"}], _reply("{}")
+        ),
+    )
+    monkeypatch.setattr(
+        conductor_module, "analyze_deliverables",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            DeliverableManifestError("invalid twice")),
+    )
+
+    with pytest.raises(DeliverableManifestError, match="invalid twice"):
+        runner.make_plan("Build a CLI")
+    assert not (tmp_path / ".spiral/artifacts.json").exists()
+
+
+def test_deliverable_manifest_requires_the_requested_product_medium():
+    from spiral.planner import deliverable_manifest_defects
+
+    data = {
+        "primary_id": "deps",
+        "deliverables": [{
+            "id": "deps", "kind": "infrastructure",
+            "tool_families": ["python:pytest"],
+        }],
+    }
+
+    defects = deliverable_manifest_defects(
+        "Create a command-line interface", data, _reply("{}"))
+
+    assert any("requested cli product is missing" in defect for defect in defects)
+
+
 def test_deliverable_kind_is_reconciled_with_its_own_description():
     """A test suite labelled `kind: web, visual: true` is not hypothetical — it
     happened, the delivery manifest then demanded visual evidence a test runner can

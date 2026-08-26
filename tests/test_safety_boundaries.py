@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import json
 import shlex
 import signal
 import shutil
@@ -324,6 +325,164 @@ def test_homebrew_provisioning_requires_explicit_full_access(tmp_path):
     denied = broker.provision("brew tectonic", full_access=False)
 
     assert denied == "tool request rejected: Homebrew provisioning requires full access"
+
+
+def test_ollama_model_pull_requires_full_access_and_records_certificate(
+        tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from spiral import command_broker as broker_module
+
+    broker = CommandBroker(tmp_path)
+    calls = []
+    show_calls = 0
+
+    def fake_run(argv, **_kwargs):
+        nonlocal show_calls
+        calls.append(list(argv))
+        if argv[1] == "show":
+            show_calls += 1
+            if show_calls == 1:
+                return SimpleNamespace(returncode=1, stdout="", stderr="missing")
+            return SimpleNamespace(
+                returncode=0, stdout="architecture qwen\nparameters 8B\n", stderr="")
+        return SimpleNamespace(returncode=0, stdout="pulled", stderr="")
+
+    monkeypatch.setattr(
+        broker_module.shutil, "which",
+        lambda name: "/usr/local/bin/ollama" if name == "ollama" else None,
+    )
+    monkeypatch.setattr(broker_module.subprocess, "run", fake_run)
+
+    denied = broker.provision_typed("ollama qwen3:8b", full_access=False)
+    allowed = broker.provision_typed("ollama qwen3:8b", full_access=True)
+
+    assert denied.failure_kind == "policy"
+    assert allowed.ok and not allowed.failure_kind
+    assert ["/usr/local/bin/ollama", "pull", "qwen3:8b"] in calls
+    actions = (tmp_path / ".spiral/actions.jsonl").read_text()
+    assert '"certificate"' in actions and '"ollama", "show", "qwen3:8b"' in actions
+
+
+def test_workspace_download_is_https_bounded_hashed_and_receipted(
+        tmp_path, monkeypatch):
+    import httpx
+    from spiral import command_broker as broker_module
+
+    real_client = httpx.Client
+    body = b"audited artifact\n"
+
+    def handler(request):
+        assert request.method == "GET"
+        return httpx.Response(200, content=body, request=request)
+
+    def client_factory(**kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_client(**kwargs)
+
+    monkeypatch.setattr(
+        broker_module.socket, "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (broker_module.socket.AF_INET, broker_module.socket.SOCK_STREAM,
+             6, "", ("93.184.216.34", 443)),
+        ],
+    )
+    monkeypatch.setattr(broker_module.httpx, "Client", client_factory)
+    broker = CommandBroker(tmp_path)
+    expected = __import__("hashlib").sha256(body).hexdigest()
+
+    outcome = broker.download_workspace(
+        f"https://example.com/tool.bin -> assets/tool.bin sha256={expected}",
+        network_allowed=True, max_bytes=1024,
+    )
+
+    assert outcome.ok
+    assert (tmp_path / "assets/tool.bin").read_bytes() == body
+    receipt = json.loads(Path(outcome.receipt).read_text())
+    assert receipt["sha256"] == expected and receipt["integrity"] == "pinned"
+
+
+def test_workspace_download_rejects_network_denial_credentials_and_overwrite(
+        tmp_path):
+    broker = CommandBroker(tmp_path)
+    (tmp_path / "keep.bin").write_bytes(b"keep")
+
+    denied = broker.download_workspace(
+        "https://example.com/a -> new.bin", network_allowed=False)
+    credential = broker.download_workspace(
+        "https://user:pass@example.com/a -> new.bin", network_allowed=True)
+    overwrite = broker.download_workspace(
+        "https://example.com/a -> keep.bin", network_allowed=True)
+
+    assert {denied.failure_kind, credential.failure_kind, overwrite.failure_kind} == {"policy"}
+    assert (tmp_path / "keep.bin").read_bytes() == b"keep"
+
+
+def test_transient_workspace_download_retries_inside_setup_lane(
+        tmp_path, monkeypatch):
+    import httpx
+    from spiral import command_broker as broker_module
+
+    real_client = httpx.Client
+    calls = []
+
+    def handler(request):
+        calls.append(1)
+        if len(calls) < 3:
+            raise httpx.ReadTimeout("temporary CDN stall", request=request)
+        return httpx.Response(200, content=b"ready", request=request)
+
+    def client_factory(**kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_client(**kwargs)
+
+    monkeypatch.setattr(
+        broker_module.socket, "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (broker_module.socket.AF_INET, broker_module.socket.SOCK_STREAM,
+             6, "", ("93.184.216.34", 443)),
+        ],
+    )
+    monkeypatch.setattr(broker_module.httpx, "Client", client_factory)
+    monkeypatch.setattr(broker_module.time, "sleep", lambda _seconds: None)
+
+    outcome = CommandBroker(tmp_path).download_workspace(
+        "https://example.com/tool -> tool.bin", network_allowed=True)
+
+    assert outcome.ok and len(calls) == 3
+    assert (tmp_path / "tool.bin").read_bytes() == b"ready"
+
+
+def test_transient_workspace_download_retries_http_statuses(
+        tmp_path, monkeypatch):
+    import httpx
+    from spiral import command_broker as broker_module
+
+    real_client = httpx.Client
+    statuses = [429, 503, 200]
+
+    def handler(request):
+        status = statuses.pop(0)
+        return httpx.Response(status, content=b"ready", request=request)
+
+    def client_factory(**kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_client(**kwargs)
+
+    monkeypatch.setattr(
+        broker_module.socket, "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (broker_module.socket.AF_INET, broker_module.socket.SOCK_STREAM,
+             6, "", ("93.184.216.34", 443)),
+        ],
+    )
+    monkeypatch.setattr(broker_module.httpx, "Client", client_factory)
+    monkeypatch.setattr(broker_module.time, "sleep", lambda _seconds: None)
+
+    outcome = CommandBroker(tmp_path).download_workspace(
+        "https://example.com/tool -> tool.bin", network_allowed=True)
+
+    assert outcome.ok and statuses == []
+    assert (tmp_path / "tool.bin").read_bytes() == b"ready"
 
 
 def test_edit_paths_reject_absolute_and_parent_traversal(tmp_path):
