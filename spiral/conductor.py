@@ -45,7 +45,8 @@ from spiral.ladder import is_python_gate, venv_prefix
 from spiral.llm import Ollama
 from spiral.runtime_control import checkpoint as runtime_checkpoint
 from spiral.planner import (
-    Milestone, Plan, Task, analyze_deliverables, coverage_gaps, critique_plan,
+    DeliverableManifestError, Milestone, Plan, Task, analyze_deliverables,
+    coverage_gaps, critique_plan,
     default_output_globs, design_brief, design_tokens, enrich_deliverable_spec,
     enrich_product_spec,
     ensure_plan_coverage,
@@ -56,6 +57,18 @@ from spiral.ledger import Ledger
 from spiral.repomap import build_relevant_repomap, build_repomap, list_files
 
 CLAY = "rgb(217,119,87)"
+
+
+class BuildIncomplete(RuntimeError):
+    """A finite build run ended honestly, but required evidence still has debt."""
+
+    def __init__(self, outcome: str, gaps: list[str] | tuple[str, ...] = (),
+                 result_path: str = ".spiral/result.json"):
+        self.outcome = str(outcome)
+        self.gaps = tuple(str(gap) for gap in gaps if str(gap).strip())
+        self.result_path = str(result_path)
+        detail = f": {self.gaps[0]}" if self.gaps else ""
+        super().__init__(f"build incomplete ({self.outcome}){detail}")
 
 
 @dataclass(frozen=True)
@@ -545,6 +558,14 @@ class Conductor:
             if deps.get("changed"):
                 self.c.print(f"  [dim]↓ dependencies synchronized · {deps.get('detail', '')[:140]}[/]")
             if not deps.get("ok"):
+                if deps.get("failure_kind") == "transient":
+                    from spiral.harness_check import HarnessFault
+
+                    raise HarnessFault(
+                        "transient dependency setup failed after bounded retries; "
+                        "no source-edit attempt was consumed: "
+                        + str(deps.get("detail") or "")[:1200]
+                    )
                 return tools.RunResult(
                     "spiral dependency synchronization", 1,
                     str(deps.get("detail") or "dependency synchronization failed"),
@@ -930,6 +951,11 @@ class Conductor:
                     goal, spec, repomap, self.cfg, self.ol,
                     progress=lambda k: sp.tick(),
                 )
+        except DeliverableManifestError:
+            # The analyst was available but twice returned a malformed or
+            # semantically invalid manifest. Falling back here would erase the
+            # requested product/tool evidence and let planning continue on a lie.
+            raise
         except Exception as exc:
             kind = self._heuristic_project_kind(goal)
             manifest = {
@@ -971,6 +997,23 @@ class Conductor:
                 for row in manifest.get("deliverables") or []
             )
         )
+
+        # The deliverable analyst has now supplied stronger, typed evidence than
+        # goal keywords alone (for example ``ffmpeg`` or ``ollama:qwen3:8b``).
+        # Builder runs an explicit inspect/setup pass here, before draft planning
+        # or any worker edit. ``spiral plan`` stays read-only; build() enables this
+        # phase and snapshots any newly declared project dependency immediately
+        # afterward so task transactions still begin from a clean checkpoint.
+        if getattr(self, "_capability_setup_enabled", False):
+            try:
+                from spiral.capability import manifest_tool_families
+
+                tool_families = manifest_tool_families(manifest)
+            except Exception:
+                tool_families = []
+            self._resolve_capabilities(
+                goal, tool_families=tool_families, setup=True,
+                synchronize_projects="if-declared")
 
         kind = self._project_kind(goal)
         spec = enrich_deliverable_spec(spec, manifest)
@@ -1189,6 +1232,10 @@ class Conductor:
         ])
         report.records.extend(extra)
         evidence = report.to_dict()
+        # Keep acceptance debt machine-readable rather than burying it inside a
+        # prose uncertainty sentence. Hosts use this exact list to distinguish a
+        # genuinely complete result from a finite run that needs resume/user help.
+        evidence["required_gaps"] = list(dict.fromkeys(report.unresolved))
         payload = {
             "schema_version": 1,
             "kind": "spiral.build.handoff",
@@ -2197,7 +2244,11 @@ class Conductor:
             return result.result.code == 0
         return gate_ok
 
-    def _resolve_capabilities(self, goal: str) -> None:
+    def _resolve_capabilities(
+        self, goal: str, tool_families: list[str] | None = None,
+        *, setup: bool = False,
+        synchronize_projects: bool | str = True,
+    ):
         """Ask what this build needs that this machine lacks, and close the gap.
 
         Declaring the dependency beats installing it: the provisioning that already
@@ -2207,27 +2258,97 @@ class Conductor:
         command instead of being installed behind the user's back.
         """
         try:
-            from spiral.capability import resolve, write_capabilities
+            from spiral.capability import (
+                Resolution, inspect_workspace, resolve, setup_capabilities,
+                write_capabilities,
+            )
         except Exception:
-            return
+            return None
         try:
-            outcome = resolve(self.ws, goal)
+            if setup:
+                outcome = setup_capabilities(
+                    self.ws, goal, tool_families,
+                    declare=True,
+                    synchronize_projects=synchronize_projects,
+                    tool_auto=bool(getattr(
+                        self.cfg, "builder_tool_auto", True)),
+                    full_access=bool(getattr(
+                        self.cfg, "builder_full_access", False)),
+                    timeout=int(getattr(self.cfg, "verify_timeout", 900)),
+                    allow_scripts=bool(getattr(
+                        self.cfg, "builder_allow_install_scripts", False)),
+                    broker=self.command_broker,
+                )
+            else:
+                outcome = resolve(self.ws, goal, tool_families)
+                outcome.inspection = inspect_workspace(self.ws)
         except Exception as exc:
-            self.c.print(f"  [yellow]○ capability check unavailable[/] [dim]{exc}[/]")
-            return
-        if not (outcome.present or outcome.declared or outcome.blocked):
-            return
+            if not setup:
+                self.c.print(
+                    f"  [yellow]○ capability check unavailable[/] [dim]{exc}[/]")
+                return None
+            # Setup is part of the build admission boundary, not optional advice.
+            # Persist unexpected preflight failures through the same receipt/gate
+            # path as ordinary provisioning failures so a host retry has evidence
+            # and planning cannot continue without known prerequisites.
+            outcome = Resolution()
+            try:
+                outcome.inspection = inspect_workspace(self.ws)
+            except Exception:
+                outcome.inspection = {}
+            outcome.setup_reports.append({
+                "kind": "capability-preflight",
+                "ok": False,
+                "changed": False,
+                "failure_kind": "setup",
+                "detail": (
+                    f"capability preflight raised {type(exc).__name__}: {exc}"
+                )[:2000],
+            })
         write_capabilities(self.ws, outcome)
         self._capability_brief = outcome.brief()
+        if outcome.declared:
+            self._capability_tree_changed = True
         if outcome.declared:
             names = sorted({p for need in outcome.declared for p in need.packages})
             self.c.print(
                 f"  [green]●[/] capability: declared {len(names)} dependency(ies) "
                 f"this goal needs · [dim]{', '.join(names)}[/]")
+        if outcome.acquired:
+            names = sorted({
+                need.binary or (need.packages[0] if need.packages else need.id)
+                for need in outcome.acquired
+            })
+            self.c.print(
+                f"  [green]●[/] capability: acquired and certified "
+                f"{len(names)} prerequisite(s) · [dim]{', '.join(names)}[/]")
+        for report in outcome.setup_reports:
+            if report.get("ok"):
+                continue
+            kind = str(report.get("failure_kind") or "setup")
+            detail = str(report.get("detail") or "setup did not complete")
+            self.c.print(
+                f"  [yellow]○ {kind} capability setup:[/] [dim]{detail[:220]}[/]")
         for need in outcome.blocked:
             self.c.print(
                 f"  [yellow]○ missing capability:[/] {need.binary or need.id} "
                 f"[dim]({need.why}) — install with: {need.install_hint}[/]")
+        failed_setup = [
+            report for report in outcome.setup_reports
+            if not bool(report.get("ok"))
+        ]
+        if setup and failed_setup:
+            from spiral.harness_check import HarnessFault
+
+            first = failed_setup[0]
+            failure_kind = str(first.get("failure_kind") or "setup")
+            detail = str(first.get("detail") or "capability setup did not complete")
+            raise HarnessFault(
+                f"{failure_kind} capability setup failed before planning; "
+                "no source-edit attempt was consumed. Durable details are in "
+                f".spiral/capabilities.json: {detail[:1200]}"
+            )
+        return outcome
 
     def build(self, goal: str, resume: bool = False, approve: bool = False) -> None:
         from spiral.dash import Dash
@@ -2236,12 +2357,14 @@ class Conductor:
         c = self.c
         t0 = time.time()
         self._preflight()
+        self._capability_tree_changed = False
         # capability gap FIRST, so declared dependencies land in the pre-run
         # snapshot. Declaring after the snapshot would leave the workspace dirty
         # and every task transaction would refuse to commit.
         if not resume:
-            self._resolve_capabilities(self._raw_goal(goal))
+            self._resolve_capabilities(self._raw_goal(goal), setup=True)
         self._snapshot(resume=resume)
+        self._capability_tree_changed = False
         if not resume:
             self.state = {"last_green_head": self._revision()}
 
@@ -2254,7 +2377,22 @@ class Conductor:
                 goal = str(self.state.get("goal") or "")
         goal = self._raw_goal(goal)
         if plan is None:
-            plan = self.make_plan(goal)
+            # A resume without plan.json stopped before any executable task could
+            # exist. Re-run analyst-derived typed setup just as a fresh pre-plan
+            # pass would; otherwise an interruption during planning permanently
+            # suppresses prerequisites that goal-only inspection could not infer.
+            self._capability_setup_enabled = True
+            try:
+                plan = self.make_plan(goal)
+            finally:
+                self._capability_setup_enabled = False
+            if self._capability_tree_changed:
+                # Typed tool-family evidence may have declared a dependency that
+                # goal-only preflight could not know. Freeze that deterministic
+                # setup into the pre-run baseline before any task transaction.
+                self._snapshot(resume=False)
+                self._write_state(last_green_head=self._revision())
+                self._capability_tree_changed = False
         raw_goal = goal
         goal = self._goal_with_design(raw_goal)
         self.show_plan(plan)
@@ -2391,7 +2529,11 @@ class Conductor:
                         self._write_state(blocked=["M0 bootstrap"], tokens=atom.tokens, outcome="bootstrap_failed")
                         self._write_evidence_result(
                             outcome="bootstrap_failed", blocked=["M0 bootstrap"], atom=atom)
-                        return
+                        watcher.stop()
+                        raise BuildIncomplete(
+                            "bootstrap_failed", ["M0 bootstrap"],
+                            str(self._dir() / "result.json"),
+                        )
                     dash.task(0, 0, "done")
                     self._write_state(
                         last_green_head=self._revision(),
@@ -2451,7 +2593,10 @@ class Conductor:
                         self._write_state(outcome="user_stop", tokens=atom.tokens)
                         self._write_evidence_result(
                             outcome="user_stop", blocked=blocked, atom=atom)
-                        return
+                        raise BuildIncomplete(
+                            "user_stop", [*blocked, "run stopped before completion"],
+                            str(self._dir() / "result.json"),
+                        )
                     dash.task(mi, ti, "run")
                     self._evidence_dag.start(task_key)
                     self._evidence_dag.save(dag_path)
@@ -2550,7 +2695,12 @@ class Conductor:
                         self._write_state(outcome="budget_stop")
                         self._write_evidence_result(
                             outcome="budget_stop", blocked=blocked, atom=atom)
-                        return
+                        watcher.stop()
+                        raise BuildIncomplete(
+                            "budget_stop",
+                            [*blocked, "finite execution budget reached"],
+                            str(self._dir() / "result.json"),
+                        )
 
             # ---- recovery frontier ---------------------------------------------
             # A blocked task is evidence debt, not a permanent verdict.  Once later
@@ -2754,11 +2904,24 @@ class Conductor:
             if self.state.get("validation_status") not in {"quality-pending"}:
                 break
 
-        outcome = "complete" if spec_green else "finished_with_gaps"
-        self._write_state(outcome=outcome, run_status=outcome, tokens=atom.tokens,
-                          minutes=round((time.time() - t0) / 60, 1))
         _processed_count, green_count = self._task_counts(
             plan, dict(self.state.get("task_records") or {}))
+        terminal_dag = getattr(self, "_evidence_dag", TaskEvidenceDAG())
+        evidence_debt = list(terminal_dag.evidence_report([
+            *blocked,
+            *(str(gap) for gap in (self.state.get("gaps") or [])),
+        ]).unresolved)
+        if self.state.get("delivery_ready") is False:
+            evidence_debt.append("delivery manifest has unmet acceptance evidence")
+        if green_count != total:
+            evidence_debt.append(
+                f"only {green_count}/{total} required tasks are green")
+        if not spec_green:
+            evidence_debt.append("final requirement validation is not green")
+        evidence_debt = list(dict.fromkeys(evidence_debt))
+        outcome = "complete" if not evidence_debt else "finished_with_gaps"
+        self._write_state(outcome=outcome, run_status=outcome, tokens=atom.tokens,
+                          minutes=round((time.time() - t0) / 60, 1))
         self._hook(
             "run_complete",
             f"{green_count}/{total} tasks green · "
@@ -2766,3 +2929,6 @@ class Conductor:
         )
         self._write_evidence_result(outcome=outcome, blocked=blocked, atom=atom)
         self._summary_card(atom, t0, green_count, blocked, total)
+        if evidence_debt:
+            raise BuildIncomplete(
+                outcome, evidence_debt, str(self._dir() / "result.json"))

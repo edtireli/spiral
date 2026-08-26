@@ -8,6 +8,9 @@ shell commands cannot quietly become download or messaging channels.
 from __future__ import annotations
 
 import errno
+import contextlib
+import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -15,12 +18,17 @@ import select
 import shlex
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import time
+from urllib.parse import parse_qsl, urljoin, urlsplit
 from dataclasses import dataclass
 from pathlib import Path
+
+import httpx
 
 from spiral.tools import RunResult
 
@@ -133,6 +141,14 @@ _NODE_PACKAGE = re.compile(
     r"(?:@[A-Za-z0-9*^~<>=_.+-]+)?$"
 )
 _BREW_FORMULA = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.+-]{0,100}$")
+_OLLAMA_MODEL = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}(?::[A-Za-z0-9][A-Za-z0-9._-]{0,63})?$"
+)
+_DOWNLOAD_SECRET = re.compile(
+    r"(?:token|secret|password|passwd|credential|authorization|signature|"
+    r"api[_-]?key|x-amz-(?:credential|signature|security-token))",
+    re.I,
+)
 _MANAGED_ENV = "SPIRALCHAT_EXTERNAL_GIT_APPROVAL"
 
 # Environment variables are capabilities too.  In particular, Git's environment
@@ -526,6 +542,66 @@ class BrokerResult:
     result: RunResult
     sandboxed: bool
     manifest: str
+
+
+@dataclass(frozen=True)
+class ProvisionOutcome:
+    """Typed result for setup/acquisition decisions and retry classification."""
+
+    ok: bool
+    message: str
+    failure_kind: str = ""  # "" | policy | config | transient | setup
+    receipt: str = ""
+
+    @property
+    def transient(self) -> bool:
+        return self.failure_kind == "transient"
+
+
+def _transient_setup_text(detail: str) -> bool:
+    low = str(detail or "").lower()
+    return any(token in low for token in (
+        "timed out", "timeout", "temporar", "try again", "connection reset",
+        "connection refused", "connection aborted", "network is unreachable",
+        "name resolution", "could not resolve host", "tls handshake timeout",
+        "unexpected eof", "resource temporarily unavailable", "http 429",
+        "status 429", "http 500", "http 502", "http 503", "http 504",
+    ))
+
+
+def _validated_public_https_url(raw: str) -> str:
+    """Validate a credential-free public HTTPS target, including resolved IPs."""
+
+    value = str(raw or "").strip()
+    if len(value) > 2048:
+        raise ValueError("URL is too long")
+    parsed = urlsplit(value)
+    if parsed.scheme.lower() != "https" or not parsed.hostname:
+        raise ValueError("downloads require an absolute HTTPS URL")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("credential-bearing URLs are forbidden")
+    if parsed.fragment:
+        raise ValueError("URL fragments are not part of downloadable artifacts")
+    if any(_DOWNLOAD_SECRET.search(key) for key, _value in parse_qsl(
+            parsed.query, keep_blank_values=True)):
+        raise ValueError("credential-bearing URL query parameters are forbidden")
+    host = parsed.hostname.rstrip(".").lower()
+    if host in {"localhost", "localhost.localdomain"} or host.endswith((".local", ".internal")):
+        raise ValueError("local/private download hosts are forbidden")
+    try:
+        addresses = {
+            item[4][0] for item in socket.getaddrinfo(
+                host, parsed.port or 443, type=socket.SOCK_STREAM)
+        }
+    except OSError as exc:
+        raise ValueError(f"download host could not be resolved: {exc}") from exc
+    if not addresses:
+        raise ValueError("download host has no resolved address")
+    for address in addresses:
+        ip = ipaddress.ip_address(address)
+        if not ip.is_global:
+            raise ValueError("local/private download addresses are forbidden")
+    return value
 
 
 def _process_group_alive(process: subprocess.Popen) -> bool:
@@ -1039,7 +1115,10 @@ class CommandBroker:
         except ValueError as exc:
             return f"tool request rejected: {exc}"
         if len(parts) != 2:
-            return "tool request rejected: use `python PACKAGE`, `node PACKAGE`, or `brew FORMULA`"
+            return (
+                "tool request rejected: use `python PACKAGE`, `node PACKAGE`, "
+                "`brew FORMULA`, or `ollama MODEL`"
+            )
         ecosystem, package = parts[0].lower(), parts[1]
         if package.startswith(("-", ".", "/")) or re.search(
                 r"(?:https?://|git(?:\+|hub:|lab:)?|ssh:|file:)", package, re.I):
@@ -1063,6 +1142,11 @@ class CommandBroker:
                 return "tool request rejected: invalid Homebrew core formula"
             if not full_access:
                 return "tool request rejected: Homebrew provisioning requires full access"
+        elif ecosystem == "ollama":
+            if not _OLLAMA_MODEL.fullmatch(package):
+                return "tool request rejected: invalid Ollama model name"
+            if not full_access:
+                return "tool request rejected: Ollama model pulls require full access"
         else:
             return "tool request rejected: unsupported ecosystem"
         tooling = self.root / ".spiral" / "tooling"
@@ -1137,6 +1221,17 @@ class CommandBroker:
             )
             already = check.returncode == 0
             command = [brew, "install", package]
+        elif ecosystem == "ollama":
+            ollama = shutil.which("ollama")
+            if not ollama:
+                return "tool install failed: Ollama CLI is unavailable"
+            check = subprocess.run(
+                [ollama, "show", package], capture_output=True, text=True,
+                stdin=subprocess.DEVNULL, timeout=60,
+                env=scrubbed_environment(self.root, full_access=True),
+            )
+            already = check.returncode == 0
+            command = [ollama, "show" if already else "pull", package]
         else:
             return "tool request rejected: unsupported ecosystem"
 
@@ -1147,16 +1242,42 @@ class CommandBroker:
             "GIT_TERMINAL_PROMPT": "0",
         })
         started = time.monotonic()
-        try:
-            result = subprocess.run(
-                command, cwd=self.root, capture_output=True, text=True,
-                stdin=subprocess.DEVNULL, timeout=timeout, env=env,
+        attempts = 3
+        result = None
+        detail = ""
+        for dispatch in range(1, attempts + 1):
+            try:
+                result = subprocess.run(
+                    command, cwd=self.root, capture_output=True, text=True,
+                    stdin=subprocess.DEVNULL, timeout=timeout, env=env,
+                )
+                detail = ((result.stdout or "") + (result.stderr or ""))[-3000:]
+                if result.returncode == 0 or not _transient_setup_text(detail):
+                    break
+            except Exception as exc:
+                result = None
+                detail = f"{type(exc).__name__}: {exc}"
+                if not _transient_setup_text(detail):
+                    break
+            if dispatch < attempts:
+                from spiral.runtime_control import checkpoint
+
+                checkpoint()
+                time.sleep(min(0.5 * (2 ** (dispatch - 1)), 2.0))
+        ok = bool(result is not None and result.returncode == 0)
+        if ok and ecosystem == "ollama":
+            certificate = subprocess.run(
+                [command[0], "show", package], capture_output=True, text=True,
+                stdin=subprocess.DEVNULL, timeout=60, env=env,
             )
-            ok = result.returncode == 0
-            detail = (result.stdout + result.stderr)[-3000:]
-        except Exception as exc:
-            ok = False
-            detail = f"{type(exc).__name__}: {exc}"
+            if certificate.returncode != 0:
+                ok = False
+                detail = (
+                    certificate.stderr or certificate.stdout
+                    or "Ollama pull completed but the model certificate failed"
+                )[-3000:]
+            else:
+                detail = (certificate.stdout or detail)[-3000:]
         cleanup = ""
         if not ok:
             if remove_on_failure is not None:
@@ -1187,6 +1308,11 @@ class CommandBroker:
             "command": [Path(command[0]).name, *command[1:]],
             "ok": ok, "seconds": round(time.monotonic() - started, 2),
             "credential_environment": "scrubbed",
+            "certificate": (
+                {"command": ["ollama", "show", package],
+                 "sha256": hashlib.sha256(detail.encode()).hexdigest()}
+                if ok and ecosystem == "ollama" else None
+            ),
             "cleanup": cleanup, "detail_tail": detail[-1200:],
         })
         return (
@@ -1194,3 +1320,221 @@ class CommandBroker:
             + (f"; PATH includes {bin_dir}" if bin_dir else "")
             if ok else f"tool install failed: {detail[-1200:]}{'; ' + cleanup if cleanup else ''}"
         )
+
+    def provision_typed(
+        self, request: str, *, timeout: int = 900, full_access: bool = False,
+    ) -> ProvisionOutcome:
+        """Provision through the compatibility API and retain a typed verdict."""
+
+        message = self.provision(request, timeout=timeout, full_access=full_access)
+        ok = message.startswith("tool installed:")
+        if ok:
+            failure_kind = ""
+        elif message.startswith("tool request rejected:"):
+            failure_kind = "policy"
+        elif any(token in message.lower() for token in (
+                "unavailable", "invalid", "requires manual review")):
+            failure_kind = "config"
+        elif _transient_setup_text(message):
+            failure_kind = "transient"
+        else:
+            failure_kind = "setup"
+        receipt = self._record({
+            "kind": "typed-provision-result", "request": request,
+            "full_access": bool(full_access), "ok": ok,
+            "failure_kind": failure_kind, "detail_tail": message[-1200:],
+        })
+        return ProvisionOutcome(ok, message, failure_kind, receipt)
+
+    def download_workspace(
+        self,
+        request: str,
+        *,
+        network_allowed: bool,
+        timeout: int = 300,
+        max_bytes: int = 256 * 1024 * 1024,
+        max_redirects: int = 5,
+        retry_attempts: int = 3,
+    ) -> ProvisionOutcome:
+        """Perform one bounded, credential-free HTTPS GET into the workspace.
+
+        Request syntax is ``URL -> relative/path [sha256=HEX]``.  Existing files,
+        symlink escapes, private hosts, credential-bearing URLs, non-HTTPS redirects,
+        and oversized bodies fail closed.  The artifact is published atomically only
+        after hashing, and both the append-only action log and a durable receipt record
+        the final URL and digest.
+        """
+
+        if not network_allowed:
+            return ProvisionOutcome(
+                False, "download request rejected: network acquisition is disabled",
+                "policy", str(self.audit),
+            )
+        match = re.fullmatch(
+            r"\s*(\S+)\s+->\s+([^\s]+)(?:\s+sha256=([A-Fa-f0-9]{64}))?\s*",
+            str(request or ""),
+        )
+        if not match:
+            return ProvisionOutcome(
+                False,
+                "download request rejected: use `HTTPS_URL -> relative/path "
+                "[sha256=64_HEX]`",
+                "policy", str(self.audit),
+            )
+        raw_url, raw_destination, expected = match.groups()
+        expected = (expected or "").lower()
+        relative = Path(raw_destination)
+        if (relative.is_absolute() or not relative.parts
+                or ".." in relative.parts or relative.parts[0] in {".git", ".spiral"}):
+            return ProvisionOutcome(
+                False, "download request rejected: destination must be a normal "
+                "workspace-relative artifact path", "policy", str(self.audit),
+            )
+        destination = self.root.joinpath(relative)
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.parent.resolve().relative_to(self.root)
+        except (OSError, ValueError) as exc:
+            return ProvisionOutcome(
+                False, f"download request rejected: destination escapes workspace: {exc}",
+                "policy", str(self.audit),
+            )
+        if destination.exists() or destination.is_symlink():
+            return ProvisionOutcome(
+                False, "download request rejected: destination already exists; "
+                "typed acquisition never overwrites workspace data",
+                "policy", str(self.audit),
+            )
+        try:
+            current = _validated_public_https_url(raw_url)
+        except ValueError as exc:
+            return ProvisionOutcome(
+                False, f"download request rejected: {exc}", "policy", str(self.audit))
+        max_bytes = max(1, min(int(max_bytes), 2 * 1024 * 1024 * 1024))
+        max_redirects = max(0, min(int(max_redirects), 10))
+        temporary_path: Path | None = None
+        started = time.monotonic()
+        digest = hashlib.sha256()
+        received = 0
+        redirects: list[str] = []
+        failure_kind = "setup"
+        try:
+            with httpx.Client(
+                timeout=httpx.Timeout(max(1, timeout)), follow_redirects=False,
+                trust_env=False,
+                headers={"User-Agent": "Spiral-typed-download/1"},
+            ) as client:
+                response = None
+                for redirect in range(max_redirects + 1):
+                    from spiral.runtime_control import checkpoint
+
+                    checkpoint()
+                    response = client.build_request("GET", current)
+                    response = client.send(response, stream=True)
+                    if response.status_code in {301, 302, 303, 307, 308}:
+                        location = response.headers.get("location", "")
+                        response.close()
+                        if not location or redirect >= max_redirects:
+                            raise RuntimeError("redirect limit exceeded")
+                        current = _validated_public_https_url(urljoin(current, location))
+                        redirects.append(current)
+                        continue
+                    break
+                if response is None:
+                    raise RuntimeError("download produced no response")
+                with contextlib.closing(response):
+                    response.raise_for_status()
+                    content_length = response.headers.get("content-length")
+                    if content_length:
+                        try:
+                            declared = int(content_length)
+                        except ValueError as exc:
+                            raise RuntimeError("invalid Content-Length") from exc
+                        if declared < 0 or declared > max_bytes:
+                            raise RuntimeError(
+                                f"download exceeds {max_bytes} byte limit")
+                    with tempfile.NamedTemporaryFile(
+                        prefix=".spiral-download-", suffix=".part",
+                        dir=destination.parent, delete=False,
+                    ) as handle:
+                        temporary_path = Path(handle.name)
+                        for chunk in response.iter_bytes(64 * 1024):
+                            checkpoint()
+                            received += len(chunk)
+                            if received > max_bytes:
+                                raise RuntimeError(
+                                    f"download exceeds {max_bytes} byte limit")
+                            digest.update(chunk)
+                            handle.write(chunk)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+            observed = digest.hexdigest()
+            if expected and observed != expected:
+                failure_kind = "config"
+                raise RuntimeError(
+                    f"SHA-256 mismatch: expected {expected}, observed {observed}")
+            os.replace(temporary_path, destination)
+            temporary_path = None
+            receipt_dir = self.root / ".spiral" / "downloads"
+            receipt_dir.mkdir(parents=True, exist_ok=True)
+            receipt_path = receipt_dir / (
+                hashlib.sha256(str(relative).encode()).hexdigest()[:20] + ".json")
+            receipt = {
+                "schema_version": 1,
+                "requested_url": raw_url,
+                "final_url": current,
+                "redirects": redirects,
+                "destination": str(relative),
+                "bytes": received,
+                "sha256": observed,
+                "expected_sha256": expected or None,
+                "integrity": "pinned" if expected else "recorded-unpinned",
+                "credential_environment": "none",
+                "seconds": round(time.monotonic() - started, 2),
+            }
+            receipt_tmp = receipt_path.with_suffix(".json.tmp")
+            receipt_tmp.write_text(json.dumps(receipt, indent=2), encoding="utf-8")
+            receipt_tmp.replace(receipt_path)
+            self._record({"kind": "workspace-download", **receipt, "ok": True})
+            return ProvisionOutcome(
+                True,
+                f"downloaded {received} bytes to {relative}; sha256={observed}",
+                "", str(receipt_path),
+            )
+        except BaseException as exc:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+            if not isinstance(exc, Exception):
+                raise
+            detail = f"{type(exc).__name__}: {exc}"
+            transient_http = (
+                isinstance(exc, httpx.HTTPStatusError)
+                and (
+                    exc.response.status_code in {408, 425, 429}
+                    or 500 <= exc.response.status_code <= 599
+                )
+            )
+            if transient_http or _transient_setup_text(detail) or isinstance(
+                    exc, (httpx.TransportError, httpx.TimeoutException)):
+                failure_kind = "transient"
+            self._record({
+                "kind": "workspace-download", "requested_url": raw_url,
+                "destination": str(relative), "bytes": received,
+                "expected_sha256": expected or None, "ok": False,
+                "failure_kind": failure_kind, "detail_tail": detail[-1200:],
+            })
+            retry_attempts = max(1, min(int(retry_attempts), 5))
+            if failure_kind == "transient" and retry_attempts > 1:
+                from spiral.runtime_control import checkpoint
+
+                checkpoint()
+                time.sleep(min(0.5 * (2 ** (3 - min(retry_attempts, 3))), 2.0))
+                return self.download_workspace(
+                    request, network_allowed=network_allowed, timeout=timeout,
+                    max_bytes=max_bytes, max_redirects=max_redirects,
+                    retry_attempts=retry_attempts - 1,
+                )
+            return ProvisionOutcome(
+                False, f"download failed: {detail[-1200:]}",
+                failure_kind, str(self.audit),
+            )

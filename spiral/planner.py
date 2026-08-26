@@ -169,7 +169,7 @@ ARTIFACT_SCHEMA = {
     "properties": {
         "primary_id": {"type": "string"},
         "deliverables": {
-            "type": "array",
+            "type": "array", "minItems": 1, "maxItems": 16,
             "items": {
                 "type": "object",
                 "properties": {
@@ -186,18 +186,28 @@ ARTIFACT_SCHEMA = {
                     "description": {"type": "string"},
                     "root_hint": {"type": "string"},
                     "output_globs": {
-                        "type": "array", "items": {"type": "string"},
+                        "type": "array", "maxItems": 12,
+                        "items": {"type": "string"},
                     },
                     "visual": {"type": "boolean"},
                     "interactive": {"type": "boolean"},
                     "acceptance_evidence": {
-                        "type": "array", "items": {"type": "string"},
+                        "type": "array", "maxItems": 24,
+                        "items": {"type": "string"},
                     },
                     "tool_families": {
-                        "type": "array", "items": {"type": "string"},
+                        "type": "array", "maxItems": 24, "uniqueItems": True,
+                        "items": {"type": "string"},
+                        "description": (
+                            "Typed prerequisites: python:REQUIREMENT, node:PACKAGE, "
+                            "brew:CORE_FORMULA, ollama:MODEL, or binary:NAME"
+                        ),
                     },
                 },
-                "required": ["id", "kind", "description", "visual", "interactive"],
+                "required": [
+                    "id", "kind", "description", "root_hint", "output_globs",
+                    "visual", "interactive", "acceptance_evidence", "tool_families",
+                ],
             },
         },
     },
@@ -226,11 +236,21 @@ ARTIFACT_SYSTEM = (
     "For each deliverable state its medium, whether it is visual/interactive, likely "
     "workspace root, exact relative output globs that identify finished outputs rather "
     "than source assets (for example output/report.pdf or dist/*.png), tool families "
-    "needed, and concrete acceptance evidence. For a code project, leave output_globs "
+    "needed, and concrete acceptance evidence. Express every concrete prerequisite "
+    "with one safe typed convention: python:REQUIREMENT for a public registry Python "
+    "distribution, node:PACKAGE for a public npm package, brew:CORE_FORMULA for an "
+    "eligible Homebrew core command-line tool (never a tap or cask), ollama:MODEL for "
+    "an explicitly required local model, or binary:NAME when an existing system binary "
+    "is required but must not be acquired automatically. Do not put shell commands, URLs, "
+    "credentials, prose, or speculative tools in tool_families. For a code project, leave output_globs "
     "empty unless the goal actually requires a built package/export or an existing build "
     "convention yields one; never declare the workspace, src/, app/, lib/, or another "
     "source tree as a finished output. Do not add a paper, novelty review, or academic "
-    "classification to an ordinary software build. Evidence "
+    "classification to an ordinary software build. Dependency manifests, test suites, "
+    "fixtures, setup receipts, and documentation support the requested product; do not "
+    "make one of those the primary deliverable or repeat a tool family. List at most 24 "
+    "unique, materially required tool families across a deliverable; do not enumerate an "
+    "ecosystem of optional plugins. Evidence "
     "must describe opening, running, parsing, measuring, testing, rendering, or inspecting "
     "the artifact rather than merely checking that a file exists. Return JSON only."
 )
@@ -853,6 +873,10 @@ def _extract_json(text: str) -> dict:
         raise
 
 
+class _PlannerJSONError(RuntimeError):
+    """A model replied, but no rung yielded a parseable structured object."""
+
+
 def _close_json(prefix: str) -> str:
     """Compute the closers a truncated JSON prefix needs (string + brackets)."""
     stack: list[str] = []
@@ -956,7 +980,7 @@ def _plan_chat(
             if data is not None:
                 res.text = json.dumps(data)
                 return res
-    raise RuntimeError(
+    raise _PlannerJSONError(
         f"planner produced no parseable JSON on {len(ladder)} attempts "
         f"(last reply: {res.completion_tokens} tok, starts {res.text[:80]!r})"
     )
@@ -1115,6 +1139,94 @@ def sanitize_deliverables(rows: list[dict]) -> list[str]:
     return notes
 
 
+_TYPED_TOOL_FAMILY = re.compile(
+    r"^(?:python|node|brew|ollama|binary):\S+$", re.I,
+)
+_PROFILE_DELIVERABLE_KINDS = {
+    "cli": {"cli"},
+    "service": {"service"},
+    "library": {"library"},
+    "plot": {"plot"},
+    "simulation": {"simulation"},
+    "ui": {"web", "android", "ios", "desktop", "game"},
+    "visual-media": {"image", "video", "audio", "3d"},
+    "document": {"document", "presentation", "notebook"},
+    "data": {"dataset"},
+    "formal": {"formal-proof"},
+    "systems": {"infrastructure", "firmware"},
+}
+
+
+class DeliverableManifestError(ValueError):
+    """The analyst responded, but its manifest stayed invalid after repair.
+
+    This is intentionally distinct from transport/model availability failures.
+    Callers may use a conservative fallback when optional analysis cannot run at
+    all, but must not silently reinterpret a semantically invalid manifest as a
+    trustworthy declaration of the requested product and its prerequisites.
+    """
+
+
+def deliverable_manifest_defects(
+    goal: str, data: dict, result: ChatResult | None = None,
+) -> list[str]:
+    """Reject parseable-but-degenerate analyst output before it provisions tools.
+
+    JSON grammar proves shape, not judgment. A token-capped model can close a valid
+    object after repeating one array item hundreds of times, or emit only a support
+    artifact while omitting the product. Those are retryable inference defects, not
+    dependency or source-code failures.
+    """
+
+    defects: list[str] = []
+    reason = str(getattr(result, "done_reason", "") or "").lower()
+    if reason in {"length", "max_tokens", "max_output_tokens"}:
+        defects.append("response reached its output-token limit")
+    rows = data.get("deliverables") if isinstance(data, dict) else None
+    if not isinstance(rows, list) or not rows:
+        return [*defects, "manifest contains no deliverables"]
+    if len(rows) > 16:
+        defects.append(f"manifest contains {len(rows)} deliverables (maximum 16)")
+    ids = [str(row.get("id") or "") for row in rows if isinstance(row, dict)]
+    if len(ids) != len(rows) or any(not value for value in ids):
+        defects.append("every deliverable needs a non-empty id")
+    elif len(set(ids)) != len(ids):
+        defects.append("deliverable ids are not unique")
+    primary = str(data.get("primary_id") or "")
+    if not primary or primary not in set(ids):
+        defects.append("primary_id does not name a deliverable")
+
+    kinds: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            defects.append("deliverable entry is not an object")
+            continue
+        kinds.add(str(row.get("kind") or ""))
+        families = row.get("tool_families") or []
+        if not isinstance(families, list):
+            defects.append(f"{row.get('id', '?')} tool_families is not an array")
+            continue
+        values = [str(value).strip() for value in families]
+        if len(values) > 24:
+            defects.append(
+                f"{row.get('id', '?')} lists {len(values)} tool families (maximum 24)")
+        if len(set(values)) != len(values):
+            defects.append(f"{row.get('id', '?')} repeats tool families")
+        invalid = [value for value in values if not _TYPED_TOOL_FAMILY.fullmatch(value)]
+        if invalid:
+            defects.append(
+                f"{row.get('id', '?')} has invalid typed tool family {invalid[0][:80]!r}")
+
+    profile = product_profile(goal)
+    expected = _PROFILE_DELIVERABLE_KINDS.get(profile)
+    if expected and not kinds.intersection(expected):
+        defects.append(
+            f"requested {profile} product is missing (found kinds: "
+            + ", ".join(sorted(kinds) or ["none"]) + ")"
+        )
+    return list(dict.fromkeys(defects))
+
+
 def analyze_deliverables(
     goal: str, spec: list[dict], repomap: str = "",
     cfg: Config | None = None, ol: Ollama | None = None, progress=None,
@@ -1128,12 +1240,61 @@ def analyze_deliverables(
         f"CURRENT REPOSITORY SIGNALS:\n{repomap[:20000] or '(empty)'}\n\n"
         "Return the deliverable manifest."
     )
-    res = _plan_chat(
-        ARTIFACT_SYSTEM, user, cfg, ol, temperature=0.15,
-        schema=ARTIFACT_SCHEMA, think=cfg.planner.think,
-        max_tokens=min(cfg.planner_max_tokens, 6144), progress=progress,
-    )
-    data = _extract_json(res.text)
+    data: dict = {}
+    res: ChatResult | None = None
+    defects: list[str] = []
+    for analysis_attempt in range(2):
+        correction = ""
+        if analysis_attempt:
+            correction = (
+                "\n\nDETERMINISTIC VALIDATOR REJECTED THE PREVIOUS MANIFEST: "
+                + "; ".join(defects[:8])
+                + ". Re-derive the product from the original goal. Be concise, include "
+                  "the requested product as a deliverable, and emit no duplicate, "
+                  "optional, or speculative tool families."
+            )
+        try:
+            res = _plan_chat(
+                ARTIFACT_SYSTEM + correction, user, cfg, ol, temperature=0.1,
+                schema=ARTIFACT_SCHEMA,
+                # The corrective attempt needs its entire finite budget for the object.
+                think=bool(cfg.planner.think) if analysis_attempt == 0 else False,
+                max_tokens=min(cfg.planner_max_tokens, 6144), progress=progress,
+            )
+        except _PlannerJSONError as exc:
+            defects = [f"response was not valid JSON: {str(exc)[:320]}"]
+            continue
+        except Exception as exc:
+            if defects:
+                raise DeliverableManifestError(
+                    "deliverable manifest corrective attempt failed after an "
+                    f"invalid response: {type(exc).__name__}: {str(exc)[:320]}"
+                ) from exc
+            raise
+        try:
+            parsed = _extract_json(res.text)
+        except (TypeError, ValueError) as exc:
+            data = {}
+            defects = [
+                "response was not valid JSON: "
+                f"{type(exc).__name__}: {str(exc)[:240]}"
+            ]
+            continue
+        if not isinstance(parsed, dict):
+            data = {}
+            defects = [
+                f"response JSON root is {type(parsed).__name__}, expected object"
+            ]
+            continue
+        data = parsed
+        defects = deliverable_manifest_defects(goal, data, res)
+        if not defects:
+            break
+    if defects:
+        raise DeliverableManifestError(
+            "deliverable manifest failed deterministic validation after two attempts: "
+            + "; ".join(defects[:8])
+        )
     rows = [
         row for row in data.get("deliverables", [])
         if isinstance(row, dict) and row.get("id") and row.get("kind")
@@ -1151,6 +1312,14 @@ def analyze_deliverables(
             list(dict.fromkeys(globs))[:12]
             or default_output_globs(str(row.get("kind") or "other"))
         )
+        row["acceptance_evidence"] = list(dict.fromkeys(
+            str(value).strip() for value in row.get("acceptance_evidence") or []
+            if str(value).strip()
+        ))[:24]
+        row["tool_families"] = list(dict.fromkeys(
+            str(value).strip() for value in row.get("tool_families") or []
+            if _TYPED_TOOL_FAMILY.fullmatch(str(value).strip())
+        ))[:24]
         row["root_hint"] = str(row.get("root_hint") or ".").strip() or "."
     if not rows:
         rows = [{
@@ -1163,6 +1332,7 @@ def analyze_deliverables(
     primary = str(data.get("primary_id") or rows[0]["id"])
     if primary not in {str(row["id"]) for row in rows}:
         primary = str(rows[0]["id"])
+    assert res is not None
     return {"schema_version": 1, "primary_id": primary, "deliverables": rows}, res
 
 

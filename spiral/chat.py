@@ -65,7 +65,18 @@ def chat(first: str = "", model: str | None = None, cfg: Config | None = None) -
 
         def on(kind: str, piece: str) -> None:
             nonlocal in_think
-            if kind == "think":
+            if kind == "reset":
+                # A local stream can disconnect after visible tokens.  The model
+                # call is replayed, so make the attempt boundary explicit instead
+                # of presenting the partial tail and replay as one false answer.
+                if in_think:
+                    sys.stdout.write(RST)
+                sys.stdout.write(
+                    "\n\n  [connection reset; replaying response]\n"
+                    f"{CLAY}spiral ›{RST} "
+                )
+                in_think = False
+            elif kind == "think":
                 if not in_think:
                     sys.stdout.write("\n" + DIM)
                     in_think = True

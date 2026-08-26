@@ -1047,6 +1047,43 @@ def ensure_go_dependencies(workspace: str | Path, *, timeout: int = 900) -> dict
         }
 
 
+def _dependency_failure_kind(report: dict) -> str:
+    if report.get("ok"):
+        return ""
+    detail = str(report.get("detail") or "").lower()
+    if any(token in detail for token in (
+            "timed out", "timeout", "temporar", "try again",
+            "connection reset", "connection refused", "network is unreachable",
+            "name resolution", "could not resolve", "tls handshake",
+            "unexpected eof", "resource temporarily unavailable", "http 429",
+            "status 429", "http 500", "http 502", "http 503", "http 504")):
+        return "transient"
+    if any(token in detail for token in (
+            "invalid", "manual review", "unsupported", "credentials",
+            "custom registry", "escapes", "merge-conflict", "is unavailable")):
+        return "config"
+    return "setup"
+
+
+def _dependency_with_retry(run, *, attempts: int = 3) -> dict:
+    """Retry only host/network availability faults before an edit lane exists."""
+
+    report: dict = {"applicable": False, "ok": True}
+    for attempt in range(1, max(1, attempts) + 1):
+        report = run()
+        failure_kind = _dependency_failure_kind(report)
+        report["failure_kind"] = failure_kind
+        report["attempts"] = attempt
+        if not report.get("applicable") or report.get("ok") or failure_kind != "transient":
+            return report
+        if attempt < attempts:
+            from spiral.runtime_control import checkpoint
+
+            checkpoint()
+            time.sleep(min(0.5 * (2 ** (attempt - 1)), 2.0))
+    return report
+
+
 def ensure_builder_dependencies(workspace: str | Path, *, timeout: int = 900,
                                 allow_scripts: bool = False) -> dict:
     """Synchronize supported ecosystems and return the environment for build gates."""
@@ -1056,17 +1093,19 @@ def ensure_builder_dependencies(workspace: str | Path, *, timeout: int = 900,
     reports = []
     for project_root in project_roots:
         rel = str(project_root.relative_to(workspace) or Path("."))
-        for ecosystem, report in (
-            ("node", ensure_node_dependencies(
+        operations = (
+            ("node", lambda: ensure_node_dependencies(
                 project_root, timeout=timeout, allow_scripts=allow_scripts)),
-            ("python", ensure_python_dependencies(
+            ("python", lambda: ensure_python_dependencies(
                 project_root, timeout=timeout,
                 allow_source_builds=allow_scripts)),
-            ("rust", ensure_rust_dependencies(
+            ("rust", lambda: ensure_rust_dependencies(
                 project_root, timeout=timeout)),
-            ("go", ensure_go_dependencies(
+            ("go", lambda: ensure_go_dependencies(
                 project_root, timeout=timeout)),
-        ):
+        )
+        for ecosystem, operation in operations:
+            report = _dependency_with_retry(operation)
             reports.append({
                 **report, "ecosystem": ecosystem,
                 "project_root": str(project_root), "relative_root": rel,
@@ -1089,6 +1128,13 @@ def ensure_builder_dependencies(workspace: str | Path, *, timeout: int = 900,
         "applicable": bool(applicable),
         "ok": not failures,
         "changed": any(report.get("changed") for report in applicable),
+        "failure_kind": (
+            "transient" if any(
+                report.get("failure_kind") == "transient" for report in failures)
+            else "config" if any(
+                report.get("failure_kind") == "config" for report in failures)
+            else "setup" if failures else ""
+        ),
         "detail": (
             "; ".join(
                 f"{report.get('relative_root')}:{report.get('ecosystem')} "

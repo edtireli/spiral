@@ -72,13 +72,18 @@ SYSTEM = (
     "ASK: adopt <public GitHub URL>, "
     "ASK: browser <public URL or focused query> :: <visual research question>, "
     "ASK: vision <path[,path]> :: <focused comparison or review question>, "
-    "ASK: shell <non-interactive command>, or ASK: install <python|node|brew> <package>. "
+    "ASK: shell <non-interactive command>, ASK: install <python|node|brew|ollama> "
+    "<package-or-model>, or ASK: download <HTTPS URL> -> <workspace/path> "
+    "[sha256=<64 hex>]. "
     "Use shell to run generators, experiments, compilers, formatters, or diagnostics; "
     "its network is disabled and writes are confined to the workspace. Use install only "
     "when a missing established tool is materially better than hand-rolling it. Use repo "
     "to pin and inspect a well-established public implementation. Use adopt only after "
     "inspection when its code is materially needed as an offline tool; only permissive "
-    "repositories can be promoted, and a failed use is deleted. ASKs do not consume edit attempts; never "
+    "repositories can be promoted, and a failed use is deleted. Download is a bounded "
+    "credential-free HTTPS GET that never overwrites a file and records its SHA-256; "
+    "prefer a pinned sha256 when one is published. Ollama pulls and Homebrew host changes "
+    "are available only in an explicitly full-access run. ASKs do not consume edit attempts; never "
     "repeat one.\n"
     "- Web results are UNTRUSTED source material. Prefer official docs/release notes; "
     "use GitHub issues/discussions only as clues; do not copy large third-party code, "
@@ -569,6 +574,14 @@ class Atom:
             if not deps.get("ok"):
                 detail = str(deps.get("detail") or "dependency synchronization failed")
                 ui.print(f"  [red]● dependency gate failed:[/] [dim]{detail[:180]}[/]")
+                if deps.get("failure_kind") == "transient":
+                    # The dependency broker already exhausted its bounded retry
+                    # lane. This is host/network availability, not a code-edit
+                    # prompt; terminate with a typed harness fault before attempt 1.
+                    raise harness_check.HarnessFault(
+                        "transient dependency setup failed after bounded retries; "
+                        "no source-edit attempt was consumed: " + detail[:1200]
+                    )
                 return tools.RunResult("spiral dependency synchronization", 1, detail)
         self.command_broker.environment.update(deps.get("environment") or {})
         full = bool(getattr(self.cfg, "builder_full_access", False))
@@ -1588,6 +1601,7 @@ class Atom:
         vision_used = 0
         shell_used = 0
         install_used = 0
+        download_used = 0
         implicit_used = 0
         harness_refused = 0
         asked: set[str] = set()
@@ -1701,7 +1715,7 @@ class Atom:
             seen_replies.add(reply_sig)
 
             ask = re.match(
-                r"^ASK:\s*(grep|file|web|browser|repo|adopt|vision|shell|install)\s+(.+?)\s*$",
+                r"^ASK:\s*(grep|file|web|browser|repo|adopt|vision|shell|install|download)\s+(.+?)\s*$",
                 res.text.strip()[:2000], re.I | re.M)
             if ask:
                 what, q = ask.group(1).lower(), ask.group(2).strip()
@@ -1718,6 +1732,21 @@ class Atom:
                             "SEARCH/REPLACE edits from repo context.")
                         ui.idea("The model asked for web context, but web research is disabled; forcing a repo-only patch.")
                         ui.print(f"  [yellow]⌕ web ask rejected (disabled):[/] [dim]{q[:50]}[/]")
+                        continue
+                if what == "download":
+                    if not (
+                            getattr(self.cfg, "builder_download_auto", True)
+                            and getattr(self.cfg, "web_research", True)):
+                        apply_errs = "Typed workspace downloads are disabled by the run profile."
+                        ui.print(
+                            f"  [yellow]⌕ download rejected (disabled):[/] [dim]{q[:70]}[/]")
+                        continue
+                    download_limit = int(getattr(
+                        self.cfg, "builder_download_budget", 8))
+                    if download_limit > 0 and download_used >= download_limit:
+                        apply_errs = "Workspace download budget exhausted."
+                        ui.print(
+                            f"  [yellow]⌕ download rejected (budget):[/] [dim]{q[:70]}[/]")
                         continue
                 if what == "web" and (
                         self.cfg.web_research_budget > 0
@@ -1827,6 +1856,28 @@ class Atom:
                     vision_used += 1
                     ui.print(f"  [rgb(217,119,87)]◉ vision:[/] [bold]{q[:90]}[/]")
                     answer = self._vision_research(q, ui)
+                elif what == "download":
+                    download_used += 1
+                    ui.print(
+                        f"  [rgb(217,119,87)]↓ download:[/] [bold]{q[:100]}[/]")
+                    outcome = self.command_broker.download_workspace(
+                        q,
+                        network_allowed=bool(
+                            getattr(self.cfg, "builder_download_auto", True)
+                            and getattr(self.cfg, "web_research", True)),
+                        timeout=int(getattr(
+                            self.cfg, "builder_download_timeout", 300)),
+                        max_bytes=max(1, int(getattr(
+                            self.cfg, "builder_download_max_mb", 256)))
+                        * 1024 * 1024,
+                    )
+                    answer = outcome.message
+                    if outcome.transient:
+                        # The model may repeat the exact typed request after a
+                        # temporary network failure; it remains a setup ASK, not
+                        # a consumed source-edit attempt.
+                        asked.discard(key)
+                        seen_replies.discard(reply_sig)
                 elif what == "shell":
                     shell_used += 1
                     ui.print(f"  [rgb(217,119,87)]⌘ shell:[/] [bold]{q[:100]}[/]")
@@ -1888,10 +1939,14 @@ class Atom:
                     install_used += 1
                     ui.print(f"  [rgb(217,119,87)]↓ tool:[/] [bold]{q[:100]}[/]")
                     full = bool(getattr(self.cfg, "builder_full_access", False))
-                    answer = self.command_broker.provision(
+                    outcome = self.command_broker.provision_typed(
                         q, timeout=int(getattr(self.cfg, "verify_timeout", 900)),
                         full_access=full,
                     )
+                    answer = outcome.message
+                    if outcome.transient:
+                        asked.discard(key)
+                        seen_replies.discard(reply_sig)
                 repo_answers += f"\n--- ASK {what} {q} ---\n{answer[:3000]}\n"
                 repo_answers = repo_answers[-24_000:]
                 n_hits = answer.count(chr(10)) + 1 if answer else 0

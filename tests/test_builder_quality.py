@@ -256,6 +256,46 @@ def test_detect_gate_and_dependencies_follow_nested_product(tmp_path, monkeypatc
     assert result["project_root"] == str(product)
 
 
+def test_transient_dependency_setup_retries_before_any_edit_lane(
+        tmp_path, monkeypatch):
+    from spiral import builder_tools
+
+    (tmp_path / "package.json").write_text('{"name":"demo"}')
+    attempts = []
+
+    def node(_root, **_kwargs):
+        attempts.append(1)
+        if len(attempts) < 3:
+            return {
+                "applicable": True, "ok": False,
+                "detail": "connection reset by registry",
+            }
+        return {"applicable": True, "ok": True, "changed": True,
+                "detail": "dependencies synchronized"}
+
+    monkeypatch.setattr(builder_tools, "ensure_node_dependencies", node)
+    monkeypatch.setattr(
+        builder_tools, "ensure_python_dependencies",
+        lambda *_args, **_kwargs: {"applicable": False, "ok": True},
+    )
+    monkeypatch.setattr(
+        builder_tools, "ensure_rust_dependencies",
+        lambda *_args, **_kwargs: {"applicable": False, "ok": True},
+    )
+    monkeypatch.setattr(
+        builder_tools, "ensure_go_dependencies",
+        lambda *_args, **_kwargs: {"applicable": False, "ok": True},
+    )
+    monkeypatch.setattr(builder_tools.time, "sleep", lambda _seconds: None)
+
+    result = builder_tools.ensure_builder_dependencies(tmp_path)
+
+    assert result["ok"] is True
+    assert len(attempts) == 3
+    node_report = next(row for row in result["reports"] if row["ecosystem"] == "node")
+    assert node_report["attempts"] == 3
+
+
 def test_advertisement_goal_enters_visual_pipeline(tmp_path):
     from spiral.conductor import Conductor
 

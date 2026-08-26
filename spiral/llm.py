@@ -13,6 +13,7 @@ import contextlib
 import httpx
 import json
 import os
+import queue
 import threading
 import time
 from pathlib import Path
@@ -106,6 +107,126 @@ class OwnedLocalModelEvictionError(RuntimeError):
         self.models = tuple(sorted(set(models)))
         super().__init__(
             "could not unload run-owned local model(s): " + ", ".join(self.models))
+
+
+class LocalModelStreamStalled(httpx.ReadTimeout):
+    """A local response began streaming and then stopped making progress."""
+
+
+def _iter_local_stream_lines(
+    response: httpx.Response,
+    *,
+    request_timeout: float,
+    stall_timeout: float,
+) -> Iterator[str]:
+    """Read a local stream with a tighter timeout only after its first chunk.
+
+    HTTPX applies one read timeout to both a legitimately long model load and every
+    later socket read. A small timeout on the request would therefore kill slow
+    first-token work; its normal (wall-bounded) timeout is retained. Once any line
+    arrives, a daemon reader lets us enforce a separate no-progress deadline. On a
+    stall we close the response before raising a transport error, which unblocks the
+    reader, releases the inference lease in the caller, and lets the finite local
+    retry path replay the side-effect-free request.
+    """
+
+    inbox: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
+    stop = threading.Event()
+
+    def publish(kind: str, value: Any) -> bool:
+        while not stop.is_set():
+            try:
+                inbox.put((kind, value), timeout=0.05)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def read_lines() -> None:
+        try:
+            for line in response.iter_lines():
+                if not publish("line", line):
+                    return
+            publish("end", None)
+        except BaseException as exc:
+            publish("error", exc)
+
+    reader = threading.Thread(
+        target=read_lines,
+        name=f"spiral-ollama-stream-{id(response):x}",
+        daemon=True,
+    )
+    reader.start()
+    request_deadline = time.monotonic() + max(0.001, float(request_timeout))
+    post_start_limit = max(0.001, float(stall_timeout))
+    progress_deadline: float | None = None
+    try:
+        while True:
+            active_deadline = request_deadline
+            if progress_deadline is not None:
+                active_deadline = min(active_deadline, progress_deadline)
+            wait_for = active_deadline - time.monotonic()
+            if wait_for <= 0:
+                if (progress_deadline is not None
+                        and progress_deadline <= request_deadline):
+                    raise LocalModelStreamStalled(
+                        "local model stream made no progress for "
+                        f"{post_start_limit:g}s after streaming began")
+                raise httpx.ReadTimeout(
+                    "local model stream exceeded the remaining run wall time")
+            try:
+                kind, value = inbox.get(timeout=wait_for)
+            except queue.Empty:
+                # Re-evaluate the absolute deadlines above. In particular, blank
+                # keepalives never move ``progress_deadline`` into the future.
+                continue
+            if kind == "line":
+                meaningful = bool(value.strip())
+                yield value
+                if meaningful:
+                    # Start after the consumer has handled this delta: UI callback
+                    # time is not a transport stall, though the overall wall deadline
+                    # continues to include it.
+                    progress_deadline = time.monotonic() + post_start_limit
+            elif kind == "error":
+                raise value
+            else:
+                return
+    finally:
+        stop.set()
+        try:
+            response.close()
+        except Exception:
+            pass
+        # Closing HTTPX's response closes the underlying socket and normally wakes
+        # the reader immediately. Never let a broken transport hold up the finite
+        # orchestration deadline; the reader is daemonized as a final containment.
+        reader.join(timeout=min(1.0, post_start_limit))
+
+
+_TRANSIENT_LOCAL_HTTP_STATUS = {408, 425, 429, 500, 502, 503, 504}
+
+
+def _transient_local_model_error(error: BaseException) -> bool:
+    """Whether repeating a side-effect-free local inference is useful.
+
+    Ollama restarts, model-load pressure, and broken streaming connections are host
+    availability faults, not failed coding attempts.  Protocol/auth/request errors
+    stay terminal so a bad request cannot spin through the run budget.
+    """
+
+    if isinstance(error, httpx.TransportError):
+        return True
+    if isinstance(error, httpx.HTTPStatusError):
+        response = getattr(error, "response", None)
+        return bool(
+            response is not None
+            and response.status_code in _TRANSIENT_LOCAL_HTTP_STATUS
+        )
+    # A truncated local JSON/JSONL response is commonly the observable tail of a
+    # daemon restart or stream reset.  Retrying it is safe because inference itself
+    # does not mutate the workspace.
+    return isinstance(error, json.JSONDecodeError)
 
 
 def _reject_offline_request(request: httpx.Request) -> httpx.Response:
@@ -357,6 +478,13 @@ class ChatResult:
         return self.prompt_tokens + self.completion_tokens
 
     @property
+    def done_reason(self) -> str:
+        """Normalized provider stop reason for truncation-sensitive callers."""
+
+        raw = self.raw or {}
+        return str(raw.get("done_reason") or raw.get("finish_reason") or "")
+
+    @property
     def spent_on_thinking(self) -> bool:
         """The model reasoned until the budget ran out and never began answering.
 
@@ -406,6 +534,25 @@ class Ollama:
             except Exception:
                 providers = {}
         self.providers = providers or {}
+        try:
+            local_attempts = int(os.environ.get(
+                "SPIRAL_LOCAL_MODEL_RETRY_ATTEMPTS", "3"))
+        except ValueError:
+            local_attempts = 3
+        # Total dispatch attempts, not retries.  Keep this finite and small: an
+        # ambiguous disconnect is charged at the full admitted token cap.
+        self.local_model_retry_attempts = max(1, min(8, local_attempts))
+        try:
+            local_stall = float(os.environ.get(
+                "SPIRAL_LOCAL_STREAM_STALL_SECONDS", "240"))
+        except ValueError:
+            local_stall = 240.0
+        # Four minutes is generous once Ollama has demonstrated forward progress,
+        # while remaining far below the general 20-minute model-load timeout. Keep
+        # the knob finite; sub-second values remain useful to deterministic tests.
+        if not 0.1 <= local_stall <= 900.0:
+            local_stall = 240.0
+        self.local_stream_stall_seconds = local_stall
         self.inference_lease = InferenceLease.from_env()
         if loaded_cfg is None:
             try:
@@ -682,7 +829,7 @@ class Ollama:
         )
         accounted_before = self.budget.total_tokens
         try:
-            result = self._chat_impl(
+            result = self._chat_impl_resilient(
                 model, messages, think=think, num_predict=capped,
                 temperature=temperature, stop=stop, fmt=fmt, on_delta=on_delta,
                 num_ctx=num_ctx, keep_alive=keep_alive, _recovering=_recovering,
@@ -698,6 +845,76 @@ class Ollama:
         if isinstance(result.raw, dict):
             result.raw.setdefault("spiral_budget", self.budget.snapshot())
         return result
+
+    def _chat_impl_resilient(
+        self,
+        model: str,
+        messages: list[dict],
+        *,
+        prior_unrecorded_tokens: int = 0,
+        **call,
+    ) -> ChatResult:
+        """Retry finite transient failures from the local Ollama transport.
+
+        Remote providers already own a status-aware retry loop.  Each ambiguous
+        local dispatch is conservatively charged at its complete admitted prompt
+        and completion allowance before another request is admitted, so recovery
+        cannot make the shared run ceiling fictitious.  A streaming consumer gets
+        one ``reset`` delta before a replay.  That is part of the callback contract:
+        text/thinking emitted by the failed attempt must be discarded rather than
+        concatenated with the replayed answer.
+        """
+
+        if model in self.providers:
+            return self._chat_impl(model, messages, **call)
+        attempts = max(1, int(getattr(
+            self, "local_model_retry_attempts", 3)))
+        prompt_reserve = _prompt_token_reserve(messages)
+        minimum = self._provider_minimum_completion(
+            model, think=bool(call.get("think", False)))
+        requested_cap = call.get("num_predict")
+        admitted_cap = requested_cap
+        for attempt in range(1, attempts + 1):
+            accounted_before = self.budget.total_tokens
+            try:
+                result = self._chat_impl(
+                    model, messages, **{**call, "num_predict": admitted_cap})
+                if attempt > 1 and isinstance(result.raw, dict):
+                    result.raw.setdefault(
+                        "spiral_local_transport_attempts", attempt)
+                return result
+            except Exception as exc:
+                if not _transient_local_model_error(exc):
+                    raise
+                # A nested thinking-recovery call may already have conservatively
+                # accounted its failed transport.  Do not charge or replay the outer
+                # logical call a second time.
+                if self.budget.total_tokens != accounted_before:
+                    raise
+                self.budget.record(prompt_reserve, int(admitted_cap or 0))
+                if attempt >= attempts:
+                    raise
+                try:
+                    admitted_cap = self.budget.begin_retry(
+                        requested_cap,
+                        prompt_token_reserve=prompt_reserve,
+                        minimum_completion_tokens=minimum,
+                        unrecorded_tokens=max(
+                            0, int(prior_unrecorded_tokens or 0)),
+                    )
+                except BudgetExceeded:
+                    # Preserve the actionable transport failure.  The ledger already
+                    # records why another attempt could not safely be admitted.
+                    raise exc
+                from spiral.runtime_control import checkpoint
+
+                checkpoint()
+                on_delta = call.get("on_delta")
+                if callable(on_delta):
+                    on_delta("reset", "")
+                time.sleep(min(0.25 * (2 ** (attempt - 1)), 2.0))
+
+        raise RuntimeError("unreachable local model retry state")
 
     def _chat_impl(
         self,
@@ -715,8 +932,11 @@ class Ollama:
         _recovering: bool = False,
     ) -> ChatResult:
         """One call, two modes. Without on_delta: blocking. With on_delta: streams,
-        calling on_delta(kind, piece) per chunk (kind: 'think' | 'text') so a UI can
-        tick tokens live — the difference between a CLI that feels dead and alive.
+        calling on_delta(kind, piece) per chunk (kind: ``think`` | ``text``) so a UI
+        can tick tokens live — the difference between a CLI that feels dead and
+        alive.  The resilient wrapper may additionally emit ``reset`` before a
+        replay; consumers that retain streamed content must discard the failed
+        attempt when they receive it.
 
         A reasoning model that spends the whole budget thinking is retried once
         with thinking off — see ``_answer_or_recover``."""
@@ -800,19 +1020,28 @@ class Ollama:
                 break
             with contextlib.closing(response) as r:
                 r.raise_for_status()
-                for line in r.iter_lines():
-                    if not line:
-                        continue
-                    chunk = _json.loads(line)
-                    msg = chunk.get("message") or {}
-                    if msg.get("thinking"):
-                        think_parts.append(msg["thinking"])
-                        on_delta("think", msg["thinking"])
-                    if msg.get("content"):
-                        text_parts.append(msg["content"])
-                        on_delta("text", msg["content"])
-                    if chunk.get("done"):
-                        last = chunk
+                lines = _iter_local_stream_lines(
+                    r,
+                    request_timeout=self._remaining_request_timeout(),
+                    stall_timeout=self.local_stream_stall_seconds,
+                )
+                try:
+                    for line in lines:
+                        if not line:
+                            continue
+                        chunk = _json.loads(line)
+                        msg = chunk.get("message") or {}
+                        if msg.get("thinking"):
+                            think_parts.append(msg["thinking"])
+                            on_delta("think", msg["thinking"])
+                        if msg.get("content"):
+                            text_parts.append(msg["content"])
+                            on_delta("text", msg["content"])
+                        if chunk.get("done"):
+                            last = chunk
+                            break
+                finally:
+                    lines.close()
         return self._answer_or_recover(
             ChatResult(
                 text="".join(text_parts),
@@ -859,16 +1088,24 @@ class Ollama:
             # preserve its observed usage before the outer wrapper handles the error.
             self.budget.record(result.prompt_tokens, result.completion_tokens)
             raise
+        recovery_accounted_before = self.budget.total_tokens
         try:
-            again = self._chat_impl(
+            again = self._chat_impl_resilient(
                 model, messages, think=False, _recovering=True,
+                prior_unrecorded_tokens=result.total_tokens,
                 **{**call, "num_predict": capped},
             )
         except BaseException:
-            self.budget.record(
-                result.prompt_tokens + _prompt_token_reserve(messages),
-                result.completion_tokens + capped,
-            )
+            if self.budget.total_tokens == recovery_accounted_before:
+                self.budget.record(
+                    result.prompt_tokens + _prompt_token_reserve(messages),
+                    result.completion_tokens + capped,
+                )
+            else:
+                # The resilient transport already charged every ambiguous recovery
+                # dispatch; only the first, observed thinking result remains pending.
+                self.budget.record(
+                    result.prompt_tokens, result.completion_tokens)
             raise
         return ChatResult(
             text=again.text,
@@ -1168,6 +1405,9 @@ class Ollama:
                 if r.status_code >= 500:
                     spent_prompt += attempt_prompt_reserve
                     spent_completion += attempt_completion_cap
+                    if attempt < retries:
+                        time.sleep(min(2 ** attempt, 20))
+                        continue
                 return ChatResult(text="", prompt_tokens=spent_prompt,
                                   completion_tokens=spent_completion,
                                   raw=last_error)
@@ -1233,15 +1473,25 @@ class Ollama:
                         "POST", f"{self.base_url}/api/chat", json=payload,
                         timeout=request_timeout) as r:
                     r.raise_for_status()
-                    for line in r.iter_lines():
-                        if not line:
-                            continue
-                        chunk = json.loads(line)
-                        if chunk.get("done"):
-                            last = chunk
-                        piece = (chunk.get("message") or {}).get("content", "")
-                        if piece:
-                            yield piece
+                    lines = _iter_local_stream_lines(
+                        r,
+                        request_timeout=self._remaining_request_timeout(),
+                        stall_timeout=self.local_stream_stall_seconds,
+                    )
+                    try:
+                        for line in lines:
+                            if not line:
+                                continue
+                            chunk = json.loads(line)
+                            if chunk.get("done"):
+                                last = chunk
+                            piece = (chunk.get("message") or {}).get("content", "")
+                            if piece:
+                                yield piece
+                            if chunk.get("done"):
+                                break
+                    finally:
+                        lines.close()
         finally:
             self.budget.record(
                 last.get("prompt_eval_count", prompt_reserve),

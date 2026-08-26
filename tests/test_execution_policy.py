@@ -6,6 +6,8 @@ import errno
 import httpx
 import json
 import os
+import threading
+import time
 import types
 from pathlib import Path
 
@@ -19,7 +21,13 @@ from spiral.execution import (
     TaskEvidenceDAG, TaskState,
     OrchestrationPolicy,
 )
-from spiral.llm import InferenceLease, OfflineModelAccess, Ollama, _prompt_token_reserve
+from spiral.llm import (
+    InferenceLease,
+    LocalModelStreamStalled,
+    OfflineModelAccess,
+    Ollama,
+    _prompt_token_reserve,
+)
 from spiral.planner import Milestone, Plan, Task
 from spiral.safety_kernel import (
     SafetyBoundaryError,
@@ -366,6 +374,49 @@ def test_provider_retry_is_recapped_against_unrecorded_first_attempt(monkeypatch
     assert client.budget.calls == 2
 
 
+def test_provider_server_error_retries_instead_of_returning_an_empty_reply(monkeypatch):
+    messages = [{"role": "user", "content": "answer"}]
+    reserve = _prompt_token_reserve(messages)
+    client = Ollama(providers={"remote": {
+        "base_url": "https://provider.test/v1",
+        "api_key_env": "FAKE_PROVIDER_KEY",
+        "min_completion_tokens": 1,
+        "retries": 2,
+    }})
+    client.configure_budget(
+        wall_seconds=60, total_tokens=(reserve + 20) * 3,
+        model_calls=3,
+    )
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(
+                500, json={"error": {"type": "server_error"}})
+        return httpx.Response(200, json={
+            "choices": [{
+                "message": {"content": "done"},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 4},
+        })
+
+    monkeypatch.setenv("FAKE_PROVIDER_KEY", "offline")
+    monkeypatch.setattr("spiral.llm.time.sleep", lambda _delay: None)
+    client._client.close()
+    client._client = httpx.Client(transport=httpx.MockTransport(handler))
+    try:
+        result = client.chat("remote", messages, num_predict=20)
+    finally:
+        client.close()
+
+    assert result.text == "done"
+    assert len(requests) == 2
+    assert client.budget.calls == 2
+    assert client.budget.total_tokens == reserve + 20 + 3 + 4
+
+
 def test_inference_lease_releases_on_cancellation(tmp_path):
     lease_path = tmp_path / "spiral-compute.lease"
     client = Ollama(providers={})
@@ -400,6 +451,283 @@ def test_blocking_request_timeout_is_bounded_and_failure_is_charged():
     assert 0 < observed["timeout"] <= 3
     assert client.budget.total_tokens == reserve + 20
     assert client.budget.total_tokens <= client.budget.limits.total_tokens
+
+
+def test_local_transport_retry_recovers_and_charges_each_dispatch(monkeypatch):
+    messages = [{"role": "user", "content": "finish"}]
+    reserve = _prompt_token_reserve(messages)
+    client = Ollama(providers={})
+    client.local_model_retry_attempts = 2
+    client.configure_budget(
+        wall_seconds=60, total_tokens=(reserve + 10) * 3,
+        model_calls=3,
+    )
+    calls = []
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+        @staticmethod
+        def json():
+            return {
+                "message": {"content": "done"},
+                "prompt_eval_count": 3,
+                "eval_count": 4,
+                "done_reason": "stop",
+            }
+
+    def post(_url, **_kwargs):
+        calls.append("post")
+        if len(calls) == 1:
+            raise httpx.ReadTimeout("local stream stalled")
+        return Response()
+
+    monkeypatch.setattr("spiral.llm.time.sleep", lambda _delay: None)
+    client._client = types.SimpleNamespace(post=post)
+    result = client.chat("local:27b", messages, num_predict=10)
+
+    assert result.text == "done"
+    assert result.raw["spiral_local_transport_attempts"] == 2
+    assert calls == ["post", "post"]
+    assert client.budget.calls == 2
+    assert client.budget.total_tokens == reserve + 10 + 3 + 4
+
+
+def test_local_stream_disconnect_is_retried_without_aborting_the_run(monkeypatch):
+    messages = [{"role": "user", "content": "finish"}]
+    reserve = _prompt_token_reserve(messages)
+    client = Ollama(providers={})
+    client.local_model_retry_attempts = 2
+    client.configure_budget(
+        wall_seconds=60, total_tokens=(reserve + 10) * 3,
+        model_calls=3,
+    )
+    calls = []
+
+    class BrokenStream(httpx.SyncByteStream):
+        def __iter__(self):
+            yield b'{"message":{"content":"partial"}}\n'
+            raise httpx.ReadError("connection reset")
+
+        def close(self):
+            return None
+
+    def handler(request):
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx.Response(200, stream=BrokenStream())
+        return httpx.Response(
+            200,
+            content=(
+                b'{"message":{"content":"done"},"done":true,'
+                b'"prompt_eval_count":3,"eval_count":4}\n'
+            ),
+        )
+
+    monkeypatch.setattr("spiral.llm.time.sleep", lambda _delay: None)
+    client._client.close()
+    client._client = httpx.Client(transport=httpx.MockTransport(handler))
+    deltas = []
+    try:
+        result = client.chat(
+            "local:27b", messages, num_predict=10,
+            on_delta=lambda kind, piece: deltas.append((kind, piece)),
+        )
+    finally:
+        client.close()
+
+    assert result.text == "done"
+    assert result.raw["spiral_local_transport_attempts"] == 2
+    assert len(calls) == 2
+    assert deltas == [
+        ("text", "partial"), ("reset", ""), ("text", "done"),
+    ]
+    visible_attempt = ""
+    for kind, piece in deltas:
+        if kind == "reset":
+            visible_attempt = ""
+        elif kind == "text":
+            visible_attempt += piece
+    assert visible_attempt == "done", (
+        "the failed partial stream must not concatenate with its replay")
+    assert client.budget.calls == 2
+    assert client.budget.total_tokens == reserve + 10 + 3 + 4
+
+
+def test_local_stream_stall_after_partial_is_closed_reset_and_retried(
+        tmp_path, monkeypatch):
+    messages = [{"role": "user", "content": "finish"}]
+    reserve = _prompt_token_reserve(messages)
+    lease_path = tmp_path / "spiral-compute.lease"
+    client = Ollama(timeout=2, providers={})
+    client.local_model_retry_attempts = 2
+    client.local_stream_stall_seconds = 0.05
+    client.inference_lease = InferenceLease(lease_path, timeout=1)
+    client.configure_budget(
+        wall_seconds=5, total_tokens=(reserve + 10) * 3, model_calls=3,
+    )
+    calls = []
+    stalled_closed = threading.Event()
+
+    class StalledStream(httpx.SyncByteStream):
+        def __iter__(self):
+            yield b'{"message":{"content":"partial"}}\n'
+            stalled_closed.wait(5)
+
+        def close(self):
+            stalled_closed.set()
+
+    def handler(request):
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx.Response(200, stream=StalledStream())
+        return httpx.Response(
+            200,
+            content=(
+                b'{"message":{"content":"done"},"done":true,'
+                b'"prompt_eval_count":3,"eval_count":4}\n'
+            ),
+        )
+
+    monkeypatch.setattr("spiral.llm.time.sleep", lambda _delay: None)
+    client._client.close()
+    client._client = httpx.Client(transport=httpx.MockTransport(handler))
+    deltas = []
+    started = time.monotonic()
+    try:
+        result = client.chat(
+            "local:27b", messages, num_predict=10,
+            on_delta=lambda kind, piece: deltas.append((kind, piece)),
+        )
+    finally:
+        client.close()
+
+    assert time.monotonic() - started < 1
+    assert stalled_closed.is_set(), "the timed-out response was not closed"
+    assert _can_lock(lease_path), "the timed-out stream leaked its inference lease"
+    assert result.text == "done"
+    assert result.raw["spiral_local_transport_attempts"] == 2
+    assert len(calls) == 2
+    assert deltas == [
+        ("text", "partial"), ("reset", ""), ("text", "done"),
+    ]
+    assert client.budget.calls == 2
+    assert client.budget.total_tokens == reserve + 10 + 3 + 4
+
+
+def test_local_stream_stall_limit_does_not_cut_off_slow_first_chunk():
+    messages = [{"role": "user", "content": "finish"}]
+    client = Ollama(timeout=1, providers={})
+    client.local_model_retry_attempts = 1
+    client.local_stream_stall_seconds = 0.01
+    client.configure_budget(
+        wall_seconds=3, total_tokens=1_000, model_calls=2,
+    )
+    calls = []
+
+    class SlowFirstStream(httpx.SyncByteStream):
+        def __iter__(self):
+            threading.Event().wait(0.08)
+            yield (
+                b'{"message":{"content":"done"},"done":true,'
+                b'"prompt_eval_count":3,"eval_count":4}\n'
+            )
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(200, stream=SlowFirstStream())
+
+    client._client.close()
+    client._client = httpx.Client(transport=httpx.MockTransport(handler))
+    deltas = []
+    started = time.monotonic()
+    try:
+        result = client.chat(
+            "local:27b", messages, num_predict=10,
+            on_delta=lambda kind, piece: deltas.append((kind, piece)),
+        )
+    finally:
+        client.close()
+
+    assert time.monotonic() - started >= 0.06
+    assert result.text == "done"
+    assert len(calls) == 1
+    assert deltas == [("text", "done")]
+
+
+def test_blank_keepalives_neither_start_nor_extend_progress_deadline():
+    messages = [{"role": "user", "content": "finish"}]
+    reserve = _prompt_token_reserve(messages)
+    client = Ollama(timeout=0.4, providers={})
+    client.local_model_retry_attempts = 1
+    client.local_stream_stall_seconds = 0.05
+    client.configure_budget(
+        wall_seconds=1, total_tokens=reserve + 10, model_calls=1,
+    )
+    closed = threading.Event()
+
+    class BlankKeepaliveStream(httpx.SyncByteStream):
+        def __iter__(self):
+            # More than one stall interval of blank transport activity must not
+            # start the post-progress clock before any model data exists.
+            for _ in range(16):
+                if closed.wait(0.005):
+                    return
+                yield b'\n'
+            yield b'{"message":{"content":"partial"}}\n'
+            # Once real model data arrives, the same keepalives must not refresh
+            # its absolute no-progress deadline.
+            while not closed.wait(0.005):
+                yield b'\n'
+
+        def close(self):
+            closed.set()
+
+    client._client.close()
+    client._client = httpx.Client(transport=httpx.MockTransport(
+        lambda _request: httpx.Response(200, stream=BlankKeepaliveStream())
+    ))
+    deltas = []
+    started = time.monotonic()
+    try:
+        with pytest.raises(LocalModelStreamStalled, match="no progress"):
+            client.chat(
+                "local:27b", messages, num_predict=10,
+                on_delta=lambda kind, piece: deltas.append((kind, piece)),
+            )
+    finally:
+        client.close()
+
+    elapsed = time.monotonic() - started
+    assert 0.1 <= elapsed < 0.3
+    assert closed.is_set(), "blank keepalive stall did not close its response"
+    assert deltas == [("text", "partial")]
+    assert client.budget.calls == 1
+    assert client.budget.total_tokens == reserve + 10
+
+
+def test_local_stream_stall_exception_is_a_transient_transport_error():
+    assert issubclass(LocalModelStreamStalled, httpx.TransportError)
+
+
+def test_local_stream_stall_bound_is_configurable_but_always_finite(monkeypatch):
+    monkeypatch.setenv("SPIRAL_LOCAL_STREAM_STALL_SECONDS", "0.25")
+    configured = Ollama(providers={})
+    try:
+        assert configured.local_stream_stall_seconds == 0.25
+    finally:
+        configured.close()
+
+    monkeypatch.setenv("SPIRAL_LOCAL_STREAM_STALL_SECONDS", "inf")
+    invalid = Ollama(providers={})
+    try:
+        assert invalid.local_stream_stall_seconds == 240.0
+    finally:
+        invalid.close()
 
 
 def test_background_inference_observes_interactive_priority_tickets(tmp_path):

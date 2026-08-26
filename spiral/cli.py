@@ -906,6 +906,7 @@ def main() -> None:
 
 
 def entry() -> None:
+    from spiral.conductor import BuildIncomplete
     from spiral.harness_check import HarnessFault
     from spiral.runtime_control import get_runtime_control
 
@@ -914,19 +915,45 @@ def entry() -> None:
     # The host stops detached jobs with SIGTERM. Translate that request into a
     # normal Python unwind so the same exact-owned-model cleanup used for Ctrl-C
     # runs before process exit. SIGKILL remains intentionally uncatchable.
-    previous_sigterm = None
+    previous_handlers: dict[int, object] = {}
+    cleanup_started = False
     if threading.current_thread() is threading.main_thread():
-        previous_sigterm = signal.getsignal(signal.SIGTERM)
+        previous_handlers = {
+            signal.SIGINT: signal.getsignal(signal.SIGINT),
+            signal.SIGTERM: signal.getsignal(signal.SIGTERM),
+        }
 
         def terminate(signum, _frame):
+            # Terminal cleanup is deliberately short and bounded.  Once it starts,
+            # repeated Ctrl-C/SIGTERM requests must be idempotent: raising another
+            # BaseException here can interrupt exact-owned model eviction and leave
+            # that model resident, so the next managed attempt mistakes it for a
+            # foreign process' model and refuses admission.
+            if cleanup_started:
+                return
             runtime_control.cancel()
+            if signum == signal.SIGINT:
+                raise KeyboardInterrupt
             raise SystemExit(128 + signum)
 
+        signal.signal(signal.SIGINT, terminate)
         signal.signal(signal.SIGTERM, terminate)
     begin_owned_local_model_run()
     try:
         try:
             main()
+        except BuildIncomplete as incomplete:
+            make_console().print(
+                f"\n  [yellow]■ build incomplete:[/] "
+                f"[bold]{incomplete.outcome}[/]\n"
+                + "".join(
+                    f"  [yellow]-[/] {gap}\n"
+                    for gap in incomplete.gaps[:12]
+                )
+                + f"\n  [dim]Durable evidence: {incomplete.result_path}. "
+                  "Resume with the same build command + --resume.[/]\n"
+            )
+            raise SystemExit(4)
         except HarnessFault as fault:
             # Not a build failure. The gate could not measure anything, so stopping and
             # saying why is the honest outcome — reporting the code as red would be a lie
@@ -945,14 +972,18 @@ def entry() -> None:
             )
             raise SystemExit(130)
     finally:
+        # Keep the handlers installed while cleanup runs; ``terminate`` becomes a
+        # no-op in this bounded window.  Restoring the caller's handlers happens even
+        # if eviction or runtime-control shutdown itself fails.
+        cleanup_started = True
         try:
             release_owned_local_models()
         finally:
             try:
                 runtime_control.close()
             finally:
-                if previous_sigterm is not None:
-                    signal.signal(signal.SIGTERM, previous_sigterm)
+                for signum, handler in previous_handlers.items():
+                    signal.signal(signum, handler)
 
 
 if __name__ == "__main__":

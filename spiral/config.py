@@ -1744,6 +1744,13 @@ class Config:
     builder_allow_install_scripts: bool = False
     builder_tool_auto: bool = True
     builder_tool_install_budget: int = 6
+    # Typed HTTPS GETs write one new workspace artifact, never overwrite, reject
+    # credentials/private hosts, and retain a SHA-256 receipt. This is separate
+    # from shell network access and can be disabled without disabling web research.
+    builder_download_auto: bool = True
+    builder_download_budget: int = 8
+    builder_download_max_mb: int = 256
+    builder_download_timeout: int = 300
     builder_shell_budget: int = 24
     builder_vision_budget: int = 8
     builder_browser_budget: int = 8
@@ -1939,6 +1946,14 @@ class Config:
                 "builder_tool_auto", cfg.builder_tool_auto))
             cfg.builder_tool_install_budget = int(overlay.get(
                 "builder_tool_install_budget", cfg.builder_tool_install_budget))
+            cfg.builder_download_auto = bool(overlay.get(
+                "builder_download_auto", cfg.builder_download_auto))
+            cfg.builder_download_budget = int(overlay.get(
+                "builder_download_budget", cfg.builder_download_budget))
+            cfg.builder_download_max_mb = int(overlay.get(
+                "builder_download_max_mb", cfg.builder_download_max_mb))
+            cfg.builder_download_timeout = int(overlay.get(
+                "builder_download_timeout", cfg.builder_download_timeout))
             cfg.builder_shell_budget = int(overlay.get(
                 "builder_shell_budget", cfg.builder_shell_budget))
             cfg.builder_vision_budget = int(overlay.get(

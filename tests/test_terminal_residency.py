@@ -641,6 +641,69 @@ def test_sigterm_cleanup_is_bounded_behind_interactive_model_lane(
     assert signal.getsignal(signal.SIGTERM) == previous_sigterm
 
 
+def test_repeated_terminal_signals_cannot_interrupt_exact_model_cleanup(monkeypatch):
+    events = []
+    previous_sigint = signal.getsignal(signal.SIGINT)
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+    monkeypatch.setattr(cli, "begin_owned_local_model_run", lambda: None)
+    monkeypatch.setattr(
+        cli, "make_console", lambda: types.SimpleNamespace(print=lambda *_a, **_k: None),
+    )
+    monkeypatch.setattr(
+        cli, "main", lambda: signal.raise_signal(signal.SIGINT),
+    )
+
+    def release():
+        events.append("release-start")
+        # This reproduces the live double-Ctrl-C failure, and also pins the same
+        # idempotence for a controller repeating SIGTERM while cleanup is active.
+        signal.raise_signal(signal.SIGINT)
+        signal.raise_signal(signal.SIGTERM)
+        events.append("release-complete")
+
+    monkeypatch.setattr(cli, "release_owned_local_models", release)
+
+    with pytest.raises(SystemExit) as stopped:
+        cli.entry()
+
+    assert stopped.value.code == 130
+    assert events == ["release-start", "release-complete"]
+    assert signal.getsignal(signal.SIGINT) == previous_sigint
+    assert signal.getsignal(signal.SIGTERM) == previous_sigterm
+
+
+def test_incomplete_build_is_a_durable_nonzero_terminal_outcome(
+        tmp_path, monkeypatch):
+    from spiral.conductor import BuildIncomplete
+
+    events = []
+    result = tmp_path / ".spiral" / "result.json"
+    result.parent.mkdir()
+    result.write_text('{"outcome":"finished_with_gaps"}')
+    monkeypatch.setattr(cli, "begin_owned_local_model_run", lambda: None)
+    monkeypatch.setattr(
+        cli, "release_owned_local_models", lambda: events.append("cleanup"))
+    printed = []
+    monkeypatch.setattr(
+        cli, "make_console",
+        lambda: types.SimpleNamespace(
+            print=lambda value, *_args, **_kwargs: printed.append(str(value))),
+    )
+    monkeypatch.setattr(
+        cli, "main",
+        lambda: (_ for _ in ()).throw(BuildIncomplete(
+            "finished_with_gaps", ["1.2 is blocked"], str(result))),
+    )
+
+    with pytest.raises(SystemExit) as stopped:
+        cli.entry()
+
+    assert stopped.value.code == 4
+    assert events == ["cleanup"]
+    rendered = "\n".join(printed)
+    assert "1.2 is blocked" in rendered and str(result) in rendered
+
+
 @pytest.mark.parametrize("outcome", ["success", "error", "interrupt", "sigterm"])
 def test_cli_terminal_boundary_always_runs_cleanup(monkeypatch, outcome):
     events = []
