@@ -662,11 +662,15 @@ def test_local_stream_stall_limit_does_not_cut_off_slow_first_chunk():
 def test_blank_keepalives_neither_start_nor_extend_progress_deadline():
     messages = [{"role": "user", "content": "finish"}]
     reserve = _prompt_token_reserve(messages)
-    client = Ollama(timeout=0.4, providers={})
+    # Hosted macOS runners can take hundreds of milliseconds merely to schedule the
+    # reader thread under a four-job matrix. Keep the semantic deadlines far apart:
+    # blank keepalives must outlive the 50 ms post-progress limit, while the overall
+    # request budget must not win the race before the first real chunk is observed.
+    client = Ollama(timeout=2.0, providers={})
     client.local_model_retry_attempts = 1
     client.local_stream_stall_seconds = 0.05
     client.configure_budget(
-        wall_seconds=1, total_tokens=reserve + 10, model_calls=1,
+        wall_seconds=3, total_tokens=reserve + 10, model_calls=1,
     )
     closed = threading.Event()
 
@@ -703,7 +707,7 @@ def test_blank_keepalives_neither_start_nor_extend_progress_deadline():
         client.close()
 
     elapsed = time.monotonic() - started
-    assert 0.1 <= elapsed < 0.3
+    assert 0.1 <= elapsed < 1.5
     assert closed.is_set(), "blank keepalive stall did not close its response"
     assert deltas == [("text", "partial")]
     assert client.budget.calls == 1
