@@ -707,7 +707,8 @@ def test_explicit_uncensored_mode_marks_process_and_bypasses_academic_prose(
 
     for env_name in (
             "SPIRAL_UNCENSORED_ACTIVE", "SPIRAL_WORKER",
-            "SPIRAL_PLANNER", "SPIRAL_ESCALATION"):
+            "SPIRAL_PLANNER", "SPIRAL_ESCALATION", "SPIRAL_CRITIC",
+            "SPIRAL_RESEARCH_AUDITOR", "SPIRAL_JANITOR"):
         monkeypatch.setenv(env_name, "")
     monkeypatch.setattr(Config, "load", classmethod(lambda cls: cfg))
     monkeypatch.setattr("spiral.cli.Ollama", lambda *_args, **_kwargs: Installed())
@@ -718,6 +719,10 @@ def test_explicit_uncensored_mode_marks_process_and_bypasses_academic_prose(
         fallback_role="worker")
 
     assert os.environ["SPIRAL_UNCENSORED_ACTIVE"] == "1"
+    for role in (
+            "WORKER", "PLANNER", "ESCALATION", "CRITIC",
+            "RESEARCH_AUDITOR", "JANITOR"):
+        assert os.environ[f"SPIRAL_{role}"] == cfg.uncensored_model
     assert text == "existing writer"
     assert [model for model, _, _ in models.calls] == [cfg.worker.name]
     assert models.evictions == [{cfg.worker.name}]

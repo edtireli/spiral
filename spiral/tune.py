@@ -28,7 +28,7 @@ KV_CATALOG = {
     # the abliterated seat is the same architecture, so the same KV per token.
     # Thinking is a per-request toggle on this one model, not a second model, so
     # the high- and low-thinking lanes share this entry.
-    "qwen3.8:27b-uncensored": 66_000,
+    "qwen3.8:27b-heretic": 66_000,
 }
 KV_DEFAULT = 160_000
 QFACTOR = {"f16": 1.0, "": 1.0, "q8_0": 0.5, "q4_0": 0.25}

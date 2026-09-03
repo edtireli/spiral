@@ -1677,11 +1677,10 @@ class Config:
         default_factory=lambda: AcademicPlannerSpec("", num_ctx=8192, think=False)
     )
 
-    # The abliterated seat, used only when a run asks for it with --uncensored.
-    # Never a default: refusal removal costs some instruction-following precision,
-    # and the judging seats stay stock so a run is not graded by the model whose
-    # checks were removed.
-    uncensored_model: str = "qwen3.8:27b-uncensored"
+    # The refusal-removed seat, used only when a run asks for it with --uncensored.
+    # Never a default: refusal removal costs some instruction-following precision.
+    # An explicit unrestricted run remains model-sticky across every local role.
+    uncensored_model: str = "qwen3.8:27b-heretic"
 
     def spec_for(self, model_name: str) -> ModelSpec:
         """The ModelSpec whose name matches — so per-model num_ctx follows the

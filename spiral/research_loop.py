@@ -1398,6 +1398,15 @@ class ResearchLoop:
                     "fallback_used": status != "success",
                 })
 
+        if str(os.environ.get("SPIRAL_UNCENSORED_ACTIVE", "")).strip().lower() in {
+            "1", "true", "yes", "on",
+        }:
+            record_outcome(
+                "disabled", attempted=False,
+                fallback_reason="explicit Heretic model route is active",
+            )
+            return None
+
         spec = getattr(self.cfg, "academic_planner", None)
         if spec is None or not getattr(spec, "enabled", False):
             record_outcome(
