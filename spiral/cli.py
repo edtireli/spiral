@@ -80,17 +80,16 @@ def _apply_tier(cfg, console, tier, api_key: str | None = None):
 
 
 def _apply_uncensored(console) -> None:
-    """Point the GENERATING seats at the abliterated model for this process only.
+    """Point every local model seat at the selected Heretic model for this process only.
 
     Set as SPIRAL_<ROLE> environment overrides rather than on one Config object:
     every subcommand loads its own Config, several of them deep inside the run
     (style_tool, research_loop), and the env vars are the seam all of them
     already read.
 
-    The JUDGING seats — critic and research_auditor — deliberately keep their
-    stock models. A run graded by the model whose checks were removed is a run
-    with no grader, and the same-family-rubber-stamp finding that put gemma in
-    the critic seat applies twice over here.
+    This mode is an explicit user choice and is model-sticky: planning, generation,
+    criticism, research audit and compaction all remain on the same weights. That
+    prevents a Heretic chat from silently handing part of its task to stock Qwen.
     """
     import os
 
@@ -107,10 +106,12 @@ def _apply_uncensored(console) -> None:
     # ResearchLoop uses this marker to keep publication prose on the abliterated
     # generating seats instead of silently diverting it through the academic LoRA.
     os.environ["SPIRAL_UNCENSORED_ACTIVE"] = "1"
-    for role in ("worker", "planner", "escalation"):
+    for role in (
+        "worker", "planner", "escalation", "critic", "research_auditor", "janitor",
+    ):
         os.environ[f"SPIRAL_{role.upper()}"] = model
     reveal(console, f"  [rgb(217,119,87)]◆ uncensored[/] — {model} on: "
-                    "worker, planner, escalation [dim](judges stay stock)[/]\n")
+                    "worker, planner, escalation, critic, research audit, janitor\n")
 
 
 def _free_foreign_models(console, cfg=None) -> None:
