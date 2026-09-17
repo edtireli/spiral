@@ -38,7 +38,8 @@ def test_gate_redetected_when_project_materialises():
     assert c.gate == "" and c._refresh_gate() is False        # empty repo, nothing to detect
     (d / "pyproject.toml").write_text("[project]\nname='x'\nversion='0'\n")
     assert c._refresh_gate() is True                          # gate appears mid-run
-    assert "pytest" in c.gate and "footguns" in c.gate_disp
+    assert ".spiral/rungs/test.py" in c.gate and "footguns" in c.gate_disp
+    assert 'pytest.main(["-q"])' in (d / ".spiral/rungs/test.py").read_text()
     assert c._refresh_gate() is False                         # idempotent — no false 'changed'
 
 
@@ -67,7 +68,8 @@ def test_real_failure_still_red():
 def test_tests_dir_alone_triggers_gate():
     d = _repo()
     (d / "tests").mkdir()
-    assert "pytest" in detect_gate(d)
+    assert ".spiral/rungs/test.py" in detect_gate(d)
+    assert 'pytest.main(["-q"])' in (d / ".spiral/rungs/test.py").read_text()
 
 
 

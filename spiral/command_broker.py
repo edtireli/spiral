@@ -192,6 +192,12 @@ def _managed_execution() -> bool:
     return os.environ.get(_MANAGED_ENV) == "1"
 
 
+def shell_network_policy(*, full_access: bool) -> str:
+    """Describe shell egress authority, not whether a destination is reachable."""
+
+    return "allowed" if full_access and not _managed_execution() else "denied"
+
+
 def _credential_boundaries() -> tuple[tuple[Path, str], ...]:
     """Host credential stores that a managed shell must not read directly."""
 
@@ -307,6 +313,15 @@ def shell_executable() -> str:
     if sys.platform == "darwin" and Path("/bin/zsh").is_file():
         return "/bin/zsh"
     return shutil.which("bash") or shutil.which("sh") or "/bin/sh"
+
+
+_PIPELINE_STATUS_PREAMBLE = (
+    "if ! (set -o pipefail) 2>/dev/null; then\n"
+    "  printf '%s\\n' 'SPIRAL_VERIFIER_UNAVAILABLE: shell cannot report failed pipeline stages' >&2\n"
+    "  exit 126\n"
+    "fi\n"
+    "set -o pipefail\n"
+)
 
 
 def scrubbed_environment(
@@ -542,6 +557,9 @@ class BrokerResult:
     result: RunResult
     sandboxed: bool
     manifest: str
+    # Report the broker's decision directly; workspace audit files are mutable.
+    # Older callers constructing three-field results must not imply permission.
+    network: str = "unknown"
 
 
 @dataclass(frozen=True)
@@ -736,6 +754,11 @@ class CommandBroker:
     ) -> tuple[list[str], bool]:
         from spiral.safety_kernel import protected_boundaries
 
+        # A display filter must not turn a failed producer into successful tool
+        # evidence (`installer | tail` was observed returning zero on failure).
+        # This affects only the owned child shell, never login files/settings.
+        command = _PIPELINE_STATUS_PREAMBLE + command
+
         managed = _managed_execution()
         kernel_boundaries = protected_boundaries(self.root)
         kernel_paths = [
@@ -866,7 +889,7 @@ class CommandBroker:
                 argv.extend(["--ro-bind", str(protected), str(protected)])
             argv.extend([
                 "--proc", "/proc", "--chdir", str(cwd),
-                "/bin/sh", "-lc", command,
+                shell_executable(), "-lc", command,
             ])
             return argv, True
         if bwrap and (not allow_network or managed):
@@ -888,10 +911,10 @@ class CommandBroker:
                 argv.extend(["--ro-bind", str(reference), str(reference)])
             argv.extend([
                 "--proc", "/proc", "--chdir", str(cwd),
-                "/bin/sh", "-lc", command,
+                shell_executable(), "-lc", command,
             ])
             return argv, True
-        return ["/bin/sh", "-lc", command], False
+        return [shell_executable(), "-lc", command], False
 
     def run(
         self, command: str, *, cwd: str | Path | None = None, timeout: int = 300,
@@ -929,7 +952,7 @@ class CommandBroker:
                 "kind": purpose, "command": command, "cwd": str(work),
                 "ok": False, "blocked": True, "reason": error,
             })
-            return BrokerResult(result, False, manifest)
+            return BrokerResult(result, False, manifest, network="not-executed")
 
         from spiral.safety_kernel import SafetyBoundaryError, protection_active
 
@@ -949,7 +972,7 @@ class CommandBroker:
                 "ok": False, "blocked": True,
                 "reason": f"protected-path contract: {exc}",
             })
-            return BrokerResult(result, False, manifest)
+            return BrokerResult(result, False, manifest, network="not-executed")
 
         if full_access and protection_active(self.root) and not sandboxed:
             result = RunResult(
@@ -963,7 +986,7 @@ class CommandBroker:
                 "ok": False, "blocked": True,
                 "reason": "safety-kernel sandbox unavailable",
             })
-            return BrokerResult(result, False, manifest)
+            return BrokerResult(result, False, manifest, network="not-executed")
         if managed and not sandboxed:
             result = RunResult(
                 command, 126,
@@ -976,7 +999,7 @@ class CommandBroker:
                 "ok": False, "blocked": True,
                 "reason": "managed Git/network sandbox unavailable",
             })
-            return BrokerResult(result, False, manifest)
+            return BrokerResult(result, False, manifest, network="not-executed")
         # Full access is deliberately unsandboxed; require_sandbox does not apply.
         if require_sandbox and not sandboxed and not full_access:
             result = RunResult(
@@ -988,7 +1011,7 @@ class CommandBroker:
                 "kind": purpose, "command": command, "cwd": str(work),
                 "ok": False, "blocked": True, "reason": "sandbox unavailable",
             })
-            return BrokerResult(result, False, manifest)
+            return BrokerResult(result, False, manifest, network="not-executed")
 
         env = scrubbed_environment(
             self.root, self.environment, full_access=full_access)
@@ -1074,6 +1097,20 @@ class CommandBroker:
         runtime_control.checkpoint()
         output = "".join(lines).strip()
         result = RunResult(command, code, output)
+        # The standalone Linux protected-path fallback can select a network
+        # namespace even for a full-access caller. Inspect only our generated
+        # launcher prefix, never the untrusted shell command in the final slot.
+        network_namespace = (
+            sandboxed and Path(argv[0]).name == "bwrap"
+            and argv[-3:-1] == [shell_executable(), "-lc"]
+            and "--unshare-net" in argv[1:-3]
+        )
+        network = (
+            "not-executed" if process is None else
+            "denied" if managed or network_namespace else
+            "allowed" if allow_network or full_access else
+            "denied" if sandboxed else "not-isolated"
+        )
         try:
             audit_cwd = str(work.relative_to(self.root) or ".")
         except ValueError:
@@ -1083,10 +1120,7 @@ class CommandBroker:
             "command": command,
             "cwd": audit_cwd,
             "sandboxed": sandboxed,
-            "network": (
-                "denied" if managed else
-                "allowed" if allow_network or full_access else "denied"
-            ),
+            "network": network,
             "host_read": (
                 "allowed-except-vcs-credentials" if managed and full_access else
                 "allowed" if allow_host_read or full_access else
@@ -1095,6 +1129,8 @@ class CommandBroker:
             "reference_roots": [str(path) for path in self.reference_roots],
             "environment_keys": sorted(env),
             "exit": code,
+            "pipeline_status": ("pipefail" if argv[-1].startswith(_PIPELINE_STATUS_PREAMBLE)
+                                else "launcher-default"),
             "seconds": round(max(
                 0.0,
                 time.monotonic() - started
@@ -1103,7 +1139,7 @@ class CommandBroker:
             "output_tail": output[-2000:],
             "ok": code == 0,
         })
-        return BrokerResult(result, sandboxed, manifest)
+        return BrokerResult(result, sandboxed, manifest, network=network)
 
     def provision(
         self, request: str, *, timeout: int = 900, full_access: bool = False,
@@ -1305,6 +1341,7 @@ class CommandBroker:
             self.environment["PATH"] = str(bin_dir) + os.pathsep + current
         self._record({
             "kind": "tool-install", "ecosystem": ecosystem, "package": package,
+            "python_environment": str(tooling / "python") if ecosystem == "python" else None,
             "command": [Path(command[0]).name, *command[1:]],
             "ok": ok, "seconds": round(time.monotonic() - started, 2),
             "credential_environment": "scrubbed",
@@ -1315,11 +1352,18 @@ class CommandBroker:
             ),
             "cleanup": cleanup, "detail_tail": detail[-1200:],
         })
-        return (
+        message = (
             f"tool installed: {ecosystem} {package}"
             + (f"; PATH includes {bin_dir}" if bin_dir else "")
             if ok else f"tool install failed: {detail[-1200:]}{'; ' + cleanup if cleanup else ''}"
         )
+        if ecosystem == "python":
+            message += (
+                f"; installation target={tooling / 'python'}"
+                f"; interpreter={tooling / 'python' / 'bin' / 'python'}"
+                "; this tool does not install into any other requested environment"
+            )
+        return message
 
     def provision_typed(
         self, request: str, *, timeout: int = 900, full_access: bool = False,

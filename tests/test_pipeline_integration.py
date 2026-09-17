@@ -189,7 +189,8 @@ def test_capability_resolution_lands_before_the_snapshot(tmp_path):
     """Declaring a dependency after the snapshot leaves the tree dirty forever."""
     root = _repo(tmp_path / "cap")
     conductor = _conductor(root)
-    conductor._resolve_capabilities("Build a Reddit bot that replies to mentions")
+    conductor._resolve_capabilities("Build a Reddit bot that replies to mentions",
+                                    tool_families=["python-package:praw"])
     assert "praw" in (root / "requirements.txt").read_text()
     conductor._snapshot()
     assert _clean(root)

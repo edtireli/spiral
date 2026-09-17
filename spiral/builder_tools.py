@@ -679,13 +679,24 @@ def _python_requirements(root: Path) -> tuple[list[str], list[Path], list[str]]:
 
 
 def ensure_python_dependencies(workspace: str | Path, *, timeout: int = 900,
-                               allow_source_builds: bool = False) -> dict:
-    """Install declared Python dependencies into an isolated project-local venv."""
+                               allow_source_builds: bool = False,
+                               verification_requirements: tuple[str, ...] = ()) -> dict:
+    """Synchronize project and harness dependencies in the same isolated venv.
+
+    Harness requirements come from the selected verifier, never from the goal.
+    They do not rewrite the project's dependency declarations or enable tool or
+    source-build installation. The normal registry-only wheel policy still applies.
+    """
 
     root = Path(workspace).resolve()
     requirements, inputs, errors = _python_requirements(root)
+    # This parameter is an internal capability, not a model-authored package list.
+    if verification_requirements not in ((), ("pytest",)):
+        raise ValueError("unsupported verification requirements")
     if errors:
-        return {"applicable": bool(inputs), "ok": False, "detail": "; ".join(errors[:6])}
+        return {"applicable": bool(inputs or verification_requirements), "ok": False,
+                "detail": "; ".join(errors[:6])}
+    requirements = list(dict.fromkeys([*requirements, *verification_requirements]))
     if not requirements:
         return {"applicable": False, "ok": True}
 
@@ -757,6 +768,7 @@ def ensure_python_dependencies(workspace: str | Path, *, timeout: int = 900,
             "schema_version": 1,
             "input_sha256": wanted,
             "requirements": requirements,
+            "verification_requirements": list(verification_requirements),
             "source_builds": "allowed" if allow_source_builds else "binary-wheels-only",
             "credential_environment": "scrubbed",
             "seconds": round(time.time() - started, 2),
@@ -1085,7 +1097,8 @@ def _dependency_with_retry(run, *, attempts: int = 3) -> dict:
 
 
 def ensure_builder_dependencies(workspace: str | Path, *, timeout: int = 900,
-                                allow_scripts: bool = False) -> dict:
+                                allow_scripts: bool = False,
+                                verification_command: str = "") -> dict:
     """Synchronize supported ecosystems and return the environment for build gates."""
 
     workspace = Path(workspace).resolve()
@@ -1093,12 +1106,19 @@ def ensure_builder_dependencies(workspace: str | Path, *, timeout: int = 900,
     reports = []
     for project_root in project_roots:
         rel = str(project_root.relative_to(workspace) or Path("."))
+        # The Python ladder always executes pytest, including stdlib projects
+        # whose manifests declare no third-party dependencies. Provision that
+        # instrument in its own selected interpreter before asking for code edits.
+        # Rungs are materialized by gate discovery at each selected project root.
+        verifier_requirements = (("pytest",) if ".spiral/rungs/" in verification_command
+                                 and (project_root / ".spiral/rungs").is_dir() else ())
         operations = (
             ("node", lambda: ensure_node_dependencies(
                 project_root, timeout=timeout, allow_scripts=allow_scripts)),
             ("python", lambda: ensure_python_dependencies(
                 project_root, timeout=timeout,
-                allow_source_builds=allow_scripts)),
+                allow_source_builds=allow_scripts,
+                verification_requirements=verifier_requirements)),
             ("rust", lambda: ensure_rust_dependencies(
                 project_root, timeout=timeout)),
             ("go", lambda: ensure_go_dependencies(

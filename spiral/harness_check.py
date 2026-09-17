@@ -42,6 +42,21 @@ class HarnessFault(RuntimeError):
     harness's, not the code's."""
 
 
+VERIFIER_UNAVAILABLE = "SPIRAL_VERIFIER_UNAVAILABLE:"
+
+
+def require_verifier_started(output: str, code: int) -> None:
+    """A trusted rung's startup failure must not enter a source-edit loop.
+
+    Use an explicit instrument marker, not arbitrary test tracebacks: a test
+    importing a missing application dependency remains a real failing test.
+    """
+    if code:
+        for line in (output or "").splitlines():
+            if line.startswith(VERIFIER_UNAVAILABLE):
+                raise HarnessFault(line + "; no source-edit attempt was consumed")
+
+
 @dataclass(frozen=True)
 class Fault:
     """One reason the failure is the instrument's, not the code's."""

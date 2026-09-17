@@ -71,9 +71,10 @@ def _tool_from_command(command: str) -> str:
 
 
 class Toolsmith:
-    def __init__(self, workspace: str | Path | None = None):
+    def __init__(self, workspace: str | Path | None = None, *, registry_path: Path | None = None):
         self.workspace = Path(workspace).resolve() if workspace else None
-        self.path = Path.home() / ".local" / "share" / "spiral" / "toolsmith.json"
+        self.path = (Path(registry_path) if registry_path is not None else
+                     Path.home() / ".local" / "share" / "spiral" / "toolsmith.json")
         try:
             self.state = json.loads(self.path.read_text(encoding="utf-8"))
         except Exception:

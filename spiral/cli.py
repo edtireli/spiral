@@ -8,9 +8,11 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import signal
 import threading
+import time
 from pathlib import Path
 
 from rich.console import Console
@@ -20,6 +22,7 @@ from spiral.theme import make_console, reveal
 from spiral.config import Config, general_api_providers
 from spiral.llm import (
     Ollama,
+    InferenceLease,
     begin_owned_local_model_run,
     release_owned_local_models,
 )
@@ -32,6 +35,25 @@ def _health(console: Console) -> None:
         reveal(console, f"  [green]●[/green] ollama {version}  ·  worker [bold]{cfg.worker.name}[/bold]\n")
     else:
         reveal(console, f"  [red]●[/red] ollama unreachable at {cfg.base_url}\n")
+
+
+def _full_access_notice() -> str:
+    from spiral.command_broker import shell_network_policy
+
+    if shell_network_policy(full_access=True) == "denied":
+        return (
+            "  [rgb(217,119,87)]◆ full access[/] — shell filesystem reach extends beyond "
+            "the workspace; managed OS isolation remains mandatory and shell network is off.\n"
+            "  [dim]Use approved typed web, browser, download and install tools for network "
+            "access. Protected paths, credentials, destructive actions and separately "
+            "approved Git mutations remain restricted.[/]\n"
+        )
+    return (
+        "  [rgb(217,119,87)]◆ full access[/] — the model's shell reaches beyond the "
+        "workspace, with network on; normally unsandboxed.\n"
+        "  [dim]Protected-path contracts, disk-wipe · halt · fork-bomb and separately "
+        "approved Git mutations stay blocked.[/]\n"
+    )
 
 
 def _info_line(console: Console, workspace: str, *extra: str) -> None:
@@ -114,13 +136,22 @@ def _apply_uncensored(console) -> None:
                     "worker, planner, escalation, critic, research audit, janitor\n")
 
 
-def _free_foreign_models(console, cfg=None) -> None:
+def _free_foreign_models(console, cfg=None, *, drain_seconds: float = 4.0,
+                         _clock=time.monotonic, _sleep=time.sleep) -> None:
     """Read-only residency preflight; never evict a model this run does not own.
 
     The historical name is retained for callers, but the destructive sweep is
     intentionally gone.  A foreign resident can make a second large model fail
     with Metal OOM on a 32 GB Mac; stopping with an actionable message preserves
     ownership and is safer than silently unloading another app's model.
+
+    A short, fixed grace lets an already-expiring host action drain naturally.
+    Managed runs hold their existing configured inference lane while draining;
+    this does not claim ownership of any resident model. Standalone invocations
+    with no configured lane retain their existing read-only limitation. The
+    actual request acquires its lease later, so the preexisting race between
+    this check and dispatch is not solved by waiting. Unknown state never earns
+    a retry or permission to allocate a model.
     """
     # Unit/offline verification is not allowed to wake or inspect a user's
     # resident models. This guard avoids even a loopback probe.
@@ -128,6 +159,23 @@ def _free_foreign_models(console, cfg=None) -> None:
         return
 
     cfg = cfg or Config.load()
+    grace = float(drain_seconds)
+    if not 0.0 <= grace <= 4.0:
+        raise ValueError("residency drain grace must be between 0 and 4 seconds")
+    deadline = _clock() + grace
+    lease = InferenceLease.from_env()
+    scope = (
+        lease.hold(model=cfg.worker.name, operation="admission", timeout=grace)
+        if lease.path is not None else contextlib.nullcontext()
+    )
+    # Do not invent a different global lane for standalone commands. A managed
+    # child's existing lane prevents a cooperating caller refreshing residency
+    # during the grace; release it before ordinary branch dispatch resumes.
+    with scope:
+        _await_empty_residency(cfg, grace, deadline, _clock, _sleep)
+
+
+def _await_empty_residency(cfg, grace, deadline, _clock, _sleep) -> None:
 
     def connection_refused(error: BaseException) -> bool:
         """Recognise only a definitive empty auxiliary socket, not ambiguity."""
@@ -146,37 +194,47 @@ def _free_foreign_models(console, cfg=None) -> None:
     # `localhost` to ::1 and 127.0.0.1 to a DIFFERENT socket, and a machine can end
     # up running two ollama servers at once (the menu-bar app starts its own beside
     # a LaunchAgent-managed one). They keep separate memory pools.
-    preexisting: list[tuple[str, str]] = []
-    failures: list[tuple[str, str]] = []
-    for url in dict.fromkeys([cfg.base_url,
-                              "http://127.0.0.1:11434", "http://localhost:11434"]):
-        client = Ollama(url, providers=cfg.providers)
-        try:
+    while True:
+        preexisting: list[tuple[str, str]] = []
+        failures: list[tuple[str, str]] = []
+        for url in dict.fromkeys([cfg.base_url,
+                                  "http://127.0.0.1:11434", "http://localhost:11434"]):
+            remaining = max(0.001, deadline - _clock()) if grace else 1.0
+            client = Ollama(url, timeout=min(1.0, remaining), providers=cfg.providers)
             try:
-                names = client.resident_strict()
-            except Exception as exc:
-                # A refused auxiliary loopback address proves no Ollama process is
-                # listening there. Every other failure is ambiguous and admission
-                # must stop rather than pretending the resident set is empty.
-                is_auxiliary = url.rstrip("/") != cfg.base_url.rstrip("/")
-                if is_auxiliary and connection_refused(exc):
-                    names = []
-                else:
-                    failures.append((url.rstrip("/"),
-                                     f"{type(exc).__name__}: {exc}"))
-                    names = []
-            preexisting.extend((url.rstrip("/"), name) for name in names)
-        finally:
-            client.close()
-    if failures:
-        details = "\n".join(
-            f"    - {url}: {error}" for url, error in sorted(set(failures))
-        )
-        raise SystemExit(
-            "Spiral could not prove Ollama residency is safe:\n"
-            f"{details}\n"
-            "No model was unloaded. Restore the endpoint, then retry."
-        )
+                try:
+                    names = client.resident_strict()
+                except Exception as exc:
+                    # A refused auxiliary loopback address proves no Ollama process is
+                    # listening there. Every other failure is ambiguous and admission
+                    # must stop rather than pretending the resident set is empty.
+                    is_auxiliary = url.rstrip("/") != cfg.base_url.rstrip("/")
+                    if is_auxiliary and connection_refused(exc):
+                        names = []
+                    else:
+                        failures.append((url.rstrip("/"),
+                                         f"{type(exc).__name__}: {exc}"))
+                        names = []
+                preexisting.extend((url.rstrip("/"), name) for name in names)
+            finally:
+                client.close()
+        if failures:
+            details = "\n".join(
+                f"    - {url}: {error}" for url, error in sorted(set(failures))
+            )
+            raise SystemExit(
+                "Spiral could not prove Ollama residency is safe:\n"
+                f"{details}\n"
+                "No model was unloaded. Restore the endpoint, then retry."
+            )
+        if not preexisting:
+            return
+        remaining = deadline - _clock()
+        if remaining <= 0:
+            break
+        # SIGINT/SIGTERM use entry()'s normal Python unwind; never swallow them
+        # or reset the deadline when a different foreign resident appears.
+        _sleep(min(0.1, remaining))
     if preexisting:
         details = "\n".join(
             f"    - {name} at {url}" for url, name in sorted(set(preexisting))
@@ -302,10 +360,10 @@ def main() -> None:
             access = p.add_mutually_exclusive_group()
             access.add_argument(
                 "--full-access", action="store_true",
-                help="lift the workspace sandbox: the model's shell reaches the WHOLE "
-                     "machine (any path, network on) and may modify spiral itself. Only "
-                     "disk-wipe/halt/fork-bomb and separately approved Git mutations "
-                     "stay blocked.",
+                help="widen shell filesystem access beyond the workspace; managed runs "
+                     "retain mandatory isolation and deny shell networking (use approved "
+                     "typed network tools). Standalone runs normally allow networking. "
+                     "Protected paths, destructive actions and Git approvals still apply.",
             )
             access.add_argument(
                 "--workspace-only", action="store_true",
@@ -861,12 +919,7 @@ def main() -> None:
             cfg.builder_tool_auto = False
         elif getattr(args, "full_access", False):
             cfg.builder_full_access = True
-            reveal(console,
-                   "  [rgb(217,119,87)]◆ full access[/] — the model's shell reaches the whole "
-                   "machine: any path, network on, spiral's own source included.\n"
-                   "  [dim]disk-wipe · halt · fork-bomb · separately approved Git "
-                   "mutations stay blocked. "
-                   "runs unsandboxed by design.[/]\n")
+            reveal(console, _full_access_notice())
         if getattr(args, "builder_auto_repos", None) is not None:
             cfg.builder_repo_auto = bool(args.builder_auto_repos)
         if os.environ.get("SPIRALCHAT_EXTERNAL_GIT_APPROVAL") == "1":
@@ -968,8 +1021,8 @@ def entry() -> None:
         except KeyboardInterrupt:
             runtime_control.cancel()
             make_console().print(
-                "\n  [rgb(217,119,87)]⠿ interrupted[/] — green work is committed, banked "
-                "checkpoints kept. [dim]Resume with the same command + --resume[/]\n"
+                "\n  [rgb(217,119,87)]⠿ interrupted[/] — inspect retained work and saved checkpoints. "
+                "[dim]Resume with the same command + --resume[/]\n"
             )
             raise SystemExit(130)
     finally:

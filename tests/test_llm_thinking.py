@@ -17,6 +17,7 @@ message every eight seconds — 119 lines, 6 events. The failure mode is real an
 worth closing; it was not the reason that run made no progress, and nothing here
 should be read as evidence that it was.
 """
+import os
 import types
 
 import pytest
@@ -72,7 +73,8 @@ class _Fake(Ollama):
             body = replies[min(state["n"], len(replies) - 1)]
             state["n"] += 1
             return types.SimpleNamespace(
-                status_code=200, json=lambda: body, raise_for_status=lambda: None)
+                status_code=200, json=lambda: {**body, "done": True},
+                raise_for_status=lambda: None, close=lambda: None)
 
         self._client = types.SimpleNamespace(post=post)
 
@@ -142,24 +144,37 @@ def test_thinking_off_is_never_retried():
 
 
 # ------------------------------------------------------------------ live
-@pytest.mark.skipif(
-    bool(__import__("os").environ.get("SPIRAL_OFFLINE_TESTS"))
-    or not __import__("shutil").which("ollama"),
-    reason="offline test mode or no local ollama")
-def test_against_the_real_model_if_one_is_installed():
-    """The bug was found live, so pin it live where the machine allows."""
-    import httpx
+def _explicit_live_model(environ):
+    """Collection must never discover a model or opt in merely from installed tools."""
+    if environ.get("SPIRAL_OFFLINE_TESTS") or environ.get("SPIRAL_LIVE_OLLAMA_TESTS") != "1":
+        return None
+    model = environ.get("SPIRAL_LIVE_OLLAMA_MODEL", "")
+    return model if model and not any(char.isspace() for char in model) else None
 
-    client = Ollama()
-    try:
-        names = [m["name"] for m in
-                 httpx.get("http://localhost:11434/api/tags", timeout=5)
-                 .json().get("models", [])]
-    except Exception:
-        pytest.skip("ollama not answering")
-    thinker = next((n for n in names if n.startswith("qwen3")), None)
-    if not thinker:
-        pytest.skip("no thinking model pulled")
+
+@pytest.mark.parametrize("environ, expected", [
+    ({}, None),
+    ({"SPIRAL_LIVE_OLLAMA_TESTS": "1"}, None),
+    ({"SPIRAL_LIVE_OLLAMA_MODEL": "qwen3.8:27b-heretic"}, None),
+    ({"SPIRAL_LIVE_OLLAMA_TESTS": "true", "SPIRAL_LIVE_OLLAMA_MODEL": "exact:tag"}, None),
+    ({"SPIRAL_LIVE_OLLAMA_TESTS": "1", "SPIRAL_LIVE_OLLAMA_MODEL": " "}, None),
+    ({"SPIRAL_LIVE_OLLAMA_TESTS": "1", "SPIRAL_LIVE_OLLAMA_MODEL": "a b"}, None),
+    ({"SPIRAL_LIVE_OLLAMA_TESTS": "1", "SPIRAL_LIVE_OLLAMA_MODEL": "exact:tag"}, "exact:tag"),
+    ({"SPIRAL_OFFLINE_TESTS": "1", "SPIRAL_LIVE_OLLAMA_TESTS": "1",
+      "SPIRAL_LIVE_OLLAMA_MODEL": "exact:tag"}, None),
+])
+def test_live_model_requires_explicit_opt_in_and_exact_name(environ, expected):
+    assert _explicit_live_model(environ) == expected
+
+
+@pytest.mark.skipif(
+    _explicit_live_model(os.environ) is None,
+    reason="requires SPIRAL_LIVE_OLLAMA_TESTS=1 plus exact SPIRAL_LIVE_OLLAMA_MODEL; offline mode always wins")
+def test_against_explicitly_requested_real_model():
+    """A separately authorized live probe, never part of the default offline suite."""
+    thinker = _explicit_live_model(os.environ)
+    assert thinker is not None
+    client = Ollama("http://127.0.0.1:11434")
     got = client.chat(thinker, [{"role": "user", "content": "Reply with exactly: OK"}],
                       think=True, num_predict=24)
     assert got.text.strip(), "a thinking overrun still came back empty"

@@ -115,6 +115,15 @@ class Spinner:
             self._tokens = tokens
         if detail is not None:
             self._detail = detail.strip()[-64:]
+        if phase is not None:
+            self._emit_ui()
+
+    def _emit_ui(self) -> bool:
+        from spiral.ui_progress import emit_progress
+        return emit_progress({"phase": self._phase[:240], "detail": self._detail[:700],
+            "model": "", "idea": "", "tokens": max(0, int(self._tokens)),
+            "elapsed_seconds": max(0, round(time.time() - self._t0, 3)),
+            "done": 0, "blocked": 0, "milestones": [], "final": False})
 
     def tick(self, n: int = 1) -> None:
         self._tokens += n
@@ -141,11 +150,14 @@ class Spinner:
         else:
             # heartbeat mode: real newline-terminated lines for logs/monitors
             while not self._stop.wait(self.HEARTBEAT_S):
+                if self._emit_ui():
+                    continue
                 stamp = time.strftime("%H:%M:%S")
                 sys.stdout.write(f"  ⠿ [{stamp}] {self._line()}\n")
                 sys.stdout.flush()
 
     def __enter__(self) -> "Spinner":
+        self._emit_ui()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
         return self

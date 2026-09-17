@@ -57,6 +57,14 @@ def _reply(text: str, *, thinking: str | None = None, reason: str = "stop"):
     )
 
 
+def _scope_reply(ids=(), *, verdict="accept", reason="Matches the requested outcome.",
+                 missing=(), outside=(), sources=("G1",)):
+    import json
+    return _reply(json.dumps({"verdict": verdict, "goal_source_ids": list(sources),
+        "reviewed_requirement_ids": list(ids), "missing_requirement_ids": list(missing),
+        "out_of_scope_deliverable_ids": list(outside), "reason": reason}))
+
+
 def test_local_structured_reasoning_has_one_finite_probe_then_answer_only():
     models = _PlannerModels([
         _reply("", thinking="still considering", reason="length"),
@@ -85,6 +93,125 @@ def test_initial_spec_and_plan_emit_json_without_hidden_think_forever():
     assert plan.understanding == "safe tool"
     assert [call[2]["think"] for call in models.calls] == [False, False]
     assert [call[2]["num_predict"] for call in models.calls] == [4096, 6144]
+
+
+def test_draft_plan_legacy_positional_call_keeps_existing_prompt_and_options():
+    models = _PlannerModels([
+        _reply('{"understanding":"tool","milestones":[{"title":"Core",'
+               '"tasks":[{"title":"Implement tool"}]}]}'),
+    ])
+    progress = lambda _kind: None
+
+    make_plan("build safely", "empty repo", "pytest", _PlannerConfig(), models, progress)
+
+    assert len(models.calls) == 1
+    model, messages, options = models.calls[0]
+    assert model == "local-planner"
+    assert messages[1]["content"] == (
+        "MANDATORY BUILD GATE (runs after every task): pytest\n\n"
+        "GOAL:\nbuild safely\n\nREPO:\nempty repo\n\n"
+        "Produce the execution plan as JSON."
+    )
+    assert options["think"] is False
+    assert options["num_predict"] == 6144
+    assert options["num_ctx"] == 32768
+
+
+def test_draft_plan_receives_complete_canonical_contract_without_an_extra_call():
+    import copy
+    import json
+
+    spec = [
+        {"id": "R7", "kind": "feature", "text": "Preserve café labels."},
+        {"id": "R41", "kind": "quality", "text": "Check behavior.",
+         "check": "python -m unittest"},
+    ]
+    manifest = {
+        "schema_version": 1,
+        "goal_sha256": "durable-goal-identity",
+        "primary_id": "tool",
+        "deliverables": [{
+            "id": "tool", "kind": "cli", "description": "Runnable tool",
+            "root_hint": ".", "output_globs": ["src/*.py"],
+            "acceptance_evidence": ["Run the behavior checks"],
+            "tool_families": ["python:pytest"],
+        }],
+        "analysis": "diagnostic text is not another instruction",
+    }
+    before = copy.deepcopy((spec, manifest))
+    models = _PlannerModels([
+        _reply('{"understanding":"tool","milestones":[{"title":"Core",'
+               '"tasks":[{"title":"Implement tool","requirements":["R7","R41"]}]}]}'),
+    ])
+
+    plan, _ = make_plan(
+        "build safely", "repository data", cfg=_PlannerConfig(), ol=models,
+        spec=spec, manifest=manifest,
+    )
+
+    assert len(models.calls) == 1
+    model, messages, options = models.calls[0]
+    prompt = messages[1]["content"]
+    assert json.dumps(spec, ensure_ascii=False, separators=(",", ":")) in prompt
+    assert json.dumps({
+        "primary_id": manifest["primary_id"], "deliverables": manifest["deliverables"],
+    }, ensure_ascii=False, separators=(",", ":")) in prompt
+    assert "diagnostic text is not another instruction" not in prompt
+    assert "durable-goal-identity" not in prompt
+    assert "map tasks to these exact IDs" in prompt
+    assert "not proof of completion or new tool permissions" in prompt
+    assert (spec, manifest) == before
+    assert plan.milestones[0].tasks[0].requirements == ["R7", "R41"]
+    assert model == "local-planner"
+    assert options["think"] is False
+    assert options["num_predict"] == 6144
+    assert options["num_ctx"] == 32768
+
+
+def test_draft_plan_preserves_long_canonical_checklist_tail_without_a_new_cap():
+    import json
+
+    spec = [{
+        "id": f"R{7 + index * 13}", "kind": "feature",
+        "text": f"Requirement {index}: " + "complete obligation " * 20,
+    } for index in range(200)]
+    models = _PlannerModels([
+        _reply('{"understanding":"tool","milestones":[{"title":"Core",'
+               '"tasks":[{"title":"Implement tool"}]}]}'),
+    ])
+
+    make_plan("build safely", "", cfg=_PlannerConfig(), ol=models, spec=spec)
+
+    assert len(models.calls) == 1
+    prompt = models.calls[0][1][1]["content"]
+    assert json.dumps(spec, ensure_ascii=False, separators=(",", ":")) in prompt
+    assert spec[-1]["id"] in prompt
+    assert spec[-1]["text"] in prompt
+
+
+def test_draft_plan_canonical_context_propagates_existing_budget_and_provider_errors():
+    import pytest
+    from spiral.execution import BudgetExceeded
+
+    for failure in (
+        BudgetExceeded("token", {}, "run token budget cannot fit this model call"),
+        RuntimeError("provider rejected the context window"),
+    ):
+        class Models(_PlannerModels):
+            def chat(self, model, messages, **kwargs):
+                self.calls.append((model, messages, kwargs))
+                raise failure
+
+        models = Models([])
+        with pytest.raises(type(failure)) as caught:
+            make_plan(
+                "build safely", "", cfg=_PlannerConfig(), ol=models,
+                spec=[{"id": "R91", "text": "Keep the complete requirement."}],
+                manifest={"primary_id": "tool", "deliverables": []},
+            )
+        assert caught.value is failure
+        assert len(models.calls) == 1
+        assert "R91" in models.calls[0][1][1]["content"]
 
 
 def test_salvaged_plan_discards_only_incomplete_tail_task():
@@ -326,7 +453,7 @@ def test_deliverable_analyst_requests_only_typed_capability_families():
     from spiral.planner import ARTIFACT_SCHEMA, ARTIFACT_SYSTEM
 
     for convention in (
-            "python:REQUIREMENT", "node:PACKAGE", "brew:CORE_FORMULA",
+            "python-package:REQUIREMENT", "python-runtime:SPECIFIER", "node:PACKAGE", "brew:CORE_FORMULA",
             "ollama:MODEL", "binary:NAME"):
         assert convention in ARTIFACT_SYSTEM
     description = ARTIFACT_SCHEMA["properties"]["deliverables"]["items"][
@@ -372,6 +499,7 @@ def test_deliverable_analyst_retries_token_capped_degenerate_manifest():
     models = _PlannerModels([
         _reply(json.dumps(bad), reason="length"),
         _reply(json.dumps(good)),
+        _scope_reply(["R1"]),
     ])
 
     manifest, result = analyze_deliverables(
@@ -379,12 +507,12 @@ def test_deliverable_analyst_retries_token_capped_degenerate_manifest():
         cfg=Config(), ol=models,
     )
 
-    assert len(models.calls) == 2
+    assert len(models.calls) == 3
     assert result.done_reason == "stop"
     assert manifest["primary_id"] == "workbench"
     assert manifest["deliverables"][0]["tool_families"] == good[
         "deliverables"][0]["tool_families"]
-    assert "DETERMINISTIC VALIDATOR REJECTED" in models.calls[1][1][0]["content"]
+    assert "CONTRACT VALIDATION REJECTED" in models.calls[1][1][0]["content"]
 
 
 def test_deliverable_analyst_retries_malformed_json_before_failing_closed():
@@ -407,6 +535,7 @@ def test_deliverable_analyst_retries_malformed_json_before_failing_closed():
     models = _PlannerModels([
         _reply("not json"),
         _reply(json.dumps(good)),
+        _scope_reply(["R1"]),
     ])
 
     manifest, _result = analyze_deliverables(
@@ -414,7 +543,7 @@ def test_deliverable_analyst_retries_malformed_json_before_failing_closed():
         cfg=Config(), ol=models,
     )
 
-    assert len(models.calls) == 2
+    assert len(models.calls) == 3
     assert manifest["primary_id"] == "cli"
     assert "response was not valid JSON" in models.calls[1][1][0]["content"]
 
@@ -499,21 +628,97 @@ def test_conductor_does_not_fallback_after_invalid_manifest_repair_fails(
     assert not (tmp_path / ".spiral/artifacts.json").exists()
 
 
-def test_deliverable_manifest_requires_the_requested_product_medium():
-    from spiral.planner import deliverable_manifest_defects
+def test_conductor_hands_saved_enriched_canonical_contract_to_draft(tmp_path, monkeypatch):
+    import json
+    import pytest
+    from spiral import conductor as conductor_module
+    from spiral.conductor import Conductor
+
+    runner = object.__new__(Conductor)
+    runner.ws = tmp_path
+    runner.c = SimpleNamespace(print=lambda *_args, **_kwargs: None)
+    runner.cfg = SimpleNamespace(planner=SimpleNamespace(name="planner"))
+    runner.ol = object()
+    runner.gate_disp = "none"
+    runner.gate = ""
+    runner.ledger = SimpleNamespace(
+        log=lambda *_args, **_kwargs: None,
+        thinking=lambda *_args, **_kwargs: None,
+    )
+    runner._raw_goal = lambda goal: goal
+    runner._goal_with_design = lambda goal: goal
+    runner._project_kind = lambda _goal: "cli"
+    runner._is_ui = lambda _kind: False
+    monkeypatch.setattr(conductor_module, "build_repomap", lambda *_args: "repo")
+    monkeypatch.setattr(conductor_module, "list_files", lambda *_args: [])
+    monkeypatch.setattr(conductor_module, "reveal", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        conductor_module, "extract_spec",
+        lambda *_args, **_kwargs: (
+            [{"id": "R17", "kind": "feature", "text": "Build the requested tool.",
+              "check": "test -f output.txt"}], _reply("{}")),
+    )
+    monkeypatch.setattr(
+        conductor_module, "analyze_deliverables",
+        lambda *_args, **_kwargs: ({
+            "schema_version": 1, "primary_id": "tool",
+            "deliverables": [{
+                "id": "tool", "kind": "cli", "description": "Runnable tool",
+                "root_hint": ".", "output_globs": ["src/*.py"], "visual": False,
+                "acceptance_evidence": ["Run the requested behavior"],
+                "tool_families": ["python:pytest"],
+            }],
+        }, _reply("{}")),
+    )
+    observed = {}
+
+    class DraftObserved(Exception):
+        pass
+
+    def capture_draft(goal, repomap, gate, cfg, ol, progress=None, *, spec=None, manifest=None):
+        observed.update(goal=goal, repomap=repomap, spec=spec, manifest=manifest)
+        raise DraftObserved()
+
+    monkeypatch.setattr(conductor_module, "make_plan", capture_draft)
+    with pytest.raises(DraftObserved):
+        runner.make_plan("Build a CLI")
+
+    saved_spec = json.loads((tmp_path / ".spiral/spec.json").read_text())
+    saved_manifest = json.loads((tmp_path / ".spiral/artifacts.json").read_text())
+    assert observed["goal"] == "Build a CLI"
+    assert observed["repomap"] == "repo"
+    assert observed["spec"] == saved_spec
+    assert observed["manifest"] == saved_manifest
+    assert saved_spec[0]["id"] == "R17"
+    assert not saved_spec[0].get("check"), "draft must receive sanitized checks"
+    assert any(row.get("deliverable") == "tool" for row in saved_spec)
+    assert len(saved_spec) == 2, "only authored/model-declared obligations belong in the mandatory checklist"
+    assert not any(row.get("origin") == "inferred-product-baseline" for row in saved_spec)
+    assert observed["spec"][-1]["id"] == saved_spec[-1]["id"]
+
+
+def test_missing_requested_product_is_rejected_by_scope_review():
+    import json
+    import pytest
+    from spiral.planner import analyze_deliverables, DeliverableManifestError
 
     data = {
         "primary_id": "deps",
         "deliverables": [{
             "id": "deps", "kind": "infrastructure",
-            "tool_families": ["python:pytest"],
+            "tool_families": ["python:pytest"], "description": "Dependencies only",
+            "root_hint": ".", "output_globs": [], "visual": False,
+            "interactive": False, "acceptance_evidence": ["Inspect dependencies"],
         }],
     }
 
-    defects = deliverable_manifest_defects(
-        "Create a command-line interface", data, _reply("{}"))
-
-    assert any("requested cli product is missing" in defect for defect in defects)
+    reject = _scope_reply(["R1"], verdict="revise",
+        reason="The requested runnable program is absent; dependencies cannot substitute.", missing=["R1"])
+    models = _PlannerModels([_reply(json.dumps(data)), reject] * 2)
+    with pytest.raises(DeliverableManifestError, match="runnable program is absent"):
+        analyze_deliverables("Create a command-line interface", [{"id":"R1", "text":"Deliver the program"}],
+            cfg=_PlannerConfig(), ol=models)
+    assert len(models.calls) == 4
 
 
 def test_deliverable_kind_is_reconciled_with_its_own_description():

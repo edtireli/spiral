@@ -7,6 +7,7 @@ engine knowing how the other prompts a model.
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from dataclasses import asdict, dataclass, field
@@ -67,6 +68,20 @@ class RunBudget:
         self._paused_clock = paused_clock
         self._paused_at_start = max(0.0, float(paused_clock()))
         self.started_at = clock()
+        self.parent_deadline_unix: float | None = None
+        self._parent_deadline_monotonic: float | None = None
+        if "SPIRAL_PARENT_DEADLINE_UNIX" in os.environ:
+            try:
+                deadline = float(os.environ["SPIRAL_PARENT_DEADLINE_UNIX"])
+            except ValueError as exc:
+                raise ValueError("parent deadline must be a finite positive Unix timestamp") from exc
+            if not math.isfinite(deadline) or deadline <= 0:
+                raise ValueError("parent deadline must be a finite positive Unix timestamp")
+            self.parent_deadline_unix = deadline
+            # Convert once, so pause accounting or a wall-clock rewind during this
+            # attempt cannot buy extra parent time. A restarted child receives the
+            # same durable absolute deadline, not a fresh duration.
+            self._parent_deadline_monotonic = self.started_at + deadline - time.time()
         self.calls = 0
         self.prompt_tokens = 0
         self.completion_tokens = 0
@@ -88,13 +103,20 @@ class RunBudget:
         return bool(self.exhausted_dimension())
 
     def exhausted_dimension(self) -> str:
-        if self.elapsed_seconds >= self.limits.wall_seconds:
+        if self.remaining_wall_seconds <= 0:
             return "wall"
         if self.total_tokens >= self.limits.total_tokens:
             return "token"
         if self.calls >= self.limits.model_calls:
             return "call"
         return ""
+
+    @property
+    def remaining_wall_seconds(self) -> float:
+        remaining = float(self.limits.wall_seconds) - self.elapsed_seconds
+        if self._parent_deadline_monotonic is not None:
+            remaining = min(remaining, self._parent_deadline_monotonic - self._clock())
+        return max(0.0, remaining)
 
     def begin_call(
         self,
@@ -169,11 +191,13 @@ class RunBudget:
                 "model_calls": self.calls,
             },
             "remaining": {
-                "wall_seconds": max(0, round(self.limits.wall_seconds - self.elapsed_seconds, 3)),
+                "wall_seconds": round(self.remaining_wall_seconds, 3),
                 "total_tokens": max(0, self.limits.total_tokens - self.total_tokens),
                 "model_calls": max(0, self.limits.model_calls - self.calls),
             },
             "exhausted": self.exhausted_dimension() or None,
+            **({"parent_deadline_unix": self.parent_deadline_unix,
+                "parent_deadline_includes_pauses": True} if self.parent_deadline_unix is not None else {}),
         }
 
 
