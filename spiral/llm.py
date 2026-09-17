@@ -19,6 +19,7 @@ import time
 from pathlib import Path
 
 from spiral.execution import BudgetExceeded, BudgetLimits, RunBudget
+from spiral.inference_boundary import InferenceRequestBoundary, thinking_rejection
 
 
 # One CLI process is one admitted Spiral run.  Track only exact local model names
@@ -113,11 +114,73 @@ class LocalModelStreamStalled(httpx.ReadTimeout):
     """A local response began streaming and then stopped making progress."""
 
 
+# Below the managed child's eight-second interrupt grace. This is a chance to
+# receive a nearly finished request's terminal receipt, not a backend abort or
+# an extension of its original wall budget. Expiry retains the uncertain fence.
+_LOCAL_CONSUMER_DRAIN_SECONDS = 5.0
+
+
+class _LocalConsumerError(BaseException):
+    """Carry a consumer failure past transport retries without changing its type."""
+
+    def __init__(self, error: BaseException):
+        self.error = error
+        super().__init__(str(error))
+
+
+class _LocalStreamStop:
+    def __init__(self):
+        self.error: BaseException | None = None
+        self.deadline: float | None = None
+
+    def capture(self, error: BaseException) -> None:
+        # Repeated interrupts cannot replenish the finite drain allowance.
+        if self.error is None:
+            self.error = error
+            self.deadline = time.monotonic() + _LOCAL_CONSUMER_DRAIN_SECONDS
+
+
+def _local_response_object(value: Any) -> dict:
+    """Validate Ollama's envelope before accepting content or a completion receipt.
+
+    Ollama reports inference failures inside HTTP-200 NDJSON streams using an
+    ``error`` object; raise a retryable protocol fault instead of accepting the
+    partial answer. This also contains malformed proxy/runner output at the model
+    boundary rather than letting it crash downstream planning or edit parsing.
+    """
+    if not isinstance(value, dict):
+        raise httpx.RemoteProtocolError("local model response is not a JSON object")
+    if "error" in value:
+        detail = str(value["error"] or "unspecified inference failure")[:1000]
+        raise httpx.RemoteProtocolError(f"local model inference failed: {detail}")
+    if "done" in value and not isinstance(value["done"], bool):
+        raise httpx.RemoteProtocolError("local model completion flag is not a boolean")
+    message = value.get("message")
+    if message is not None:
+        if not isinstance(message, dict):
+            raise httpx.RemoteProtocolError("local model message is not a JSON object")
+        for key in ("content", "thinking"):
+            piece = message.get(key)
+            if piece is not None and not isinstance(piece, str):
+                raise httpx.RemoteProtocolError(f"local model {key} is not text")
+    return value
+
+
+def _require_local_completion(last: dict) -> None:
+    # Clean EOF can still be a truncated response: a proxy may close without a
+    # socket error, or the runner may exit between complete JSON lines. Only the
+    # terminal receipt proves that generation finished and usage is available.
+    if last.get("done") is not True:
+        raise httpx.RemoteProtocolError(
+            "local model stream ended without a completion receipt (done=true)")
+
+
 def _iter_local_stream_lines(
     response: httpx.Response,
     *,
     request_timeout: float,
     stall_timeout: float,
+    consumer_stop: _LocalStreamStop | None = None,
 ) -> Iterator[str]:
     """Read a local stream with a tighter timeout only after its first chunk.
 
@@ -125,9 +188,9 @@ def _iter_local_stream_lines(
     later socket read. A small timeout on the request would therefore kill slow
     first-token work; its normal (wall-bounded) timeout is retained. Once any line
     arrives, a daemon reader lets us enforce a separate no-progress deadline. On a
-    stall we close the response before raising a transport error, which unblocks the
-    reader, releases the inference lease in the caller, and lets the finite local
-    retry path replay the side-effect-free request.
+    stall we close the response before raising a transport error. Socket closure
+    is not backend shutdown: an enabled machine boundary remains quarantined
+    without a terminal receipt, and rejects another dispatch after lease release.
     """
 
     inbox: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
@@ -165,8 +228,13 @@ def _iter_local_stream_lines(
             active_deadline = request_deadline
             if progress_deadline is not None:
                 active_deadline = min(active_deadline, progress_deadline)
+            if consumer_stop is not None and consumer_stop.deadline is not None:
+                active_deadline = min(active_deadline, consumer_stop.deadline)
             wait_for = active_deadline - time.monotonic()
             if wait_for <= 0:
+                if (consumer_stop is not None and consumer_stop.deadline is not None
+                        and consumer_stop.deadline <= active_deadline):
+                    raise httpx.ReadTimeout("local consumer stopped; completion drainage timed out")
                 if (progress_deadline is not None
                         and progress_deadline <= request_deadline):
                     raise LocalModelStreamStalled(
@@ -176,6 +244,13 @@ def _iter_local_stream_lines(
                     "local model stream exceeded the remaining run wall time")
             try:
                 kind, value = inbox.get(timeout=wait_for)
+            except KeyboardInterrupt as exc:
+                if consumer_stop is None:
+                    raise
+                # CLI SIGINT/SIGTERM becomes KeyboardInterrupt. Keep this exact
+                # reader and lease; the consumer suppresses any further output.
+                consumer_stop.capture(exc)
+                continue
             except queue.Empty:
                 # Re-evaluate the absolute deadlines above. In particular, blank
                 # keepalives never move ``progress_deadline`` into the future.
@@ -308,6 +383,16 @@ class InferenceLease:
         self.timeout = max(0.0, float(timeout))
         self.poll = max(0.01, float(poll))
         self._thread_lock = threading.Lock()
+        self._active_thread_id = None
+
+    def request(self, *, model: str, operation: str):
+        """Begin one dispatch only inside this thread's acquired machine lease."""
+        root = self.path.parent if self.path is not None and fcntl is not None else None
+        if root is not None:
+            if self._active_thread_id != threading.get_ident():
+                raise RuntimeError("engine inference dispatch requires its current machine lease")
+            self._require_reconciled_boundary()
+        return InferenceRequestBoundary(root, model, operation)
 
     @property
     def priority_dir(self) -> Path | None:
@@ -350,6 +435,52 @@ class InferenceLease:
                 except OSError:
                     pass
         return waiting
+
+    def _require_reconciled_boundary(self) -> None:
+        """Honor the host's crash-persistent fence before overwriting lane owner.
+
+        This is the small shared wire contract, not a host import (the engine
+        also runs standalone). Unknown schemas and corrupt records fail closed.
+        A dead host PID or an old timestamp does not prove its backend drained.
+        """
+        if self.path is None:
+            return
+        try:
+            with (self.path.parent / "spiral-compute.inference.json").open("rb") as source:
+                raw = source.read(8193)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise InferenceLeaseTimeout("local inference boundary is unreadable; reconciliation required") from exc
+        try:
+            value = json.loads(raw)
+            valid = (len(raw) <= 8192 and isinstance(value, dict) and
+                     value.get("schema") == "spiral.compute.inference.v1" and
+                     isinstance(value.get("attempt_id"), str) and bool(value["attempt_id"]) and
+                     value.get("state") in {"drained", "not_dispatched", "dispatching", "uncertain", "rejected"})
+            clear = valid and value["state"] in {"drained", "not_dispatched", "rejected"}
+        except (ValueError, TypeError, UnicodeDecodeError):
+            clear = False
+            valid = False
+            value = {}
+        if not clear and valid:
+            instance = value.get("backend_instance")
+            if (isinstance(instance, str) and len(instance) == 32 and
+                    all(c in "0123456789abcdef" for c in instance)):
+                try:
+                    with (self.path.parent / "inference-exits" / (instance + ".exit.json")).open("rb") as source:
+                        raw = source.read(8193)
+                    receipt = json.loads(raw)
+                    clear = (len(raw) <= 8192 and isinstance(receipt, dict) and
+                             receipt.get("schema") == "spiral.owned-inference.exit.v1" and
+                             receipt.get("instance_id") == instance and
+                             (receipt.get("child_started") is False or
+                              (receipt.get("child_reaped") is True and type(receipt.get("exit_code")) is int)))
+                except (OSError, ValueError, TypeError, UnicodeDecodeError):
+                    pass
+        if not clear:
+            raise InferenceLeaseTimeout(
+                "a previous local inference has no completion acknowledgment; reconciliation required")
 
     @classmethod
     def from_env(cls) -> "InferenceLease":
@@ -428,6 +559,7 @@ class InferenceLease:
                             acquired = False
                         if acquired:
                             try:
+                                self._require_reconciled_boundary()
                                 record = {
                                     "pid": os.getpid(),
                                     "acquired_at": time.strftime(
@@ -449,7 +581,11 @@ class InferenceLease:
                                             "could not persist model-lane owner")
                                     view = view[written:]
                                 os.fsync(fd)
-                                yield
+                                self._active_thread_id = threading.get_ident()
+                                try:
+                                    yield fd
+                                finally:
+                                    self._active_thread_id = None
                             finally:
                                 try:
                                     fcntl.flock(fd, fcntl.LOCK_UN)
@@ -514,6 +650,11 @@ class Ollama:
 
     def __init__(self, base_url: str = "http://localhost:11434", timeout: float = 1200.0,
                  providers: dict | None = None):
+        self.residency_policy = os.environ.get("SPIRAL_MODEL_RESIDENCY_POLICY", "retain")
+        if self.residency_policy not in {"retain", "release_after_request"}:
+            raise ValueError("invalid model residency policy")
+        if self.residency_policy == "release_after_request" and not os.environ.get(InferenceLease.PATH_ENV):
+            raise ValueError("request-scoped residency handoff requires a managed inference lease")
         self.base_url = base_url.rstrip("/")
         self._no_think: set[str] = set()   # families that reject the thinking toggle
         self._timeout = timeout
@@ -571,9 +712,71 @@ class Ollama:
         self.budget = RunBudget(limits)
 
     def close(self) -> None:
+        bridge = getattr(self, "_owned_engine_transport", None)
+        if bridge is not None:
+            bridge.close()
         close = getattr(getattr(self, "_client", None), "close", None)
         if callable(close):
             close()
+
+    def source_tokenizer(self, model: str):
+        """Optional trusted host helper; no inference, model switching or settings write.
+
+        Runtime packaging may explicitly supply this executable. The repository
+        being edited never supplies an executable or a tokenizer binding.
+        """
+        binary = os.environ.get("SPIRAL_CONTEXT_TOKENIZER", "")
+        if not binary or model in self.providers:
+            return None
+        from urllib.parse import urlsplit
+        from spiral.context_measurement import ContextMeasurementUnavailable, SourceTokenizer
+        import re
+
+        address = urlsplit(self.base_url)
+        if (address.hostname not in {"127.0.0.1", "localhost", "::1"}
+                or address.username or address.password or not Path(binary).is_absolute()):
+            raise ContextMeasurementUnavailable("source measurement requires a local provider and absolute host helper")
+        if self.budget.exhausted:
+            raise BudgetExceeded(self.budget.exhausted_dimension(), self.budget.snapshot())
+        try:
+            response = self._client.post(f"{self.base_url}/api/show", json={"model": model},
+                timeout=min(10, self.budget.remaining_wall_seconds))
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise ContextMeasurementUnavailable("selected local tokenizer metadata is unavailable") from exc
+        if len(response.content) > 1024 * 1024:
+            raise ContextMeasurementUnavailable("selected model metadata exceeds its bound")
+        metadata = response.json()
+        if not isinstance(metadata, dict):
+            raise ContextMeasurementUnavailable("selected local tokenizer metadata is malformed")
+        modelfile = str(metadata.get("modelfile", ""))
+        sources = re.findall(r"^FROM\s+(.+)$", modelfile, re.M)
+        if len(sources) != 1 or re.search(r"^ADAPTER\s", modelfile, re.M):
+            raise ContextMeasurementUnavailable("selected model requires an unsupported tokenizer binding")
+        source = Path(sources[0].strip().strip('"'))
+        if not source.is_absolute():
+            raise ContextMeasurementUnavailable("selected model has no absolute local tokenizer source")
+        key = (model, str(source.resolve()), str(Path(binary).resolve()))
+        cache = getattr(self, "_source_tokenizer_cache", {})
+        if key not in cache:
+            def checkpoint():
+                from spiral.runtime_control import checkpoint as runtime_checkpoint
+                runtime_checkpoint()
+                if self.budget.exhausted:
+                    raise BudgetExceeded(self.budget.exhausted_dimension(), self.budget.snapshot())
+            cache[key] = SourceTokenizer(Path(binary), source, model,
+                timeout=min(30.0, self.budget.remaining_wall_seconds), checkpoint=checkpoint)
+            self._source_tokenizer_cache = cache
+        cache[key]._check()
+        # Planning replay also depends on model-template/system changes. Vocabulary
+        # identity alone only binds the GGUF and counter, not these server defaults.
+        import hashlib
+        cache[key].inference_identity = hashlib.sha256(json.dumps({
+            "source_identity": cache[key].identity,
+            "metadata": {field: metadata.get(field) for field in (
+                "modelfile", "template", "parameters", "system", "model_info", "capabilities")},
+        }, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+        return cache[key]
 
     def __enter__(self) -> "Ollama":
         return self
@@ -616,13 +819,50 @@ class Ollama:
 
     def _remaining_request_timeout(self) -> float:
         """HTTP timeout bounded by the run's remaining wall-clock allowance."""
-        remaining = max(
-            0.0,
-            float(self.budget.limits.wall_seconds) - self.budget.elapsed_seconds,
-        )
+        remaining = self.budget.remaining_wall_seconds
         if remaining <= 0:
             raise BudgetExceeded("wall", self.budget.snapshot())
         return max(0.001, min(float(getattr(self, "_timeout", 1200.0)), remaining))
+
+    def _local_request_boundary(self, model: str, operation: str):
+        lease = getattr(self, "inference_lease", None)
+        if lease is not None:
+            return lease.request(model=model, operation=operation)
+        return InferenceRequestBoundary(None, model, operation)
+
+    def _local_blocking_request(self, payload, *, endpoint="chat", timeout):
+        with self._local_request_boundary(payload["model"], "engine_" + endpoint) as attempt:
+            response = None
+            try:
+                response = self._client.post(f"{self.base_url}/api/{endpoint}", json=payload, timeout=timeout)
+                if "think" in payload:
+                    attempt.rejected = thinking_rejection(self._client, self.base_url, payload["model"], response)
+                if attempt.rejected:
+                    return None, True
+                response.raise_for_status()
+                data = _local_response_object(response.json())
+                _require_local_completion(data)
+                attempt.terminal = True
+                return data, False
+            finally:
+                if response is not None:
+                    response.close()
+                    attempt.reader_closed = True
+
+    @contextlib.contextmanager
+    def _local_stream_request(self, payload, *, timeout):
+        with self._local_request_boundary(payload["model"], "engine_stream") as attempt:
+            response = None
+            try:
+                response = self._client.send(self._client.build_request(
+                    "POST", f"{self.base_url}/api/chat", json=payload, timeout=timeout), stream=True)
+                if "think" in payload:
+                    attempt.rejected = thinking_rejection(self._client, self.base_url, payload["model"], response)
+                yield response, attempt
+            finally:
+                if response is not None:
+                    response.close()
+                    attempt.reader_closed = True
 
     def evict(self, model: str, *, timeout: float | None = None) -> bool:
         """Explicitly unload a model (keep_alive=0 on an empty generate) — swap
@@ -652,12 +892,9 @@ class Ollama:
                 )
                 if deadline is not None and request_timeout <= 0.001:
                     return False
-                response = self._client.post(
-                    f"{self.base_url}/api/generate",
-                    json={"model": model, "prompt": "", "keep_alive": 0},
-                    **({"timeout": request_timeout} if request_timeout is not None else {}),
-                )
-                response.raise_for_status()
+                self._local_blocking_request(
+                    {"model": model, "prompt": "", "keep_alive": 0, "stream": False},
+                    endpoint="generate", timeout=request_timeout or self._remaining_request_timeout())
             return True
         except Exception:
             return False
@@ -794,11 +1031,44 @@ class Ollama:
         }
         if model not in getattr(self, "_no_think", set()):
             payload["think"] = think
-        if keep_alive is not None:
+        if getattr(self, "residency_policy", "retain") == "release_after_request":
+            # Ollama handles release for this request after its own active work
+            # settles. Never send a separate unload/kill against a shared runner.
+            payload["keep_alive"] = 0
+        elif keep_alive is not None:
             payload["keep_alive"] = keep_alive  # stop 5-min idle unloads mid-run
         if fmt is not None:
             payload["format"] = fmt  # "json" or a JSON-schema dict for structured output
         return payload
+
+    def _budgeted_messages(self, messages: list[dict]) -> list[dict]:
+        """One immutable metadata snapshot per public call, after authored input.
+
+        Only managed parent-bound work gets this overlay. Standalone/native chat
+        prompts are unchanged; retries reuse the original snapshot while the real
+        transport deadline continues shrinking independently.
+        """
+        if getattr(self.budget, "parent_deadline_unix", None) is None:
+            return messages
+        snapshot = self.budget.snapshot()
+        metadata = {
+            "scope": "this_child_execution",
+            "remaining_wall_seconds": round(self.budget.remaining_wall_seconds, 1),
+            "parent_deadline_unix": self.budget.parent_deadline_unix,
+            "remaining_tokens": snapshot["remaining"]["total_tokens"],
+            "remaining_model_calls": snapshot["remaining"]["model_calls"],
+        }
+        tail = ("\n\nHost execution budget (runtime metadata, not a new request):\n" +
+                json.dumps(metadata, separators=(",", ":"), allow_nan=False) +
+                "\nFit planning, implementation, verification and delivery for the existing task "
+                "within this remaining time. Reuse established evidence. These limits do not "
+                "waive requirements, grant permissions or justify unverified completion.")
+        result = list(messages)
+        if result and result[-1].get("role") == "user" and isinstance(result[-1].get("content"), str):
+            result[-1] = {**result[-1], "content": result[-1]["content"] + tail}
+        else:
+            result.append({"role": "user", "content": tail.lstrip()})
+        return result
 
     def chat(
         self,
@@ -818,6 +1088,7 @@ class Ollama:
         """Budgeted public model call; all roles share this one finite ledger."""
         if not hasattr(self, "budget"):
             self.budget = RunBudget(BudgetLimits.for_tier("standard"))
+        messages = self._budgeted_messages(messages)
         minimum = self._provider_minimum_completion(model, think=think)
         requested = num_predict
         if model in self.providers and requested is not None:
@@ -834,12 +1105,14 @@ class Ollama:
                 temperature=temperature, stop=stop, fmt=fmt, on_delta=on_delta,
                 num_ctx=num_ctx, keep_alive=keep_alive, _recovering=_recovering,
             )
-        except BaseException:
+        except BaseException as exc:
             # A disconnected/timed-out provider may have completed the inference even
             # though no usage record arrived. Charge the entire admitted request. A
             # nested thinking-recovery path records its two attempts itself below.
             if self.budget.total_tokens == accounted_before:
                 self.budget.record(_prompt_token_reserve(messages), capped)
+            if isinstance(exc, _LocalConsumerError):
+                raise exc.error.with_traceback(exc.error.__traceback__) from exc.__cause__
             raise
         self.budget.record(result.prompt_tokens, result.completion_tokens)
         if isinstance(result.raw, dict):
@@ -894,6 +1167,12 @@ class Ollama:
                 self.budget.record(prompt_reserve, int(admitted_cap or 0))
                 if attempt >= attempts:
                     raise
+                lease = getattr(self, "inference_lease", None)
+                if lease is not None:
+                    # No reset/extra budget admission for a replay that would cross
+                    # an uncertain backend dispatch. The next hold/request still
+                    # rechecks under the actual flock before dispatching anything.
+                    lease._require_reconciled_boundary()
                 try:
                     admitted_cap = self.budget.begin_retry(
                         requested_cap,
@@ -942,6 +1221,8 @@ class Ollama:
         with thinking off — see ``_answer_or_recover``."""
         import json as _json
 
+        from spiral.model_binding import require_selected_local_model
+        require_selected_local_model(model, self.providers)
         if model in self.providers:
             return self._openai_chat(
                 self.providers[model], model, messages, num_predict=num_predict,
@@ -954,6 +1235,25 @@ class Ollama:
             temperature=temperature, stop=stop, fmt=fmt,
             num_ctx=num_ctx, keep_alive=keep_alive,
         )
+        backend = os.environ.get("SPIRAL_ENGINE_INFERENCE_BACKEND", "ollama")
+        if backend not in {"ollama", "owned_llama"}:
+            raise ValueError("unsupported managed engine inference backend")
+        if backend == "owned_llama":
+            if os.environ.get("SPIRAL_OFFLINE_TESTS"):
+                raise OfflineModelAccess("offline tests cannot start owned engine inference")
+            if not hasattr(self, "_owned_engine_transport"):
+                # Optional host-owned seam; standalone installs retain Ollama.
+                from spiral_engine_owned import OwnedEngineTransport
+                self._owned_engine_transport = OwnedEngineTransport(self)
+            from spiral.runtime_control import checkpoint
+            def consumer(kind, piece):
+                if on_delta:
+                    try:
+                        on_delta(kind, piece)
+                    except BaseException as exc:
+                        raise _LocalConsumerError(exc) from exc
+            return ChatResult(**self._owned_engine_transport.chat(
+                payload, checkpoint=checkpoint, on_delta=consumer if on_delta else None))
         if on_delta is None:
             payload["stream"] = False
             lease = getattr(self, "inference_lease", None)
@@ -963,19 +1263,14 @@ class Ollama:
             with scope:
                 request_timeout = self._remaining_request_timeout()
                 _remember_owned_local_model(self.base_url, model)
-                r = self._client.post(
-                    f"{self.base_url}/api/chat", json=payload,
-                    timeout=request_timeout,
-                )
-                if r.status_code == 400 and payload.pop("think", None) is not None:
-                    # Rejected before inference: retrying the transport shape stays
-                    # inside the same inference-scoped lease and logical call.
-                    r = self._client.post(
-                        f"{self.base_url}/api/chat", json=payload,
-                        timeout=self._remaining_request_timeout(),
-                    )
-            r.raise_for_status()
-            data = r.json()
+                data, rejected = self._local_blocking_request(payload, timeout=request_timeout)
+                if rejected:
+                    # Exact versioned pre-scheduler rejection, never an arbitrary 400.
+                    from spiral.runtime_control import checkpoint
+                    checkpoint()
+                    payload.pop("think", None)
+                    data, _ = self._local_blocking_request(payload, timeout=self._remaining_request_timeout())
+                    self._no_think.add(model)
             msg = data.get("message", {}) or {}
             return self._answer_or_recover(
                 ChatResult(
@@ -994,10 +1289,8 @@ class Ollama:
         text_parts: list[str] = []
         think_parts: list[str] = []
         last: dict = {}
-        # not every family accepts the thinking toggle (gemma rejects what qwen
-        # requires). A 400 arrives before any evaluation, so retrying without
-        # `think` costs nothing; the model is remembered so later calls skip the
-        # round-trip entirely. A plain loop — two tries at most.
+        # Compatibility replay requires the exact versioned pre-scheduler rejection.
+        # All uncertain dispatches remain fenced after this lease is released.
         lease = getattr(self, "inference_lease", None)
         remaining_wall = self.budget.snapshot()["remaining"]["wall_seconds"]
         scope = (lease.hold(model=model, timeout=remaining_wall)
@@ -1006,42 +1299,50 @@ class Ollama:
             request_timeout = self._remaining_request_timeout()
             _remember_owned_local_model(self.base_url, model)
             for attempt in (1, 2):
-                response = self._client.send(
-                    self._client.build_request(
-                        "POST", f"{self.base_url}/api/chat", json=payload,
-                        timeout=request_timeout),
-                    stream=True)
-                if (response.status_code == 400 and attempt == 1
-                        and payload.get("think") is not None):
-                    response.close()
-                    self._no_think.add(model)
-                    payload.pop("think", None)
-                    continue
+                with self._local_stream_request(payload, timeout=self._remaining_request_timeout()) as (r, boundary):
+                    if boundary.rejected and attempt == 1:
+                        self._no_think.add(model)
+                        payload.pop("think", None)
+                        from spiral.runtime_control import checkpoint
+                        checkpoint()
+                        continue
+                    r.raise_for_status()
+                    stopped = _LocalStreamStop()
+                    lines = _iter_local_stream_lines(
+                        r, request_timeout=self._remaining_request_timeout(),
+                        stall_timeout=self.local_stream_stall_seconds,
+                        consumer_stop=stopped)
+                    try:
+                        for line in lines:
+                            if not line:
+                                continue
+                            chunk = _local_response_object(_json.loads(line))
+                            if chunk.get("done") is True:
+                                last = chunk
+                                boundary.terminal = True
+                            if stopped.error is None:
+                                try:
+                                    msg = chunk.get("message") or {}
+                                    if msg.get("thinking"):
+                                        think_parts.append(msg["thinking"])
+                                        on_delta("think", msg["thinking"])
+                                    if msg.get("content"):
+                                        text_parts.append(msg["content"])
+                                        on_delta("text", msg["content"])
+                                except BaseException as exc:
+                                    stopped.capture(exc)
+                            if chunk.get("done"):
+                                break
+                        _require_local_completion(last)
+                    except BaseException as exc:
+                        if stopped.error is not None:
+                            raise _LocalConsumerError(stopped.error) from exc
+                        raise
+                    finally:
+                        lines.close()
+                    if stopped.error is not None:
+                        raise _LocalConsumerError(stopped.error)
                 break
-            with contextlib.closing(response) as r:
-                r.raise_for_status()
-                lines = _iter_local_stream_lines(
-                    r,
-                    request_timeout=self._remaining_request_timeout(),
-                    stall_timeout=self.local_stream_stall_seconds,
-                )
-                try:
-                    for line in lines:
-                        if not line:
-                            continue
-                        chunk = _json.loads(line)
-                        msg = chunk.get("message") or {}
-                        if msg.get("thinking"):
-                            think_parts.append(msg["thinking"])
-                            on_delta("think", msg["thinking"])
-                        if msg.get("content"):
-                            text_parts.append(msg["content"])
-                            on_delta("text", msg["content"])
-                        if chunk.get("done"):
-                            last = chunk
-                            break
-                finally:
-                    lines.close()
         return self._answer_or_recover(
             ChatResult(
                 text="".join(text_parts),
@@ -1446,9 +1747,15 @@ class Ollama:
     ) -> Iterator[str]:
         """Yield local content deltas under the same lease and joint budget."""
         import json
+        from spiral.model_binding import require_selected_local_model
+
+        require_selected_local_model(model, self.providers)
+        if os.environ.get("SPIRAL_ENGINE_INFERENCE_BACKEND", "ollama") != "ollama":
+            raise ValueError("managed owned inference uses chat(on_delta=...); generator transport is unsupported")
 
         if not hasattr(self, "budget"):
             self.budget = RunBudget(BudgetLimits.for_tier("standard"))
+        messages = self._budgeted_messages(messages)
         prompt_reserve = _prompt_token_reserve(messages)
         capped = self.budget.begin_call(
             num_predict,
@@ -1465,35 +1772,48 @@ class Ollama:
         scope = (lease.hold(model=model, timeout=remaining_wall)
                  if lease is not None else contextlib.nullcontext())
         last: dict[str, Any] = {}
+        stopped = _LocalStreamStop()
         try:
             with scope:
                 request_timeout = self._remaining_request_timeout()
                 _remember_owned_local_model(self.base_url, model)
-                with self._client.stream(
-                        "POST", f"{self.base_url}/api/chat", json=payload,
-                        timeout=request_timeout) as r:
+                with self._local_stream_request(payload, timeout=request_timeout) as (r, boundary):
                     r.raise_for_status()
                     lines = _iter_local_stream_lines(
                         r,
                         request_timeout=self._remaining_request_timeout(),
                         stall_timeout=self.local_stream_stall_seconds,
+                        consumer_stop=stopped,
                     )
                     try:
                         for line in lines:
                             if not line:
                                 continue
-                            chunk = json.loads(line)
+                            chunk = _local_response_object(json.loads(line))
                             if chunk.get("done"):
                                 last = chunk
+                                boundary.terminal = True
                             piece = (chunk.get("message") or {}).get("content", "")
-                            if piece:
-                                yield piece
+                            if piece and stopped.error is None:
+                                try:
+                                    yield piece
+                                except BaseException as exc:
+                                    # Generator close/throw must not publish another
+                                    # delta or abandon a nearly finished backend.
+                                    stopped.capture(exc)
                             if chunk.get("done"):
                                 break
                     finally:
                         lines.close()
+                    _require_local_completion(last)
+        except BaseException as exc:
+            if stopped.error is not None:
+                raise stopped.error.with_traceback(stopped.error.__traceback__) from exc
+            raise
         finally:
             self.budget.record(
                 last.get("prompt_eval_count", prompt_reserve),
                 last.get("eval_count", capped),
             )
+        if stopped.error is not None:
+            raise stopped.error.with_traceback(stopped.error.__traceback__)

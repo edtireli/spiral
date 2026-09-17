@@ -45,10 +45,9 @@ from spiral.ladder import is_python_gate, venv_prefix
 from spiral.llm import Ollama
 from spiral.runtime_control import checkpoint as runtime_checkpoint
 from spiral.planner import (
-    DeliverableManifestError, Milestone, Plan, Task, analyze_deliverables,
+    DeliverableManifestError, Milestone, Plan, Task, analyze_deliverables, analyze_project,
     coverage_gaps, critique_plan,
     default_output_globs, design_brief, design_tokens, enrich_deliverable_spec,
-    enrich_product_spec,
     ensure_plan_coverage,
     extract_spec, lint_plan, make_plan, normalize_plan_requirements, parse_plan,
     plan_to_dict, repair_plan, sanitize_checks, validate_spec,
@@ -76,6 +75,46 @@ class GateSpec:
     root: Path
     command: str
     ecosystem: str
+
+
+class RenderedGoal(str):
+    """In-process provenance for harness-authored prompt appendices.
+
+    Plain strings, including loaded legacy strings, remain entirely authored
+    input. A prose heading is never authority to discard a user's requirements.
+    """
+    def __new__(cls, text: str, authored_goal: str):
+        value = super().__new__(cls, text)
+        value.authored_goal = authored_goal
+        return value
+
+    def __getnewargs__(self):
+        return str(self), self.authored_goal
+
+
+@dataclass(frozen=True)
+class WorkerContext:
+    requirements: str
+    observations: str = ""
+    authored_goal: str | None = None
+
+    def render(self) -> str:
+        return RenderedGoal(self.requirements + self.observations,
+                            self.requirements if self.authored_goal is None else self.authored_goal)
+
+    def fields(self) -> dict:
+        return {"context": self.requirements, "runtime_context": self.observations}
+
+
+def _worker_task_spec(task: Task, goal: str | WorkerContext, verify: str) -> TaskSpec:
+    """Carry the planner's declared read dependencies into real worker context."""
+    files = list(dict.fromkeys([*task.files, *getattr(task, "context_reads", [])]))
+    return TaskSpec(
+        goal=f"{task.title}\n{task.description}".strip(),
+        verify_cmd=verify, files=files or None,
+        **(goal.fields() if isinstance(goal, WorkerContext) else {"context": goal}),
+        exports=list(getattr(task, "exports", []) or []) or None,
+    )
 
 
 def _detect_gate_here(ws: Path) -> str:
@@ -294,7 +333,7 @@ def _runs_tests(command: str) -> bool:
     low = (command or "").lower()
     return any(tok in low for tok in (
         "pytest", "npm run test", " test", "--test", "gradlew test", "go test",
-        "cargo test", "mvn test", "unittest", "vitest", "jest"))
+        "cargo test", "mvn test", "unittest", "vitest", "jest", ".spiral/rungs/test.py"))
 
 
 def detect_gates(ws: Path) -> list[GateSpec]:
@@ -549,6 +588,7 @@ class Conductor:
             self.ws,
             timeout=self.cfg.verify_timeout,
             allow_scripts=bool(getattr(self.cfg, "builder_allow_install_scripts", False)),
+            verification_command=command,
         )
         if deps.get("applicable"):
             self.ledger.log(
@@ -581,6 +621,9 @@ class Conductor:
                 self.cfg, "builder_require_sandbox", True)),
             full_access=_full,
         ).result
+        from spiral.harness_check import require_verifier_started
+
+        require_verifier_started(result.out, result.code)
         try:
             self.toolsmith.record(
                 context="builder_gate", command=command, ok=result.ok,
@@ -723,7 +766,7 @@ class Conductor:
         # task 1 and redoes work it had already committed — which is what happened
         # the first time. A changed contract must invalidate its task; a new field
         # must not invalidate everyone else's.
-        for field_name in ("exports", "imports"):
+        for field_name in ("exports", "imports", "context_reads"):
             value = getattr(task, field_name, []) or []
             if value:
                 payload[field_name] = value
@@ -775,19 +818,8 @@ class Conductor:
 
     @staticmethod
     def _raw_goal(goal: str) -> str:
-        """Remove generated prompt appendices from a persisted/resumed goal."""
-
-        value = str(goal or "")
-        markers = (
-            "\n\nDESIGN SPECIFICATION (implement these decisions literally):",
-            "\n\nEMPIRICAL LOCAL TOOL PROFILE",
-        )
-        cut = len(value)
-        for marker in markers:
-            index = value.find(marker)
-            if index >= 0:
-                cut = min(cut, index)
-        return value[:cut].strip()
+        """Unwrap only typed harness context; preserve every plain input string."""
+        return str(goal.authored_goal if isinstance(goal, RenderedGoal) else goal or "").strip()
 
     @classmethod
     def _goal_hash(cls, goal: str) -> str:
@@ -890,7 +922,10 @@ class Conductor:
     def _goal_with_design(self, goal: str) -> str:
         """Append the design spec so planner and workers implement decisions,
         not vibes. Sits in the stable prompt prefix → KV-cache friendly."""
-        goal = self._raw_goal(goal)
+        return self._goal_context(self._raw_goal(goal)).render()
+
+    def _goal_context(self, goal: str) -> WorkerContext:
+        """Keep authored/design requirements separate from runtime observations."""
         f = self._dir() / "design.md"
         if not f.is_file():
             out = goal
@@ -904,11 +939,6 @@ class Conductor:
                 out += ("\n\nCANONICAL PALETTE — the app's colors are defined once in "
                         f"res/values/spiral_tokens.xml as {names}. Reference these for accent, "
                         "background, surface, and primary text; do not invent new color values.")
-        brief = getattr(self, "_capability_brief", "")
-        if brief:
-            out += ("\n\nCAPABILITIES FOR THIS BUILD (already resolved by the "
-                    "harness — do not re-install, and do not plan around tools "
-                    "listed as unavailable):\n" + brief[:1500])
         # OUTSIDE the design.md branch: the generated palette deserves announcing
         # whenever it exists, and requiring a design brief file to also exist made
         # the announcement silently skip (no design.md -> workers never told ->
@@ -917,70 +947,165 @@ class Conductor:
             from spiral.webfoundation import FAVICON_FILE, TOKENS_FILE, tokens_brief
 
             out += "\n\n" + tokens_brief([TOKENS_FILE, FAVICON_FILE])
+        observations = ""
+        brief = getattr(self, "_capability_brief", "")
+        if brief:
+            observations += ("\n\nCAPABILITIES FOR THIS BUILD (already resolved by the "
+                             "harness — do not re-install, and do not plan around tools "
+                             "listed as unavailable):\n" + brief[:1500])
         try:
             capabilities = self.toolsmith.capability_brief()
             if capabilities:
-                out += (
+                observations += (
                     "\n\nEMPIRICAL LOCAL TOOL PROFILE (observed on this machine; use it to "
                     "choose realistic implementation and verification routes):\n"
                     + capabilities[:3000]
                 )
         except Exception:
             pass
-        return out
+        return WorkerContext(out, observations, authored_goal=goal)
+
+    def _worker_context(self, goal: str) -> WorkerContext:
+        # Build establishes typed provenance once; legacy/direct callers retain
+        # their entire input as requirements rather than guessing its origin.
+        return getattr(self, "_build_worker_context", WorkerContext(goal))
 
     # -- plan -------------------------------------------------------------------
     # pipeline: spec → draft → [lint → critic (different brain) → repair] × rounds
+    def _planning_stage(self, name, *, replay=None, source_revision=""):
+        from spiral.planning_memory import PlanningStage
+        from spiral import planner
+
+        def observe(**event):
+            self.ledger.log("planning_checkpoint", **event)
+            if event.get("outcome") == "replayed":
+                from spiral.ui_progress import emit_progress
+                emit_progress({"phase": "restoring planning", "detail":
+                    f"Reusing saved {name.replace('_', ' ')} output; current validators still run.",
+                    "done": 0, "blocked": 0, "final": False, "milestones": []})
+
+        implementation = Path(planner.__file__).read_bytes()
+        if source_revision:
+            implementation += Path(__file__).read_bytes() + source_revision.encode()
+        return PlanningStage(self.ws, name, self.ol,
+            replay=getattr(self, "_resume_planning", False) if replay is None else replay,
+            implementation=hashlib.sha256(implementation).hexdigest(),
+            on_event=observe)
+
+    def _measured_source_inventory(self):
+        """Attach raw source costs when the runtime supplies a bound tokenizer.
+
+        Incomplete scans do not masquerade as complete inventories. This is
+        planning evidence; the provider must still admit each rendered prompt.
+        """
+        factory = getattr(self.ol, "source_tokenizer", None)
+        if not callable(factory):
+            return None
+        from spiral.context_map import ContextMap, read_source
+        from spiral.context_measurement import ContextMeasurementUnavailable, planning_inventory_view
+        from spiral.context_store import ContextStore
+
+        try:
+            meter = factory(self.cfg.worker.name)
+            if meter is None:
+                return None
+            index = ContextMap(self.ws)
+            sources = {path: source for path, source in index.sources.items()
+                       if source.kind == "workspace" and not path.startswith(".")}
+            if not sources or index.limited:
+                raise ContextMeasurementUnavailable("source inventory is empty or reached its scan bound")
+            dependencies = {path: [dep for dep in index.dependencies(path) if dep in sources]
+                            for path in sources}
+            inventory = meter.inventory(sources, dependencies)
+            if any(read_source(self.ws, path).sha256 != source.sha256 for path, source in sources.items()):
+                raise ContextMeasurementUnavailable("workspace sources changed during token measurement")
+            if inventory.get("model") != self.cfg.worker.name:
+                raise ContextMeasurementUnavailable("source counter changed the selected worker model")
+            inventory.update(configured_worker_context_tokens=self.cfg.worker.num_ctx,
+                output_reserved_tokens=self.cfg.worker_max_tokens,
+                capacity_scope="configured allocation, not a measured backend capacity or quality limit",
+                omitted_files=index.omitted,
+                scope="existing indexed text files; omitted and future files remain unmeasured")
+            reference = ContextStore(self.ws).save_map(inventory, kind="measured-sources")
+            self.ledger.log("context_inventory", files=len(sources),
+                source_tokens=sum(row["tokens"] for row in inventory["files"]),
+                tokenizer_identity=inventory["tokenizer_identity"], model=inventory["model"],
+                execution_admitted=False, omitted_files=index.omitted, full_inventory=reference)
+            return planning_inventory_view(inventory, reference,
+                max_bytes=min(12000, max(1500, self.cfg.planner.num_ctx // 2)))
+        except (ContextMeasurementUnavailable, OSError, ValueError) as exc:
+            self.ledger.log("context_inventory_unavailable", reason=str(exc)[:500],
+                            execution_admitted=False)
+            return None
+
     def make_plan(self, goal: str) -> Plan:
         c = self.c
         goal = self._raw_goal(goal)
         repomap = build_repomap(self.ws)
+        from spiral.recovery_context import recovery_observation, with_recovery_observation
+        recovery = recovery_observation(goal)
+        if recovery is not None:
+            self.ledger.log("infrastructure_recovery", observation=recovery,
+                            goal_sha256=self._goal_hash(goal))
         existing = set(list_files(self.ws))
         c.print(f"  [dim]gate: {self.gate_disp} · repo map: {len(repomap)} chars · planner {self.cfg.planner.name}[/]")
 
-        with Spinner("extracting spec") as sp:
-            spec, res = extract_spec(goal, self.cfg, self.ol, progress=lambda k: sp.tick())
-            sp.update(tokens=res.total_tokens)
-        self.ledger.log("plan", phase="spec", model=self.cfg.planner.name, ptok=res.prompt_tokens, ctok=res.completion_tokens)
-        self.ledger.thinking("spec", res.thinking)
-        check_notes = sanitize_checks(spec)
-
-        try:
-            with Spinner("mapping deliverables") as sp:
-                manifest, ares = analyze_deliverables(
-                    goal, spec, repomap, self.cfg, self.ol,
-                    progress=lambda k: sp.tick(),
+        analysis_mode = getattr(self.cfg, "planning_analysis_mode", "sequential")
+        if not isinstance(analysis_mode, str) or analysis_mode not in {"sequential", "joint"}:
+            raise ValueError("planning_analysis_mode must be sequential or joint")
+        if analysis_mode == "joint":
+            # No partial manifest, setup or heuristic fallback on this experimental
+            # path. Both views must validate before reaching the shared pipeline.
+            with self._planning_stage("joint_analysis") as model_io, Spinner("analyzing requirements and deliverables") as sp:
+                spec, manifest, res = analyze_project(
+                    goal, repomap, self.cfg, model_io, progress=lambda k: sp.tick(),
+                    on_attempt=lambda record: self.ledger.log(
+                        "plan_attempt", phase="joint_analysis", **record),
                 )
-        except DeliverableManifestError:
-            # The analyst was available but twice returned a malformed or
-            # semantically invalid manifest. Falling back here would erase the
-            # requested product/tool evidence and let planning continue on a lie.
-            raise
-        except Exception as exc:
-            kind = self._heuristic_project_kind(goal)
-            manifest = {
-                "schema_version": 1,
-                "primary_id": "D1",
-                "deliverables": [{
-                    "id": "D1",
-                    "kind": kind,
-                    "description": goal[:500],
-                    "root_hint": ".",
-                    "output_globs": default_output_globs(kind),
-                    "visual": self._is_ui(kind),
-                    "interactive": kind in {
-                        "web", "android", "ios", "desktop", "game", "notebook",
-                    },
-                    "acceptance_evidence": [],
-                    "tool_families": [],
-                }],
-                "analysis": f"deterministic fallback: {type(exc).__name__}: {exc}",
-            }
-            ares = None
-            c.print(
-                f"  [yellow]○ deliverable analyst unavailable[/] · "
-                f"[dim]using conservative {kind} fallback[/]"
+                sp.update(tokens=res.total_tokens)
+            self.ledger.log(
+                "plan", phase="joint_analysis", model=self.cfg.planner.name,
+                ptok=res.prompt_tokens, ctok=res.completion_tokens,
+                requirements=len(spec), count=len(manifest["deliverables"]),
             )
+            self.ledger.thinking("joint_analysis", res.thinking)
+            check_notes = sanitize_checks(spec)
+            ares = None
+        else:
+            with self._planning_stage("spec") as model_io, Spinner("extracting spec") as sp:
+                spec, res = extract_spec(
+                    goal, self.cfg, model_io, progress=lambda k: sp.tick(),
+                    on_attempt=lambda record: self.ledger.log(
+                        "plan_attempt", phase="spec", **record),
+                )
+                sp.update(tokens=res.total_tokens)
+            self.ledger.log("plan", phase="spec", model=self.cfg.planner.name, ptok=res.prompt_tokens, ctok=res.completion_tokens)
+            self.ledger.thinking("spec", res.thinking)
+            check_notes = sanitize_checks(spec)
+
+            try:
+                with self._planning_stage("deliverables") as model_io, Spinner("mapping deliverables") as sp:
+                    manifest, ares = analyze_deliverables(
+                        goal, spec, repomap, self.cfg, model_io,
+                        progress=lambda k: sp.tick(),
+                        on_attempt=lambda record: self.ledger.log(
+                            "plan_attempt", phase="deliverables", **record),
+                    )
+            except (DeliverableManifestError, BudgetExceeded):
+                # Invalid analysis must not erase requested product/tool evidence.
+                raise
+            except Exception as exc:
+                raise DeliverableManifestError(
+                    f"deliverable analysis unavailable; no substitute contract created: {exc}") from exc
+        # Revalidate every prerequisite before either artifacts.json or a
+        # dependency manifest can be mutated. Do not silently turn malformed
+        # declarations into an empty list, including legacy/resumed metadata.
+        from spiral.capability import manifest_tool_families
+        from spiral.prerequisites import PrerequisiteError
+        try:
+            tool_families = manifest_tool_families(manifest)
+        except PrerequisiteError as exc:
+            raise DeliverableManifestError(f"invalid prerequisite declaration: {exc}") from exc
         manifest["goal_sha256"] = self._goal_hash(goal)
         (self._dir() / "artifacts.json").write_text(json.dumps(manifest, indent=2))
         if ares is not None:
@@ -998,26 +1123,24 @@ class Conductor:
             )
         )
 
-        # The deliverable analyst has now supplied stronger, typed evidence than
-        # goal keywords alone (for example ``ffmpeg`` or ``ollama:qwen3:8b``).
+        # The deliverable analyst has now supplied explicit typed prerequisites.
+        # Goal-only preflight synchronizes existing manifests, never guesses them.
         # Builder runs an explicit inspect/setup pass here, before draft planning
         # or any worker edit. ``spiral plan`` stays read-only; build() enables this
         # phase and snapshots any newly declared project dependency immediately
         # afterward so task transactions still begin from a clean checkpoint.
         if getattr(self, "_capability_setup_enabled", False):
-            try:
-                from spiral.capability import manifest_tool_families
-
-                tool_families = manifest_tool_families(manifest)
-            except Exception:
-                tool_families = []
             self._resolve_capabilities(
                 goal, tool_families=tool_families, setup=True,
                 synchronize_projects="if-declared")
 
         kind = self._project_kind(goal)
         spec = enrich_deliverable_spec(spec, manifest)
-        spec = enrich_product_spec(goal, spec, kind)
+        # A product category is not new user authority or a requirements list.
+        # Model-derived, goal-constrained deliverables remain obligations, but generic
+        # kind/keyword templates must not expand the checklist and then force repair
+        # loops for failing to cover requirements the user never requested. The real
+        # critic, explicit acceptance checks and execution/artifact gates remain.
         check_notes.extend(sanitize_checks(spec))
         checked = sum(1 for r in spec if r.get("check"))
         reveal(c,
@@ -1047,8 +1170,8 @@ class Conductor:
         if design_meta.get("goal_sha256") != self._goal_hash(goal):
             design_f.unlink(missing_ok=True)
             tokens_f.unlink(missing_ok=True)
-        if not self._is_ui(kind):
-            c.print(f"  [dim]○ no visual design stage — {kind} project, not a UI[/]")
+        if not self._visual_deliverable_targets(goal):
+            c.print("  [dim]○ no visual design stage — no visual deliverable declared[/]")
         else:
             design = design_f.read_text() if design_f.is_file() else ""
             if not design:
@@ -1090,9 +1213,18 @@ class Conductor:
                 "kind": kind,
             }, indent=2))
         goal = self._goal_with_design(goal)
+        measured_inventory = self._measured_source_inventory()
+        # Recovery diagnostics inform execution planning/critique. They do not
+        # change the goal or invalidate previously accepted requirements/medium.
+        repomap = with_recovery_observation(repomap, recovery)
 
-        with Spinner("planning") as sp:
-            plan, res = make_plan(goal, repomap, self.gate, self.cfg, self.ol, progress=lambda k: sp.tick())
+        with self._planning_stage("draft") as model_io, Spinner("planning") as sp:
+            measured_options = ({"source_inventory": measured_inventory} if measured_inventory else {})
+            plan, res = make_plan(
+                goal, repomap, self.gate, self.cfg, model_io,
+                progress=lambda k: sp.tick(), spec=spec, manifest=manifest,
+                **measured_options,
+            )
             sp.update(tokens=res.total_tokens)
         self.ledger.log("plan", phase="draft", model=self.cfg.planner.name, ptok=res.prompt_tokens, ctok=res.completion_tokens)
         self.ledger.thinking("draft", res.thinking)
@@ -1120,16 +1252,22 @@ class Conductor:
                 c.print(f"     [yellow]lint:[/] {d}")
             if self.cfg.critic.name != self.cfg.planner.name:
                 self._prepare_owned_local_model(self.cfg.critic.name)
-            with Spinner(f"critic round {rnd}") as sp:
-                try:
+            try:
+                with self._planning_stage(f"critic_round_{rnd}") as model_io, Spinner(f"critic round {rnd}") as sp:
                     verdict, defects, res = critique_plan(
-                        goal, spec, repomap, plan, lint, self.gate, self.cfg, self.ol,
+                        goal, spec, repomap, plan, lint, self.gate, self.cfg, model_io,
                         progress=lambda k: (sp.tick(), sp.update(detail="thinking…" if k == "think" else "writing defects")),
                     )
+                    if (verdict not in {"pass", "revise"} or not isinstance(defects, list)
+                            or any(not isinstance(d, dict) or not isinstance(d.get("issue"), str)
+                                   or not d["issue"].strip() for d in defects)):
+                        raise ValueError("critic returned an invalid verdict or defect list")
                     sp.update(tokens=res.total_tokens)
-                except Exception as e:
-                    c.print(f"  [yellow]○ critic unavailable ({e}) — keeping current plan[/]")
-                    break
+            except BudgetExceeded:
+                raise
+            except Exception as e:
+                c.print(f"  [yellow]○ critic unavailable ({e}) — keeping current plan[/]")
+                break
             if lint:
                 existing_issues = {str(row.get("issue") or "") for row in defects}
                 defects.extend({
@@ -1149,13 +1287,15 @@ class Conductor:
                 break
             if self.cfg.critic.name != self.cfg.planner.name:
                 self._prepare_owned_local_model(self.cfg.planner.name)
-            with Spinner("repairing plan") as sp:
-                try:
-                    plan, res = repair_plan(goal, plan, defects, self.gate, self.cfg, self.ol, progress=lambda k: sp.tick())
+            try:
+                with self._planning_stage(f"repair_round_{rnd}") as model_io, Spinner("repairing plan") as sp:
+                    plan, res = repair_plan(goal, plan, defects, self.gate, self.cfg, model_io, progress=lambda k: sp.tick())
                     sp.update(tokens=res.total_tokens)
-                except Exception as e:
-                    c.print(f"  [yellow]○ repair failed ({e}) — keeping current plan[/]")
-                    break
+            except BudgetExceeded:
+                raise
+            except Exception as e:
+                c.print(f"  [yellow]○ repair failed ({e}) — keeping current plan[/]")
+                break
             c.print(f"  [green]●[/] repaired → {plan.task_count} tasks · [dim]{res.total_tokens} tok[/]")
 
         normalized = normalize_plan_requirements(spec, plan)
@@ -1346,13 +1486,12 @@ class Conductor:
         except Exception:
             meta = {}
         if f.is_file() and meta.get("goal_sha256") == self._goal_hash(goal):
-            spec = enrich_product_spec(
-                goal, json.loads(f.read_text()), self._project_kind(goal))
-            f.write_text(json.dumps(spec, indent=2))
-            return spec
+            # Validation/resume must not quietly expand the saved contract after
+            # planning has deliberately kept it scoped to the requested outputs.
+            return json.loads(f.read_text())
         with Spinner("extracting spec") as sp:
-            spec, _ = extract_spec(goal, self.cfg, self.ol, progress=lambda k: sp.tick())
-        spec = enrich_product_spec(goal, spec, self._project_kind(goal))
+            spec, _ = extract_spec(
+                self._raw_goal(goal), self.cfg, self.ol, progress=lambda k: sp.tick())
         sanitize_checks(spec)
         f.write_text(json.dumps(spec, indent=2))
         meta_f.write_text(json.dumps({
@@ -1361,28 +1500,37 @@ class Conductor:
         }, indent=2))
         return spec
 
+    def _bind_saved_requirement_checks(self, plan: Plan, goal: str) -> Plan:
+        """Use only this goal's saved structured specification; no extra inference."""
+        meta_path = self._dir() / "spec-meta.json"
+        spec_path = self._dir() / "spec.json"
+        if not meta_path.is_file() or not spec_path.is_file():
+            return plan
+        meta = json.loads(meta_path.read_text())
+        if meta.get("goal_sha256") != self._goal_hash(goal):
+            return plan
+        from spiral.planner import bind_requirement_checks
+
+        bound, bindings = bind_requirement_checks(plan, json.loads(spec_path.read_text()))
+        if bindings:
+            self.ledger.log("requirement_completion_checks", bindings=bindings,
+                            execution_admitted=False)
+        return bound
+
     VALIDATE_CHUNK = 4  # small evidence batches survive local and API context limits
 
     def _delivery_manifest(self, goal: str) -> dict:
         declaration_path = self._dir() / "artifacts.json"
+        declaration_error = ""
         try:
             declaration = json.loads(declaration_path.read_text())
             if declaration.get("goal_sha256") != self._goal_hash(goal):
                 raise ValueError("stale deliverable declaration")
-        except Exception:
-            declaration = {
-                "goal_sha256": self._goal_hash(goal),
-                "primary_id": "D1",
-                "deliverables": [{
-                    "id": "D1", "kind": self._project_kind(goal),
-                    "description": self._raw_goal(goal),
-                    "root_hint": ".", "visual": self._is_ui(
-                        self._project_kind(goal)),
-                    "interactive": False,
-                    "output_globs": default_output_globs(
-                        self._project_kind(goal)),
-                }],
-            }
+        except (OSError, ValueError, TypeError, AttributeError) as exc:
+            declaration_error = "Delivery needs this goal's saved deliverable declaration; no inferred substitute."
+            # Other requirement evidence can still be inspected after an outage.
+            # An empty declaration is explicitly not ready, never a guessed product.
+            declaration = {"goal_sha256": self._goal_hash(goal), "deliverables": []}
         from spiral.delivery import build_delivery_manifest
 
         delivery = build_delivery_manifest(
@@ -1393,6 +1541,8 @@ class Conductor:
             ),
             gate=self.gate_disp,
         )
+        if declaration_error:
+            delivery.update(ready=False, declaration_error=declaration_error)
         (self._dir() / "delivery.json").write_text(
             json.dumps(delivery, indent=2), encoding="utf-8")
         return delivery
@@ -1435,6 +1585,8 @@ class Conductor:
 
         verdicts: list[dict] = []
         tok_total = 0
+        from spiral.review_evidence import ReviewEvidence
+        review_evidence = ReviewEvidence(self.ws)
         for requirement in artifact_specs:
             identifier = str(requirement.get("deliverable") or "")
             row = delivered.get(identifier) or {}
@@ -1486,9 +1638,11 @@ class Conductor:
                 })
         # ---- executable acceptance checks first: exit codes, not opinions -------
         for r in det:
+            check_sources = review_evidence.check_sources(r["check"])
             with Spinner(f"check {r['id']}") as sp:
                 v = self._run_verified_command(
                     r["check"], on_line=lambda ln: sp.update(detail=ln))
+            review_evidence.record_check(r["id"], r["check"], v, check_sources)
             self.ledger.log("check", id=r["id"], cmd=r["check"][:120], exit=v.code)
             if v.ok:
                 verdicts.append({"id": r["id"], "status": "implemented", "check": r["check"],
@@ -1513,22 +1667,55 @@ class Conductor:
 
         if opined and self.cfg.critic.name != self.cfg.planner.name:
             self._prepare_owned_local_model(self.cfg.critic.name)
-        for i in range(0, len(opined), self.VALIDATE_CHUNK):
-            batch = opined[i:i + self.VALIDATE_CHUNK]
-            label = f"validating {batch[0]['id']}–{batch[-1]['id']}"
-            context_tokens = max(
-                8192, int(self.cfg.spec_for(self.cfg.critic.name).num_ctx))
+        from spiral.transactions import workspace_fingerprint
+        from spiral.review_context import select_review_batch, preserved_review_source
+        from spiral.planner import validation_prompt
+        from spiral.context_measurement import ContextMeasurementUnavailable
+        validation_goal = self._worker_context(goal).requirements
+        factory = getattr(self.ol, "source_tokenizer", None)
+        try:
+            review_meter = factory(self.cfg.critic.name) if callable(factory) else None
+        except (OSError, ValueError, ContextMeasurementUnavailable):
+            review_meter = None
+        i = 0
+        while i < len(opined):
+            source_revision = workspace_fingerprint(self.ws)
+            context_tokens = int(self.cfg.spec_for(self.cfg.critic.name).num_ctx)
             # Reserve room for system/goal/schema, reasoning, and a complete JSON
             # verdict. Source code averages below four chars/token, so 2.7 is a
             # deliberately conservative conversion.
             source_tokens = max(
                 5000, context_tokens - min(6144, context_tokens // 3) - 5000)
             context_chars = min(80_000, source_tokens * 27 // 10)
-            repomap, selected = build_relevant_repomap(
-                self.ws, batch,
-                max_file_bytes=min(18_000, max(6_000, context_chars // 3)),
-                max_total=context_chars,
-            )
+            max_file_chars = min(18_000, max(6_000, context_chars // 3))
+            def source_for(rows):
+                source, selected = preserved_review_source(self.ws, rows,
+                    lambda focused: build_relevant_repomap(self.ws, focused,
+                        max_file_bytes=max_file_chars, max_total=context_chars),
+                    fallback_size=self.VALIDATE_CHUNK,
+                    max_file_chars=max_file_chars, max_total=context_chars)
+                return source + review_evidence.render(), selected
+            try:
+                view = select_review_batch(opined[i:], source_for,
+                    lambda rows, source: validation_prompt(validation_goal, rows, source, self.gate),
+                    meter=review_meter, model=self.cfg.critic.name, context_tokens=context_tokens,
+                    output_reserved=min(self.cfg.planner_max_tokens, 6144),
+                    fallback_size=self.VALIDATE_CHUNK)
+            except (AttributeError, OSError, ValueError, ContextMeasurementUnavailable) as exc:
+                self.ledger.log("validation_context_unavailable", reason=str(exc)[:300])
+                review_meter = None
+                view = select_review_batch(opined[i:], source_for, None,
+                    model=self.cfg.critic.name, context_tokens=context_tokens,
+                    output_reserved=min(self.cfg.planner_max_tokens, 6144),
+                    fallback_size=self.VALIDATE_CHUNK)
+            batch, repomap, selected = view.requirements, view.source, view.selected_files
+            batch_offset = i
+            i += len(batch)
+            label = f"validating {batch[0]['id']}–{batch[-1]['id']}"
+            self.ledger.log("validation_context_sizing", model=self.cfg.critic.name,
+                requirements=len(batch), raw_tokens=view.raw_tokens, context_tokens=context_tokens,
+                output_reserved=min(self.cfg.planner_max_tokens, 6144), framing_reserved=view.framing_reserved,
+                execution_admitted=False, scope="raw system/user text; exact provider admission still required")
             with (self._dir() / "validation-retrieval.jsonl").open(
                     "a", encoding="utf-8") as handle:
                 handle.write(json.dumps({
@@ -1539,24 +1726,66 @@ class Conductor:
                     "context_chars": len(repomap),
                 }) + "\n")
             try:
-                with Spinner(label) as sp:
+                with self._planning_stage(
+                    f"validation_{rnd}_{batch_offset}",
+                    replay=getattr(self, "_resume_validation", False),
+                    source_revision=source_revision,
+                ) as model_io, Spinner(label) as sp:
+                    def record_attempt(event):
+                        self.ledger.log("validation_attempt", requirements=sorted(
+                            str(row["id"]) for row in batch), **event)
+                        if event["outcome"] in {"empty", "invalid_json", "output_limit"}:
+                            sp.update(detail=(f"Review attempt {event['attempt']} returned no "
+                                              "complete verdict."))
                     vs, res = validate_spec(
-                        goal, batch, repomap, self.gate, self.cfg, self.ol,
+                        validation_goal, batch, repomap, self.gate, self.cfg, model_io,
                         progress=lambda k: (sp.tick(), sp.update(detail="reading code…" if k == "think" else "writing verdicts")),
+                        on_attempt=record_attempt,
                     )
-                expected = {str(row["id"]) for row in batch}
-                for row in vs:
-                    if (not isinstance(row, dict)
-                            or str(row.get("id")) not in expected
-                            or row.get("status") not in {"implemented", "partial", "missing"}):
-                        continue
-                    verdicts.append({**row, "fresh": True})
+                    expected = {str(row["id"]) for row in batch}
+                    def check_rows(rows, ids):
+                        if (not isinstance(rows, list) or len(rows) != len(ids)
+                                or any(not isinstance(row, dict) or row.get("status") not in
+                                       {"implemented", "partial", "missing", "unjudged"} for row in rows)
+                                or {str(row.get("id")) for row in rows} != ids):
+                            raise ValueError("validation batch lacks exact, complete requirement verdicts")
+                    check_rows(vs, expected)
+                    reused = {str(row["id"]): bool((res.raw or {}).get("planning_checkpoint"))
+                              for row in vs}
+                    unresolved = [row for row in vs if row["status"] == "unjudged"]
+                    requested = [item for row in unresolved for item in row.get("context_requests", [])]
+                    if requested and review_evidence.request(requested):
+                        ids = {str(row["id"]) for row in unresolved}
+                        sp.update(detail="reading requested review evidence")
+                        # The same model/provider performs exact admission for this
+                        # bounded additional view; neither settings nor scope grow.
+                        retry, extra = validate_spec(validation_goal,
+                            [row for row in batch if str(row["id"]) in ids],
+                            repomap + review_evidence.render(), self.gate, self.cfg, model_io,
+                            progress=lambda k: (sp.tick(), sp.update(detail="reading code…" if k == "think" else "writing verdicts")),
+                            on_attempt=record_attempt)
+                        check_rows(retry, ids)
+                        vs = [row for row in vs if str(row["id"]) not in ids] + retry
+                        reused.update({str(row["id"]): bool((extra.raw or {}).get("planning_checkpoint"))
+                                       for row in retry})
+                        tok_total += extra.total_tokens
+                    if (workspace_fingerprint(self.ws) != source_revision
+                            or not review_evidence.current()):
+                        raise ValueError("workspace changed during validation; verdicts are not current")
+                verdicts.extend({**row, "fresh": row["status"] != "unjudged", "source_revision": source_revision,
+                                 "inference_reused": reused[str(row["id"])]} for row in vs)
                 tok_total += res.total_tokens
                 self.ledger.thinking(f"validate{rnd}-{batch[0]['id']}", res.thinking)
+            except BudgetExceeded:
+                raise
             except Exception as e:
                 c.print(f"  [yellow]○ batch {batch[0]['id']}–{batch[-1]['id']} failed:[/] [dim]{e}[/]")
 
         judged = {v.get("id") for v in verdicts}
+        if not review_evidence.current():
+            for row in verdicts:
+                row["fresh"] = False
+                row["evidence"] = "Check or requested source changed after observation; fresh verification is required."
         for r in spec:
             if r["id"] not in judged:
                 old = previous.get(str(r["id"]))
@@ -1671,11 +1900,7 @@ class Conductor:
                 verify = t.verify.strip()
                 if self.gate:
                     verify = f"({verify}) && {self.gate}" if verify else self.gate
-                spec_task = TaskSpec(
-                    goal=f"{t.title}\n{t.description}".strip(),
-                    verify_cmd=verify, files=t.files or None, context=goal,
-                    exports=list(getattr(t, "exports", []) or []) or None,
-                )
+                spec_task = _worker_task_spec(t, self._worker_context(goal), verify)
                 status = self._run_task(
                     atom, spec_task, dash, allow_done=False,
                     attempts=max(1, int(getattr(
@@ -1695,7 +1920,7 @@ class Conductor:
             updates["last_green_head"] = self._revision()
             if self.state.get("hygiene_gate"):
                 updates["hygiene_clean"] = False
-            if (self._is_ui(self._project_kind(goal))
+            if (self._visual_deliverable_targets(goal)
                     and self.state.get("visual_review") != "disabled-by-user"):
                 updates["visual_review"] = "stale-after-remediation"
             self._write_state(**updates)
@@ -1827,28 +2052,32 @@ class Conductor:
                 return False
         return False
 
-    def _visual_review_loop(self, goal: str, atom: Atom, dash) -> None:
-        """Review every declared visual deliverable, not only the primary medium."""
-
-        declaration = {}
+    def _visual_deliverable_targets(self, goal: str) -> dict[str, list[str]]:
+        """Use explicit goal-bound visual obligations, not the artifact kind's name."""
         try:
             declaration = json.loads(
                 (self._dir() / "artifacts.json").read_text())
             if declaration.get("goal_sha256") != self._goal_hash(goal):
-                declaration = {}
-        except Exception:
-            declaration = {}
+                raise ValueError("stale deliverable declaration")
+            rows = declaration["deliverables"]
+            if not isinstance(rows, list) or not rows:
+                raise ValueError("missing deliverables")
+            if any(not isinstance(row, dict) or type(row.get("visual")) is not bool for row in rows):
+                raise ValueError("visual obligations are not explicit booleans")
+        except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+            raise DeliverableManifestError(
+                "visual applicability needs this goal's explicit deliverable declaration") from exc
         targets: dict[str, list[str]] = {}
-        for row in declaration.get("deliverables") or []:
-            if not isinstance(row, dict):
-                continue
+        for row in rows:
             kind = str(row.get("kind") or "")
-            if not kind or not (bool(row.get("visual")) or self._is_ui(kind)):
+            if not kind or row["visual"] is not True:
                 continue
             targets.setdefault(kind, []).append(str(row.get("id") or kind))
-        primary_kind = self._project_kind(goal)
-        if not targets and self._is_ui(primary_kind):
-            targets = {primary_kind: ["D1"]}
+        return targets
+
+    def _visual_review_loop(self, goal: str, atom: Atom, dash) -> None:
+        """Review every declared visual deliverable, not only the primary medium."""
+        targets = self._visual_deliverable_targets(goal)
         if not targets:
             self._write_state(
                 visual_review="not-applicable", visual_reviews={})
@@ -2065,7 +2294,7 @@ class Conductor:
             goal=("A build gate just became active and is failing. Repair whatever it "
                   "reports until it passes, with the smallest changes that keep the "
                   "project's intent and style."),
-            verify_cmd=self.gate, files=None, context=goal), dash,
+            verify_cmd=self.gate, files=None, **self._worker_context(goal).fields()), dash,
             # ratchet for the same reason bootstrap does: a newly active gate
             # usually reports several STACKED signatures (a missing dependency
             # hiding a bad import), and clearing one of them is real progress.
@@ -2082,6 +2311,9 @@ class Conductor:
         With ratchet (bootstrap), partial progress banks as checkpoints and
         compounds across both model lanes. allow_done=False forbids ALREADY_DONE
         (remediation of validator-proven gaps)."""
+        escalation_budget = self.cfg.escalation_attempts if esc_attempts is None else esc_attempts
+        if type(escalation_budget) is not int or escalation_budget < 0:
+            raise ValueError("escalation attempt budget must be a non-negative integer")
         strict = not ratchet
         if atom.budget_exhausted:
             ui.print("  [red]■ run execution budget reached; task was not started[/]")
@@ -2109,11 +2341,15 @@ class Conductor:
         if atom.budget_exhausted:
             ui.print("  [red]■ run execution budget reached; escalation suppressed[/]")
             return "blocked"
+        if escalation_budget == 0:
+            ui.print("  [dim]○ escalation disabled by its zero attempt budget[/]")
+            return "blocked"
         ui.print(f"  [rgb(217,119,87)]⇑ escalating to {self.cfg.escalation.name}[/]")
         atom.run_stats["esc_lanes"] += 1
         escalation = run_lane(
             model=self.cfg.escalation.name,
-            attempts=esc_attempts or self.cfg.escalation_attempts,
+            lane="escalation",
+            attempts=escalation_budget,
             strict_green=strict, ratchet=ratchet, allow_done=allow_done, ui=ui,
             diversity=False,  # the dense lane is the last resort — no second sampler
         )
@@ -2354,6 +2590,7 @@ class Conductor:
         from spiral.dash import Dash
 
         runtime_checkpoint()
+        self._resume_validation = bool(resume)
         c = self.c
         t0 = time.time()
         self._preflight()
@@ -2367,6 +2604,7 @@ class Conductor:
         self._capability_tree_changed = False
         if not resume:
             self.state = {"last_green_head": self._revision()}
+            self._write_state(goal=self._raw_goal(goal))
 
         plan = self.load_plan() if resume else None
         if resume and not goal.strip():
@@ -2382,10 +2620,12 @@ class Conductor:
             # pass would; otherwise an interruption during planning permanently
             # suppresses prerequisites that goal-only inspection could not infer.
             self._capability_setup_enabled = True
+            self._resume_planning = resume
             try:
                 plan = self.make_plan(goal)
             finally:
                 self._capability_setup_enabled = False
+                self._resume_planning = False
             if self._capability_tree_changed:
                 # Typed tool-family evidence may have declared a dependency that
                 # goal-only preflight could not know. Freeze that deterministic
@@ -2394,7 +2634,11 @@ class Conductor:
                 self._write_state(last_green_head=self._revision())
                 self._capability_tree_changed = False
         raw_goal = goal
-        goal = self._goal_with_design(raw_goal)
+        # Bind before resume fingerprints and the evidence DAG are evaluated.
+        # Previously green records lacking this check must not skip the new gate.
+        plan = self._bind_saved_requirement_checks(plan, raw_goal)
+        self._build_worker_context = self._goal_context(raw_goal)
+        goal = self._build_worker_context.render()
         self.show_plan(plan)
         if approve:
             import sys as _sys
@@ -2407,6 +2651,7 @@ class Conductor:
         # Planning and execution share one client so role prompts reuse residency
         # and every token/call/wall second lands in the same finite run ledger.
         atom = Atom(self.ws, self.cfg, console=c, ol=self.ol)
+        atom.resume_candidates = bool(resume)
 
         # the router: fold prior runs' ledger into per-signature verdicts, so
         # error classes the worker has never beaten skip its lane entirely
@@ -2476,6 +2721,7 @@ class Conductor:
         watcher = Watcher().start()
         # the cockpit: pinned plan panel + live status line for the whole grind
         with Dash(console=c, plan=plan, gate=self.gate,
+                  plan_scope="project",
                   thought_log=self._dir() / "thoughts.jsonl") as dash:
             dash.mode = watcher.mode if watcher.enabled else ""
             watcher.on_key("t", dash.toggle_thoughts)
@@ -2496,7 +2742,7 @@ class Conductor:
                         ),
                         verify_cmd=self.gate,
                         files=None,
-                        context=goal,
+                        **self._worker_context(goal).fields(),
                     )
                     status = self._run_task(
                         atom, spec, dash,
@@ -2544,12 +2790,13 @@ class Conductor:
                     dash.task(0, 0, "done")
 
             # ---- foundation: deterministic design ground truth (icon, etc.) -----
-            self._foundation(dash, goal)
+            self._foundation(dash, raw_goal)
             # the goal-with-design text was composed BEFORE the foundation existed,
             # so its tokens/favicon brief silently skipped — and the first worker
             # then invented its own stylesheet instead of linking the generated
             # one. Recompose now that the files are on disk.
-            goal = self._goal_with_design(raw_goal)
+            self._build_worker_context = self._goal_context(raw_goal)
+            goal = self._build_worker_context.render()
 
             # ---- the grind: every task keeps the gate green ---------------------
             done = 0
@@ -2562,7 +2809,7 @@ class Conductor:
                     task_key = f"{mi}.{ti}"
                     if resume and self._task_is_resumably_done(task_key, t):
                         dash.task(mi, ti, "done")
-                        dash.print(f"  [dim]↳ {task_key} already green at its recorded commit[/]")
+                        dash.print(f"  [dim]↳ {task_key} already green at its saved checkpoint[/]")
                         continue
                     blocked = [
                         row for row in blocked
@@ -2588,7 +2835,7 @@ class Conductor:
                         self._evidence_dag.save(dag_path)
                         continue
                     if decision == "quit":
-                        dash.print("  [yellow]■ stopped by you — green work is committed; --resume continues[/]")
+                        dash.print("  [yellow]■ stopped by you — inspect retained work; --resume continues from saved state[/]")
                         watcher.stop()
                         self._write_state(outcome="user_stop", tokens=atom.tokens)
                         self._write_evidence_result(
@@ -2611,13 +2858,7 @@ class Conductor:
                     verify = t.verify.strip()
                     if self.gate:
                         verify = f"({verify}) && {self.gate}" if verify else self.gate
-                    spec = TaskSpec(
-                        goal=f"{t.title}\n{t.description}".strip(),
-                        verify_cmd=verify,
-                        files=t.files or None,
-                        context=goal,
-                        exports=list(getattr(t, "exports", []) or []) or None,
-                    )
+                    spec = _worker_task_spec(t, self._worker_context(goal), verify)
                     status = self._run_task(atom, spec, dash)
                     if status != "blocked":
                         self._verify_new_gate(dash, atom, goal)   # this task may have created the gate
@@ -2742,7 +2983,7 @@ class Conductor:
                     ).strip(),
                     verify_cmd=verify,
                     files=task.files or None,
-                    context=goal,
+                    **self._worker_context(goal).fields(),
                     exports=list(getattr(task, "exports", []) or []) or None,
                 )
                 recovery_status = self._run_task(
@@ -2863,18 +3104,12 @@ class Conductor:
         spec_green = False
         previous_finish_signature = None
         finish_rounds = max(1, int(getattr(self.cfg, "finish_rounds", 4)))
-        qa_plan = Plan("finish quality", [Milestone(
-            "finish gates", [Task(
-                "audit the complete product",
-                "Run deterministic product checks, visual inspection, the build/test gate, "
-                "and final requirement validation on the same revision.",
-            )],
-        )])
         for finish_round in range(1, finish_rounds + 1):
             runtime_checkpoint()
             c.print(f"[bold {CLAY}]━━ finish pass {finish_round}/{finish_rounds} ━━[/]")
-            with Dash(console=c, plan=qa_plan, gate=self.gate,
+            with Dash(console=c, gate=self.gate,
                       thought_log=self._dir() / "thoughts.jsonl") as qa_dash:
+                qa_dash.phase("checking delivery")
                 self._product_audit_loop(goal, atom, qa_dash)
                 self._visual_review_loop(goal, atom, qa_dash)
                 delivery = self._delivery_manifest(goal)

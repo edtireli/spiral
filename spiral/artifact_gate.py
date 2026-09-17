@@ -103,6 +103,36 @@ def _looks_like_text(path: Path) -> bool:
         return False
 
 
+def _empty_distribution_metadata(path: Path) -> bool:
+    """Optional list/mapping metadata permits zero entries, unlike a deliverable.
+
+    Validate its enclosing distribution identity rather than exempting arbitrary
+    empty text or every file in a generated directory. SOURCES and core metadata
+    are not optional lists here; ordinary parser/decoder checks remain in force.
+    """
+    if (not path.parent.name.endswith(".egg-info") or path.name not in {
+            "dependency_links.txt", "namespace_packages.txt", "requires.txt",
+            "top_level.txt", "entry_points.txt"}):
+        return False
+    from email.parser import Parser
+    from packaging.version import Version, InvalidVersion
+
+    core = path.parent / "PKG-INFO"
+    try:
+        if core.is_symlink() or core.stat().st_size > 128_000:
+            return False
+        metadata = Parser().parsestr(core.read_text(encoding="utf-8"))
+        if metadata.defects or any(len(metadata.get_all(key, [])) != 1
+                                   for key in ("Metadata-Version", "Name", "Version")):
+            return False
+        if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?", metadata["Name"]):
+            return False
+        Version(metadata["Version"])
+        return bool(re.fullmatch(r"\d+\.\d+", metadata["Metadata-Version"]))
+    except (OSError, UnicodeError, ValueError, InvalidVersion):
+        return False
+
+
 def _executable_format(path: Path) -> str:
     """Recognize ordinary native executables without attempting to run them."""
 
@@ -313,7 +343,7 @@ def verify_workspace(workspace: str | Path) -> ArtifactReport:
                     )
                     if checked.returncode:
                         raise ValueError(checked.stderr.strip() or "JavaScript syntax error")
-                elif not text.strip():
+                elif not text.strip() and not _empty_distribution_metadata(path):
                     raise ValueError("artifact is empty")
                 verified += 1
                 evidence.append(f"{rel}: parse/integrity check passed")

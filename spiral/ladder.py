@@ -38,6 +38,22 @@ SKIP_DIRS = {
 }
 
 
+# Kept dependency-free so an unavailable test runner is diagnosed by the exact
+# project interpreter before any model or test collection runs. A missing runner
+# is never accepted as "no tests". pytest.main preserves collection and exit codes.
+TEST_SCRIPT = '''import importlib.util
+import sys
+if importlib.util.find_spec("pytest") is None:
+    print("SPIRAL_VERIFIER_UNAVAILABLE: pytest is absent from " + sys.executable,
+          file=sys.stderr)
+    raise SystemExit(127)
+import pytest
+# Match `python -m pytest` import behavior when executing this stored script.
+sys.path[0] = "."
+raise SystemExit(pytest.main(["-q"]))
+'''
+
+
 @dataclass(frozen=True)
 class Rung:
     """One question, one command, and what a failure means in English."""
@@ -601,6 +617,7 @@ def materialize(root: Path, probe_paths: list[str] | None = None) -> list[Rung]:
         ("parse.py", PARSE_SCRIPT),
         ("load.py", LOAD_SCRIPT),
         ("smoke.py", SMOKE_SCRIPT),
+        ("test.py", TEST_SCRIPT),
     ):
         target = out / name
         if not target.is_file() or target.read_text() != body:
@@ -624,8 +641,8 @@ def materialize(root: Path, probe_paths: list[str] | None = None) -> list[Rung]:
         ))
     # "no tests collected" is a fair pass on a greenfield project and a lie once
     # test files exist — so the tolerance disappears the moment they do.
-    tests = ("python -m pytest -q" if has_python_tests(root)
-             else "python -m pytest -q || [ $? -eq 5 ]")
+    tests = ("python .spiral/rungs/test.py" if has_python_tests(root)
+             else "python .spiral/rungs/test.py || [ $? -eq 5 ]")
     rungs.append(Rung("test", tests, "the test suite does not pass"))
     return rungs
 

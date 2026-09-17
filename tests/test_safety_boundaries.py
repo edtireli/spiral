@@ -34,7 +34,7 @@ def test_full_access_uses_an_available_shell_on_linux(tmp_path, monkeypatch):
         full_access=True,
     )
 
-    assert argv == ["/usr/bin/bash", "-lc", "true"]
+    assert argv == ["/usr/bin/bash", "-lc", broker_module._PIPELINE_STATUS_PREAMBLE + "true"]
     assert sandboxed is False
 
 

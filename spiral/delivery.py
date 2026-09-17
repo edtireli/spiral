@@ -446,7 +446,10 @@ def build_delivery_manifest(
             and files_structural
             and (True if file_deliverable else project_ok)
         )
-        visual_required = bool(row.get("visual")) or kind in VISUAL_KINDS
+        # Honor the explicit reviewed obligation. Legacy callers without a typed
+        # flag retain their conservative medium-based requirement.
+        visual_required = (row["visual"] if type(row.get("visual")) is bool
+                           else kind in VISUAL_KINDS)
         row_visual_status = (
             str(
                 visual_status.get(str(row.get("id") or ""))

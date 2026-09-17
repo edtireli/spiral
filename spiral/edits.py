@@ -164,6 +164,32 @@ def _plausible_path(s: str) -> bool:
     return 0 < len(s) < 180 and _PATH_RX.match(s) is not None and ("/" in s or "." in s)
 
 
+class EditProgressHint:
+    """Recognize a complete streamed edit header without inventing path suffixes.
+
+    This bounded side channel only describes a proposed edit. Generation deltas
+    still pass through immediately; this never applies or verifies the proposal.
+    """
+    def __init__(self):
+        self.tail = ""
+        self.last_path = ""
+
+    def feed(self, piece: str) -> str | None:
+        text = self.tail + piece
+        if len(text) > 2048:
+            # Discard the entire cut line: its suffix is not a complete filename.
+            text = text[-2048:].partition('\n')[2]
+        self.tail = text
+        matches = list(re.finditer(r'(?m)^([^\n]+)\n\s*<{3,}\s*SEARCH\b', text))
+        if not matches:
+            return None
+        path = _path_from_line(matches[-1][1])
+        if not path or path == self.last_path:
+            return None
+        self.last_path = path
+        return path
+
+
 def parse_edits(text: str) -> list[EditBlock]:
     """Extract every well-formed SEARCH/REPLACE block from model output."""
     return parse_any(text).blocks

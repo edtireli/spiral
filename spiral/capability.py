@@ -7,10 +7,9 @@ had was the question. Nothing compared *what the work requires* against *what is
 here*, so a worker facing a missing package spent ninety thousand tokens editing
 source instead, and never once asked to install anything.
 
-This module asks it. Needs come from two places that do not require a model to be
-imaginative: the deliverable analyst's own ``tool_families``, and a table of
-domain words whose implementation route is not really in doubt — a diffusion model
-needs torch, a Reddit bot needs an API client, an Android app needs a JDK.
+This module consumes explicit validated analyst prerequisites. Goal words, site
+names and legacy prose do not select packages, binaries or models. Runtime
+constraints are observations of the selected interpreter, never packages to install.
 
 Resolution deliberately does NOT install anything itself. It DECLARES the
 dependency in the manifest the project already uses (``requirements.txt``,
@@ -32,6 +31,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -40,83 +40,21 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# domain word -> (python packages, certificate expression, why)
-# Only entries where the route is genuinely uncontroversial. A wrong guess here
-# costs a wasted install, so the bar is "any practitioner would reach for this".
-DOMAIN_PACKAGES: dict[str, tuple[tuple[str, ...], str, str]] = {
-    "diffusion": (("torch", "diffusers", "transformers"),
-                  "import torch, diffusers", "image generation with diffusers"),
-    "stable diffusion": (("torch", "diffusers", "transformers"),
-                         "import torch, diffusers", "image generation"),
-    "neural network": (("torch",), "import torch; torch.zeros(1)",
-                       "tensor maths and autograd"),
-    "deep learning": (("torch",), "import torch; torch.zeros(1)", "training"),
-    "train a model": (("torch",), "import torch; torch.zeros(1)", "training"),
-    "transformer": (("torch", "transformers"), "import transformers", "LLM work"),
-    "embedding": (("sentence-transformers",), "import sentence_transformers",
-                  "text embeddings"),
-    "computer vision": (("opencv-python", "numpy"), "import cv2, numpy",
-                        "image processing"),
-    "image processing": (("pillow",), "import PIL.Image", "raster image work"),
-    "reddit": (("praw",), "import praw", "the Reddit API"),
-    "discord": (("discord.py",), "import discord", "the Discord API"),
-    "telegram": (("python-telegram-bot",), "import telegram", "the Telegram API"),
-    "scrape": (("requests", "beautifulsoup4"), "import requests, bs4",
-               "fetching and parsing pages"),
-    # spelled out because matching is word-bounded and agent nouns are not
-    # tolerated as an inflection: "scraper" is the work, but "gamer" is a person.
-    "scraper": (("requests", "beautifulsoup4"), "import requests, bs4",
-                "fetching and parsing pages"),
-    "dataframe": (("pandas",), "import pandas", "tabular data"),
-    "csv analysis": (("pandas",), "import pandas", "tabular data"),
-    "plot": (("matplotlib",), "import matplotlib", "charts"),
-    "chart": (("matplotlib",), "import matplotlib", "charts"),
-    "pdf": (("pypdf",), "import pypdf", "reading and writing PDFs"),
-    "spreadsheet": (("openpyxl",), "import openpyxl", "xlsx files"),
-    "fastapi": (("fastapi", "uvicorn"), "import fastapi", "the web framework"),
-    "flask": (("flask",), "import flask", "the web framework"),
-    "sqlalchemy": (("sqlalchemy",), "import sqlalchemy", "the ORM"),
-    "websocket": (("websockets",), "import websockets", "socket transport"),
-    "audio": (("soundfile", "numpy"), "import soundfile, numpy", "audio io"),
-    "speech": (("openai-whisper",), "import whisper", "transcription"),
-    "game": (("pygame",), "import pygame", "the game loop and rendering"),
-    "classifier": (("scikit-learn", "numpy"), "import sklearn, numpy",
-                   "fitting and evaluating a model"),
-    "scikit": (("scikit-learn", "numpy"), "import sklearn, numpy", "modelling"),
-    "random forest": (("scikit-learn",), "import sklearn.ensemble", "the ensemble"),
-    # qualified, never bare: in the goals this CLI is handed "regression" is
-    # overwhelmingly a regression *test*, so the bare word bought scikit-learn
-    # and numpy for "add regression tests for the parser".
-    "linear regression": (("scikit-learn", "numpy"), "import sklearn, numpy",
-                          "fitting"),
-    "logistic regression": (("scikit-learn", "numpy"), "import sklearn, numpy",
-                            "fitting"),
-    "regression model": (("scikit-learn", "numpy"), "import sklearn, numpy",
-                         "fitting"),
-    "generate a pdf": (("reportlab",), "import reportlab", "laying out a PDF"),
-    "pdf report": (("reportlab",), "import reportlab", "laying out a PDF"),
-}
+from packaging.specifiers import SpecifierSet
+from packaging.utils import canonicalize_name
+from packaging.version import Version
 
-# domain word -> (binary, install hint, why). Reported, never installed silently.
-DOMAIN_BINARIES: dict[str, tuple[str, str, str]] = {
-    "android": ("java", "brew install --cask temurin", "the JDK gradle needs"),
-    "ios": ("xcodebuild", "install Xcode from the App Store", "building for iOS"),
-    "video": ("ffmpeg", "brew install ffmpeg", "encoding and decoding video"),
-    "ffmpeg": ("ffmpeg", "brew install ffmpeg", "media processing"),
-    "docker": ("docker", "install Docker Desktop", "container builds"),
-    # its own entry because matching is word-bounded and this is how the word
-    # actually shows up in a goal ("add a Dockerfile").
-    "dockerfile": ("docker", "install Docker Desktop", "container builds"),
-    "latex": ("pdflatex", "brew install --cask mactex", "typesetting"),
-}
-
+from spiral.prerequisites import (
+    NODE_REQUIREMENT as _NODE_REQUIREMENT,
+    PrerequisiteError, parse_families, python_requirement,
+)
 
 @dataclass
 class Need:
     """One capability the build requires, and how to prove it is present."""
 
     id: str
-    kind: str                       # "python" | "node" | "binary" | "model"
+    kind: str                       # "python" | "node" | "binary" | "model" | "runtime"
     packages: tuple[str, ...] = ()
     certificate: str = ""           # python expression or shell command
     why: str = ""
@@ -124,6 +62,9 @@ class Need:
     install_hint: str = ""
     setup_request: str = ""          # typed broker request, never an arbitrary shell
     access: str = "workspace"         # "workspace" | "full-access"
+    runtime_specifier: str = ""
+    runtime_observation: dict = field(default_factory=dict)
+    registry_requirement: str = ""
 
     def to_json(self) -> dict:
         return {k: (list(v) if isinstance(v, tuple) else v)
@@ -156,7 +97,14 @@ class Resolution:
         if self.present:
             lines.append("Already available: " + ", ".join(
                 sorted({p for need in self.present for p in
-                        (need.packages or (need.binary,))})))
+                        (need.packages or (need.binary or need.id,))})))
+        for need in [*self.present, *self.blocked]:
+            if need.runtime_observation:
+                observation = need.runtime_observation
+                lines.append(
+                    f"Selected Python runtime: {observation['executable']} "
+                    f"version {observation['version']}; constraint {need.runtime_specifier} "
+                    f"satisfied={observation['satisfied']}. This does not certify a different project venv.")
         if self.declared:
             lines.append("Added to this project's dependency manifest (the harness "
                          "installs them before the first gate run): " + ", ".join(
@@ -176,184 +124,53 @@ class Resolution:
         return "\n".join(lines)
 
 
-# A table word counts only as a whole word, plus the plain inflections it really
-# takes ("charts", "games"). Agent nouns are excluded on purpose — see _mentions.
-_INFLECTIONS = r"(?:s|es|d|ed|ing)?"
-_OLLAMA_MODEL = re.compile(
-    r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}(?::[A-Za-z0-9][A-Za-z0-9._-]{0,63})?$"
-)
-_NODE_REQUIREMENT = re.compile(
-    r"^(?P<name>(?:@[A-Za-z0-9_.-]+/)?[A-Za-z0-9_.-]+)"
-    r"(?:@(?P<version>[A-Za-z0-9*^~<>=_.+-]+))?$"
-)
-_HUGGING_FACE = re.compile(r"\b(?:hugging[\s-]+face|huggingface)\b", re.I)
-_MODEL_RUNTIME_ARTIFACT = re.compile(
-    r"\b(?:checkpoint|pipeline|pretrained|weights?)\b",
-    re.I,
-)
-_LOCAL_EXECUTION = re.compile(r"\b(?:local|locally|offline|on[ -]device)\b", re.I)
-_MODEL_EXECUTION_ACTION = re.compile(
-    r"\b(?:infer(?:s|red|ring)?|inference|load(?:s|ed|ing)?)\b", re.I,
-)
-_LOCAL_PYTHON_MODEL_RUNTIME = (
-    re.compile(r"\bpython\b", re.I),
-    _LOCAL_EXECUTION,
-    re.compile(
-        r"\b(?:pretrained\s+(?:language[- ]?)?model|model\s+(?:checkpoint|weights?))\b",
-        re.I,
-    ),
-    re.compile(r"\bload(?:s|ed|ing)?\b", re.I),
-    re.compile(r"\b(?:infer(?:s|red|ring)?|inference)\b", re.I),
-)
-
-
-def _mentions(text: str, word: str) -> bool:
-    """True when the table's word is used, not merely spelled somewhere inside.
-
-    The bare ``word in text`` test read "gamers" as pygame work, "flowchart" as
-    matplotlib work and every "ratios" as an iOS build — and a detected need is
-    not a suggestion: it is written into requirements.txt, committed, and then
-    really installed against the run's install budget.
-    """
-    return re.search(rf"\b{re.escape(word)}{_INFLECTIONS}\b", text) is not None
-
-
-def _requires_transformers_runtime(text: str) -> bool:
-    """Recognise an actual in-process model runtime, not an API client.
-
-    ``LLM`` describes what many products talk *to*; it does not identify their
-    Python implementation.  Named Hugging Face model work is strong evidence.
-    Without a named framework, require the much narrower combination of Python,
-    local execution, loading model weights/checkpoints, and inference.
-    """
-
-    if _HUGGING_FACE.search(text):
-        if _MODEL_RUNTIME_ARTIFACT.search(text):
-            return True
-        if _LOCAL_EXECUTION.search(text) and _MODEL_EXECUTION_ACTION.search(text):
-            return True
-    return all(pattern.search(text) for pattern in _LOCAL_PYTHON_MODEL_RUNTIME)
-
-
 def detect_needs(goal: str, tool_families: list[str] | None = None) -> list[Need]:
-    """Capabilities implied by the goal and by the analyst's declared tool families."""
-    typed_prefix = re.compile(
-        r"\s*(?:python|node|brew|binary|ollama|local-model|model)\s*[:=]",
-        re.I,
-    )
-    legacy_families = [
-        str(value) for value in (tool_families or [])
-        if not typed_prefix.match(str(value))
-    ]
-    text = " ".join([goal or "", " ".join(legacy_families)]).lower()
-    needs: dict[str, Need] = {}
-    # The analyst's generic acquisition vocabulary. Values still cross the same
-    # registry/formula/model validators as ASK: install; this is a typed hint, not
-    # permission to execute prose or a generated shell command.
-    for raw in tool_families or []:
-        family = str(raw).strip()
-        typed = re.fullmatch(
-            r"(python|node|brew|binary)\s*:\s*(\S+)", family, re.I)
-        if not typed:
-            continue
-        ecosystem, value = typed.group(1).lower(), typed.group(2)
-        if ecosystem == "python":
-            try:
-                from packaging.requirements import Requirement
-            except Exception:
-                from pip._vendor.packaging.requirements import Requirement  # type: ignore
-            try:
-                parsed = Requirement(value)
-            except Exception:
-                continue
-            if parsed.url:
-                continue
-            distribution = parsed.name
-            needs.setdefault(f"python:{distribution.lower()}", Need(
-                id=f"python:{distribution.lower()}", kind="python",
-                packages=(value,),
-                certificate=(
-                    "import importlib.metadata as m; "
-                    f"m.version({json.dumps(distribution)})"
-                ),
-                why=f"deliverable analyst requested Python distribution {distribution}",
+    """Resolve explicit declarations only; goal prose never selects dependencies."""
+    needs = []
+    for declaration in parse_families(tool_families):
+        kind, name, value = declaration.kind, declaration.name, declaration.value
+        if kind == "python":
+            needs.append(Need(
+                id=f"python:{name}", kind="python", packages=(value,),
+                registry_requirement=value,
+                certificate=("import importlib.metadata as m; "
+                             f"m.version({json.dumps(name)})"),
+                why=f"deliverable analyst requested Python distribution {name}",
                 setup_request=f"python {value}", access="workspace",
             ))
-        elif ecosystem == "node" and _NODE_REQUIREMENT.fullmatch(value):
-            package_name = _NODE_REQUIREMENT.fullmatch(value).group("name")  # type: ignore[union-attr]
-            needs.setdefault(f"node:{package_name.lower()}", Need(
-                id=f"node:{package_name.lower()}", kind="node",
-                packages=(value,), certificate=f"npm list {package_name}",
-                why=f"deliverable analyst requested Node package {package_name}",
+        elif kind == "runtime":
+            needs.append(Need(
+                id=f"python-runtime:{value}", kind="runtime",
+                runtime_specifier=value,
+                why="explicit constraint on the selected Python interpreter",
+                install_hint="use an explicitly approved compatible runtime or revise the declared constraint",
+            ))
+        elif kind == "node":
+            needs.append(Need(
+                id=f"node:{name.lower()}", kind="node", packages=(value,),
+                certificate=f"npm list {name}",
+                why=f"deliverable analyst requested Node package {name}",
                 setup_request=f"node {value}", access="workspace",
             ))
-        elif ecosystem == "brew" and re.fullmatch(
-                r"[A-Za-z0-9][A-Za-z0-9_.+-]{0,100}", value):
-            needs.setdefault(f"binary:{value}", Need(
-                id=f"binary:{value}", kind="binary", binary=value,
-                certificate=f"command -v {value}",
-                why=f"deliverable analyst requested Homebrew core formula {value}",
-                install_hint=f"brew install {value}", setup_request=f"brew {value}",
+        elif kind in {"brew", "binary"}:
+            formula = kind == "brew"
+            needs.append(Need(
+                id=f"binary:{name}", kind="binary", binary=name,
+                certificate=f"command -v {name}",
+                why=f"deliverable analyst requires {'Homebrew core formula' if formula else 'existing binary'} {name}",
+                install_hint=f"brew install {name}" if formula else "supply this binary through the approved host profile",
+                setup_request=f"brew {name}" if formula else "",
+                access="full-access" if formula else "workspace",
+            ))
+        elif kind == "model":
+            needs.append(Need(
+                id=f"model:{name}", kind="model", binary=name,
+                certificate=f"ollama show {name}",
+                why="explicitly declared local model runtime",
+                install_hint=f"ollama pull {name}", setup_request=f"ollama {name}",
                 access="full-access",
             ))
-        elif ecosystem == "binary" and re.fullmatch(
-                r"[A-Za-z0-9][A-Za-z0-9_.+-]{0,100}", value):
-            needs.setdefault(f"binary:{value}", Need(
-                id=f"binary:{value}", kind="binary", binary=value,
-                certificate=f"command -v {value}",
-                why=f"deliverable analyst requires the existing binary {value}",
-                install_hint="supply this binary through the approved host profile",
-            ))
-    for word, (packages, certificate, why) in DOMAIN_PACKAGES.items():
-        if _mentions(text, word):
-            needs.setdefault(f"python:{packages[0]}", Need(
-                id=f"python:{packages[0]}", kind="python", packages=packages,
-                certificate=certificate, why=why))
-    if _requires_transformers_runtime(text):
-        needs.setdefault("python:transformers", Need(
-            id="python:transformers", kind="python", packages=("transformers",),
-            certificate="import transformers",
-            why="explicit local Hugging Face or Python model inference work",
-        ))
-    for word, (binary, hint, why) in DOMAIN_BINARIES.items():
-        if _mentions(text, word):
-            formula = ""
-            match = re.fullmatch(r"brew install ([A-Za-z0-9][A-Za-z0-9_.+-]{0,100})", hint)
-            if match:
-                formula = match.group(1)
-            needs.setdefault(f"binary:{binary}", Need(
-                id=f"binary:{binary}", kind="binary", binary=binary,
-                certificate=f"command -v {binary}", why=why, install_hint=hint,
-                setup_request=f"brew {formula}" if formula else "",
-                access="full-access" if formula else "workspace"))
-
-    # A project-local model is too large to infer from a vague word such as "AI".
-    # Admit only an explicit typed family from the deliverable manifest, or an
-    # explicit ``ollama model NAME`` / ``ollama:NAME`` phrase in the user's goal.
-    model_names: list[str] = []
-    for family in tool_families or []:
-        match = re.fullmatch(
-            r"\s*(?:ollama|local-model|model)\s*[:=]\s*(\S+)\s*",
-            str(family), re.I,
-        )
-        if match:
-            model_names.append(match.group(1))
-    for pattern in (
-        r"\bollama\s+model\s+([A-Za-z0-9][A-Za-z0-9._/-]*(?::[A-Za-z0-9][A-Za-z0-9._-]*)?)",
-        r"\bollama\s*:\s*([A-Za-z0-9][A-Za-z0-9._/-]*(?::[A-Za-z0-9][A-Za-z0-9._-]*)?)",
-    ):
-        model_names.extend(re.findall(pattern, goal or "", re.I))
-    for name in model_names:
-        if not _OLLAMA_MODEL.fullmatch(name):
-            continue
-        needs.setdefault(f"model:{name}", Need(
-            id=f"model:{name}", kind="model", binary=name,
-            certificate=f"ollama show {name}",
-            why="the generated product's local model runtime",
-            install_hint=f"ollama pull {name}", setup_request=f"ollama {name}",
-            access="full-access",
-        ))
-    return sorted(needs.values(), key=lambda n: n.id)
+    return sorted(needs, key=lambda need: need.id)
 
 
 def _venv_python(root: Path) -> Path | None:
@@ -364,6 +181,16 @@ def _venv_python(root: Path) -> Path | None:
 
 def is_present(root: Path, need: Need) -> bool:
     """Prove it, do not assume it — run the certificate."""
+    if need.kind == "runtime":
+        # Observe this already-selected trusted interpreter, never invoke a
+        # project-controlled Python or turn a version into a pip requirement.
+        version = platform.python_version()
+        satisfied = SpecifierSet(need.runtime_specifier).contains(Version(version))
+        need.runtime_observation = {
+            "executable": sys.executable, "version": version,
+            "satisfied": satisfied, "scope": "selected_engine_interpreter_only",
+        }
+        return satisfied
     if need.kind == "binary":
         if shutil.which(need.binary) is not None:
             return True
@@ -383,6 +210,26 @@ def is_present(root: Path, need: Need) -> bool:
         return False
     if need.kind == "python":
         interpreter = _venv_python(root) or Path(sys.executable)
+        if need.registry_requirement:
+            requirement = python_requirement(need.registry_requirement)
+            # Metadata version checks do not certify optional dependency graphs
+            # or another interpreter's marker environment. Preserve these in the
+            # manifest for its resolver, without falsely calling them present.
+            if requirement.extras or requirement.marker is not None:
+                return False
+            try:
+                done = subprocess.run(
+                    [str(interpreter), "-I", "-c",
+                     "import importlib.metadata as m; "
+                     f"print(m.version({json.dumps(requirement.name)}))"],
+                    capture_output=True, text=True, timeout=180, cwd=root,
+                    stdin=subprocess.DEVNULL,
+                )
+                version = done.stdout.strip()
+                return (done.returncode == 0 and len(version) <= 128
+                        and requirement.specifier.contains(Version(version)))
+            except (OSError, subprocess.SubprocessError, ValueError):
+                return False
         try:
             done = subprocess.run(
                 [str(interpreter), "-c", need.certificate],
@@ -427,35 +274,60 @@ def _requirements_file(root: Path) -> Path:
     return root / "requirements.txt"
 
 
-def declare_python(root: Path, packages: tuple[str, ...]) -> list[str]:
+def declare_python(root: Path, packages: tuple[str, ...], *, dry_run: bool = False) -> list[str]:
     """Add packages to requirements.txt, leaving existing pins alone.
 
     Declaring rather than installing keeps one acquisition path: the provisioning
     that already runs before every gate picks these up, inside the sandbox and
     against the install budget, and the repo records what the project depends on.
     """
+    parse_families([f"python-package:{package}" for package in packages])
+    parsed_packages = [python_requirement(package) for package in packages]
     target = _requirements_file(root)
     existing_text = target.read_text() if target.is_file() else ""
-    existing = {
-        re.split(r"[<>=!\[ ]", line.strip())[0].lower()
-        for line in existing_text.splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    }
-    added = [p for p in packages if p.split("[")[0].lower() not in existing]
+    existing = set()
+    existing_requirements = {}
+    for line in existing_text.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        try:
+            parsed = python_requirement(line.strip())
+            name = canonicalize_name(parsed.name)
+            existing.add(name)
+            existing_requirements.setdefault(name, []).append(parsed)
+        except PrerequisiteError:
+            # Preserve existing pip options, includes and invalid/user-authored
+            # entries verbatim. This path never silently repairs an old manifest.
+            existing.add(canonicalize_name(re.split(r"[<>=!\[ ]", line.strip())[0]))
+    added = []
+    for package, parsed in zip(packages, parsed_packages):
+        name = canonicalize_name(parsed.name)
+        for previous in existing_requirements.get(name, []):
+            if ((parsed.specifier and str(parsed.specifier) != str(previous.specifier))
+                    or not parsed.extras.issubset(previous.extras)
+                    or str(parsed.marker or "") != str(previous.marker or "")):
+                raise PrerequisiteError(
+                    f"existing Python declaration for {name} does not encode the new explicit "
+                    "constraint/extras/marker; reconcile the manifest explicitly; existing content was not changed"
+                )
+        if name not in existing:
+            added.append(package)
+            existing.add(name)
     if not added:
         return []
     lines = existing_text.splitlines()
     if lines and lines[-1].strip() == "":
         lines = lines[:-1]
     lines += added
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text("\n".join(lines) + "\n")
+    if not dry_run:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("\n".join(lines) + "\n")
     return added
 
 
 def declare_node(root: Path, requirements: tuple[str, ...]) -> list[str]:
     """Record typed npm dependencies without accepting URLs, files, taps, or hooks."""
-
+    parse_families([f"node:{requirement}" for requirement in requirements])
     target = Path(root) / "package.json"
     if target.is_file():
         try:
@@ -509,7 +381,13 @@ def resolve(workspace: str | Path, goal: str,
     """Work out the gap and close what can be closed by declaring it."""
     root = Path(workspace).resolve()
     outcome = Resolution()
-    for need in detect_needs(goal, tool_families):
+    needs = detect_needs(goal, tool_families)
+    if declare:
+        # Existing constraint conflicts must also be found before any earlier
+        # valid declaration can modify requirements.txt or package.json.
+        declare_python(root, tuple(package for need in needs if need.kind == "python"
+                                   for package in need.packages), dry_run=True)
+    for need in needs:
         # A project dependency is a durable product fact, not merely a property
         # of the current host. Declare it even when Spiral's own interpreter can
         # import it; a clean checkout must acquire the same dependency later.
@@ -519,6 +397,7 @@ def resolve(workspace: str | Path, goal: str,
                 outcome.declared.append(Need(
                     id=need.id, kind=need.kind, packages=tuple(added),
                     certificate=need.certificate, why=need.why,
+                    registry_requirement=need.registry_requirement,
                     setup_request=need.setup_request, access=need.access))
             elif is_present(root, need):
                 outcome.present.append(need)
@@ -571,11 +450,18 @@ def manifest_tool_families(manifest: dict | None) -> list[str]:
     for deliverable in (manifest or {}).get("deliverables") or []:
         if not isinstance(deliverable, dict):
             continue
-        for raw in deliverable.get("tool_families") or []:
-            value = str(raw).strip()
+        values = deliverable.get("tool_families", [])
+        if not isinstance(values, list) or len(values) > 24:
+            raise PrerequisiteError("each deliverable permits at most 24 typed prerequisites")
+        parse_families(values)
+        for raw in values:
+            if not isinstance(raw, str):
+                raise PrerequisiteError("prerequisite must be a typed string")
+            value = raw.strip()
             if value and value not in families:
-                families.append(value[:160])
-    return families[:64]
+                families.append(value)
+    parse_families(families)
+    return families
 
 
 def inspect_workspace(workspace: str | Path) -> dict:
@@ -749,7 +635,7 @@ def write_capabilities(root: Path, outcome: Resolution) -> Path:
     payload = {
         "schema_version": 2,
         **phase,
-        # Goal-only inspection/setup and the stronger analyst-family pass happen
+        # Existing-manifest inspection/setup and the analyst-family pass happen
         # at different points before editing. Preserve both receipts even though
         # the top-level fields intentionally expose the latest effective state.
         "phases": [*phases, phase],
@@ -764,6 +650,5 @@ __all__ = [
     "Need", "Resolution", "detect_needs", "is_present", "declare_python",
     "declare_node",
     "resolve", "setup_capabilities", "inspect_workspace",
-    "manifest_tool_families", "write_capabilities", "DOMAIN_PACKAGES",
-    "DOMAIN_BINARIES",
+    "manifest_tool_families", "write_capabilities",
 ]

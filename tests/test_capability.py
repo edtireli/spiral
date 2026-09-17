@@ -24,84 +24,41 @@ def _ids(needs) -> set[str]:
     return {n.id for n in needs}
 
 
-def test_domain_words_imply_their_obvious_toolchain():
-    assert "python:torch" in _ids(detect_needs("a diffusion image generator"))
-    assert "python:praw" in _ids(detect_needs("a Reddit bot that replies"))
-    assert "python:pandas" in _ids(detect_needs("analyse this csv analysis task"))
-    assert "binary:ffmpeg" in _ids(detect_needs("stitch the frames into a video"))
-    assert detect_needs("a static calculator web page") == [], (
-        "an ordinary web page needs nothing special; guessing costs an install")
-
-
-def test_a_fragment_of_a_word_is_not_evidence_of_a_dependency():
-    """Bare `word in text` matching invented dependencies out of ordinary English.
-
-    Every hit here was declared in requirements.txt, committed, and then really
-    installed against the run's install budget — so "gamers" bought pygame and
-    "ratios" bought an Xcode hunt.
-    """
-    assert detect_needs("a chat app for gamers") == []
-    assert detect_needs("report the win ratios") == [], "'ios' inside 'ratios'"
-    assert "python:matplotlib" not in _ids(detect_needs("render a flowchart in svg"))
-    assert "python:scikit-learn" not in _ids(
-        detect_needs("add regression tests for the parser")), (
-        "in a coding agent's goals 'regression' means a test, not a model fit")
-
-
-def test_the_true_positives_survive_the_word_boundary():
-    assert "python:praw" in _ids(detect_needs("a Reddit bot that replies"))
-    assert "python:pygame" in _ids(detect_needs("a snake game in python"))
-    assert "python:matplotlib" in _ids(detect_needs("draw two charts"))
-    assert "python:scikit-learn" in _ids(detect_needs("fit a linear regression"))
-    assert "python:requests" in _ids(detect_needs("a scraper for job ads"))
-    assert "binary:xcodebuild" in _ids(detect_needs("an iOS app"))
-    assert "binary:docker" in _ids(detect_needs("add a Dockerfile"))
-
-
-def test_analyst_tool_families_count_as_evidence_too():
-    needs = detect_needs("build the thing", ["flask", "sqlalchemy"])
-    assert {"python:flask", "python:sqlalchemy"} <= _ids(needs)
-
-
-def test_generic_llm_client_does_not_invent_transformers_dependency(tmp_path):
+def test_goal_words_never_select_packages_binaries_or_models(tmp_path):
     goals = (
-        "Build a CLI around a local LLM exposed through an HTTP endpoint",
-        "A language-model CLI that calls the model server's JSON API",
-        "Talk to a local LLM through Ollama's HTTP API",
-        "Call a hosted Hugging Face model through its HTTP inference API",
-    )
-
-    for goal in goals:
-        assert "python:transformers" not in _ids(detect_needs(goal)), goal
-    assert "python:transformers" not in _ids(
-        detect_needs("build the CLI", ["local LLM", "language model API"])
-    ), "legacy analyst prose is not a typed Python dependency declaration"
-    outcome = resolve(tmp_path, goals[0], ["local LLM"])
-    assert "python:transformers" not in _ids(outcome.declared)
-    assert not (tmp_path / "requirements.txt").exists(), (
-        "generic LLM/API language must not mutate the project manifest"
-    )
-
-
-def test_explicit_local_model_runtime_still_requires_transformers(tmp_path):
-    explicit_goals = (
+        "a diffusion image generator", "a Reddit bot that replies",
+        "analyse this csv analysis task", "stitch frames into a video",
+        "a snake game in python", "draw charts", "fit a linear regression",
+        "an iOS app", "add a Dockerfile", "a scraper for job ads",
         "Load a Hugging Face checkpoint locally and perform inference",
-        "Use the Transformers library to load the language model",
-        "Build a Python CLI that locally loads pretrained language-model weights "
-        "and performs inference",
+        "Build a Python CLI that locally loads pretrained model weights",
+        "ollama model arbitrary:tag", "ollama:another-model",
     )
+    for goal in goals:
+        assert detect_needs(goal) == []
+        assert resolve(tmp_path, goal).declared == []
+    assert not (tmp_path / "requirements.txt").exists()
+    assert not (tmp_path / "package.json").exists()
 
-    for goal in explicit_goals:
-        packages = {
-            package for need in detect_needs(goal) for package in need.packages
-        }
-        assert "transformers" in packages, goal
-    assert "python:transformers" in _ids(
-        detect_needs("build it", ["python:transformers>=4.44"])
-    ), "an explicit typed package requirement remains authoritative"
-    outcome = resolve(tmp_path, explicit_goals[0])
+
+def test_legacy_prose_is_not_an_acquisition_declaration(tmp_path):
+    import pytest
+    from spiral.prerequisites import PrerequisiteError
+
+    for families in (["flask", "sqlalchemy"], ["local LLM"], ["ffmpeg"]):
+        with pytest.raises(PrerequisiteError):
+            resolve(tmp_path, "build the thing", families)
+    assert not (tmp_path / "requirements.txt").exists()
+
+
+def test_explicit_package_declarations_remain_available(tmp_path):
+    needs = detect_needs("any unrelated objective", [
+        "python-package:transformers>=4.44", "python:httpx>=0.27",
+    ])
+    assert _ids(needs) == {"python:transformers", "python:httpx"}
+    outcome = resolve(tmp_path, "any unrelated objective", ["python-package:transformers>=4.44"])
     assert "python:transformers" in _ids(outcome.declared)
-    assert "transformers" in (tmp_path / "requirements.txt").read_text()
+    assert "transformers>=4.44" in (tmp_path / "requirements.txt").read_text()
 
 
 def test_explicit_analyst_model_family_becomes_a_typed_ollama_need():
@@ -126,20 +83,22 @@ def test_explicit_analyst_model_family_becomes_a_typed_ollama_need():
     assert next(
         need for need in needs if need.id == "binary:xcodebuild"
     ).setup_request == "", "binary: detects but never invents an install source"
-    assert not any("third/party" in need.setup_request for need in detect_needs(
-        "build it", ["brew:third/party"])), "third-party taps are not typed formulas"
+    import pytest
+    from spiral.prerequisites import PrerequisiteError
+    with pytest.raises(PrerequisiteError):
+        detect_needs("build it", ["brew:third/party"])
     assert not any(need.kind == "model" for need in detect_needs(
         "build an AI assistant")), "large model pulls must require explicit evidence"
 
 
 def test_manifest_tool_families_are_flattened_and_deduplicated():
     manifest = {"deliverables": [
-        {"tool_families": ["ffmpeg", "ollama:qwen3:8b"]},
-        {"tool_families": ["ffmpeg", "fastapi"]},
+        {"tool_families": ["binary:ffmpeg", "ollama:qwen3:8b"]},
+        {"tool_families": ["binary:ffmpeg", "python:fastapi"]},
     ]}
 
     assert manifest_tool_families(manifest) == [
-        "ffmpeg", "ollama:qwen3:8b", "fastapi",
+        "binary:ffmpeg", "ollama:qwen3:8b", "python:fastapi",
     ]
 
 
@@ -182,7 +141,8 @@ def test_typed_node_family_is_declared_before_planning(tmp_path, monkeypatch):
 
 
 def test_resolution_declares_python_and_only_reports_binaries(tmp_path):
-    outcome = resolve(tmp_path, "a diffusion model, and encode it to video")
+    outcome = resolve(tmp_path, "a diffusion model, and encode it to video",
+                      ["python-package:torch", "python-package:diffusers", "binary:ffmpeg"])
     declared = {p for need in outcome.declared for p in need.packages}
     assert {"torch", "diffusers"} <= declared
     assert "torch" in (tmp_path / "requirements.txt").read_text()
@@ -222,18 +182,18 @@ def test_presence_is_proven_by_running_the_certificate(tmp_path):
 
 
 def test_the_brief_tells_the_planner_what_it_may_rely_on(tmp_path):
-    outcome = resolve(tmp_path, "a Reddit bot")
+    outcome = resolve(tmp_path, "a Reddit bot", ["python-package:praw"])
     brief = outcome.brief()
     assert "praw" in brief
     assert "dependency manifest" in brief
 
 
 def test_capabilities_are_recorded_for_the_run(tmp_path):
-    outcome = resolve(tmp_path, "a Reddit bot")
+    outcome = resolve(tmp_path, "a Reddit bot", ["python-package:praw"])
     path = write_capabilities(tmp_path, outcome)
     assert path.is_file() and "praw" in path.read_text()
 
-    followup = resolve(tmp_path, "encode video")
+    followup = resolve(tmp_path, "encode video", ["binary:ffmpeg"])
     followup.setup_reports.append({
         "kind": "project-dependencies", "ok": True, "detail": "inspected",
     })

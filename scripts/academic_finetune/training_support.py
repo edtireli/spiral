@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import html
+import http.client
 import importlib.metadata
 import json
 import math
@@ -31,7 +32,7 @@ import uuid
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from spiral.academic_structure_contract import (
     format_structure_prompt as format_structure_task_prompt,
@@ -3411,19 +3412,59 @@ class TrainingComputeLease:
         self.release()
 
 
-def verify_ollama_empty(base_url: str = "http://127.0.0.1:11434", *, timeout: float = 3.0) -> dict[str, Any]:
+def verify_ollama_empty(
+    base_url: str = "http://127.0.0.1:11434", *, timeout: float = 4.0,
+    drain_seconds: float = 4.0, cancelled: Callable[[], bool] = lambda: False,
+    clock: Callable[[], float] = time.monotonic,
+    wait: Callable[[float], None] = time.sleep,
+    opener: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+    """Read-only natural-drain barrier, held inside each academic compute lease.
+
+    Training, text, and VLM servers all import this packaged implementation. Never
+    claim a resident based on its name or expiry; a foreign refresh cannot extend
+    our four-second deadline. No model load or unload is issued by this check.
+    """
+    opener = opener or urllib.request.urlopen
+    duration = max(0.1, min(4.0, float(timeout)))
+    grace = max(0.0, min(4.0, float(drain_seconds)))
+    deadline = clock() + min(duration, grace if grace else duration)
     request = urllib.request.Request(base_url.rstrip("/") + "/api/ps", method="GET")
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            payload = json.loads(response.read())
-    except (OSError, urllib.error.URLError, json.JSONDecodeError, ValueError) as exc:
-        raise HarnessError(f"cannot verify Ollama residency at {base_url}/api/ps: {exc}") from exc
-    models = payload.get("models") if isinstance(payload, Mapping) else None
-    if not isinstance(models, list):
-        raise HarnessError("Ollama /api/ps returned an invalid residency response")
-    if models:
-        names = [str(item.get("name") or item.get("model") or "unknown") for item in models if isinstance(item, Mapping)]
-        raise HarnessError(
-            "Ollama still has resident model(s); training will not evict them: " + ", ".join(names)
-        )
-    return {"base_url": base_url, "resident_models": [], "verified_empty": True}
+    while True:
+        if cancelled():
+            raise HarnessError("academic request cancelled during Ollama natural drain")
+        remaining = deadline - clock()
+        if remaining <= 0:
+            raise HarnessError("Ollama residency check exceeded its fixed deadline")
+        try:
+            with opener(request, timeout=remaining) as response:
+                if not 200 <= int(getattr(response, "status", 200)) < 300:
+                    raise ValueError("Ollama residency response was not successful")
+                raw = response.read((1 << 20) + 1)
+            if len(raw) > 1 << 20:
+                raise ValueError("Ollama residency response exceeded 1 MiB")
+            payload = json.loads(raw)
+        except (OSError, urllib.error.URLError, http.client.HTTPException,
+                UnicodeError, ValueError) as exc:
+            raise HarnessError(f"cannot verify Ollama residency at {base_url}/api/ps: {exc}") from exc
+        if cancelled():
+            raise HarnessError("academic request cancelled during Ollama natural drain")
+        if clock() > deadline:
+            raise HarnessError("Ollama residency check exceeded its fixed deadline")
+        models = payload.get("models") if isinstance(payload, Mapping) else None
+        if not isinstance(models, list) or len(models) > 64:
+            raise HarnessError("Ollama /api/ps returned an invalid residency response")
+        for item in models:
+            name = (item.get("name") or item.get("model")) if isinstance(item, dict) else None
+            if (not isinstance(name, str) or not name.strip() or name != name.strip()
+                    or len(name.encode("utf-8")) > 512 or "\x00" in name):
+                raise HarnessError("Ollama /api/ps returned an invalid model entry")
+        if not models:
+            return {"base_url": base_url, "resident_models": [], "verified_empty": True}
+        if not grace:
+            raise HarnessError("Ollama still has resident model(s); training will not evict them")
+        wait(min(0.1, max(0.0, deadline - clock())))
+        if cancelled():
+            raise HarnessError("academic request cancelled during Ollama natural drain")
+        if clock() >= deadline:
+            raise HarnessError("Ollama still has resident model(s); training will not evict them")

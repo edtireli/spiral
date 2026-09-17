@@ -29,20 +29,21 @@ from rich.panel import Panel
 from rich.text import Text
 
 from spiral.banner import CLASSIC, Spinner
+from spiral.ui_progress import UI_EVENT_SCHEMA, UI_EVENT_PREFIX, emit_progress
 
 CLAY = "rgb(217,119,87)"
-UI_EVENT_SCHEMA = "spiral.ui.progress.v1"
-UI_EVENT_PREFIX = "SPIRAL_UI_EVENT_V1"
-_UI_TOKEN = re.compile(r"^[0-9a-f]{32}$")
 
 
 class Dash:
     HEARTBEAT_S = 8.0
 
     def __init__(self, console: Console | None = None, plan=None, gate: str = "",
-                 thought_log: str | Path | None = None):
+                 thought_log: str | Path | None = None, plan_scope: str = "phase"):
         self.c = console or make_console()
         self.plan = plan
+        if plan_scope not in {"project", "phase"}:
+            raise ValueError("invalid public plan scope")
+        self.plan_scope = plan_scope
         self.gate = gate
         self.status: dict[tuple[int, int], str] = {}  # (mi,ti) -> run|done|blocked
         self._phase = "starting"
@@ -73,10 +74,6 @@ class Dash:
         # terminals omit it and retain exactly their existing Rich UI.  Machine UI
         # frames are full snapshots, never chain-of-thought, so a reconnecting client
         # can render the latest one without replaying terminal control sequences.
-        candidate = os.environ.get("SPIRAL_UI_EVENT_TOKEN", "").strip().lower()
-        self._ui_event_token = candidate if _UI_TOKEN.fullmatch(candidate) else ""
-        self._ui_event_sequence = 0
-        self._ui_event_lock = threading.Lock()
 
     # -- lifecycle -------------------------------------------------------------
     def __enter__(self) -> "Dash":
@@ -111,6 +108,10 @@ class Dash:
 
     def _hb_loop(self) -> None:
         while not self._stop.wait(self.HEARTBEAT_S):
+            # The native clients already render this exact heartbeat in their
+            # activity panel. Do not duplicate animation ticks as transcript lines.
+            if self._emit_ui():
+                continue
             stamp = time.strftime("%H:%M:%S")
             tok = f"{self._tokens / 1000:.1f}k tok" if self._tokens else "…"
             line = f"  ⠿ [{stamp}] {self._phase}"
@@ -123,7 +124,6 @@ class Dash:
                 line += f" · idea: {self._idea[:120]}"
             sys.stdout.write(line + "\n")
             sys.stdout.flush()
-            self._emit_ui()
 
     def _ui_snapshot(self, *, final: bool = False) -> dict:
         milestones = []
@@ -158,6 +158,7 @@ class Dash:
                 })
         return {
             "schema_version": UI_EVENT_SCHEMA,
+            "plan_scope": self.plan_scope,
             "phase": self._phase[:240],
             "model": self._model[:240],
             "detail": self._detail[:700],
@@ -170,25 +171,8 @@ class Dash:
             "milestones": milestones,
         }
 
-    def _emit_ui(self, *, final: bool = False) -> None:
-        if not self._ui_event_token:
-            return
-        with self._ui_event_lock:
-            self._ui_event_sequence += 1
-            payload = self._ui_snapshot(final=final)
-            payload["sequence"] = self._ui_event_sequence
-            line = (
-                f"{UI_EVENT_PREFIX} {self._ui_event_token} "
-                + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-                + "\n"
-            )
-            # One write keeps a frame intact with the ordinary heartbeat/output stream;
-            # the host authenticates and removes it before publishing raw log deltas.
-            try:
-                os.write(sys.stdout.fileno(), line.encode("utf-8"))
-            except (AttributeError, OSError, ValueError):
-                sys.stdout.write(line)
-                sys.stdout.flush()
+    def _emit_ui(self, *, final: bool = False) -> bool:
+        return emit_progress(self._ui_snapshot(final=final))
 
     # -- mutations ---------------------------------------------------------------
     def phase(self, name: str, model: str = "") -> None:

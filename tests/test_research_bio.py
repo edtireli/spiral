@@ -4,6 +4,8 @@ import tempfile
 from pathlib import Path
 from types import SimpleNamespace as NS
 
+import pytest
+
 from spiral.config import Config
 from spiral.research_evidence import evidence_support
 from spiral.research_loop import (
@@ -127,3 +129,92 @@ def test_gather_survives_a_dead_channel(monkeypatch):
     monkeypatch.setattr(S, "europepmc", boom)
     n = loop.gather("q", k=4)          # must not raise
     assert n == 0
+
+
+def test_distinct_providers_fetch_concurrently_but_ingest_on_caller(monkeypatch):
+    import threading
+    import spiral.sources as S
+
+    loop = _loop("neuronal protein expression")
+    loop.state.channels = ["europepmc", "pubmed", "crossref", "pubmed"]
+    rendezvous = threading.Barrier(3, timeout=3)
+    caller = threading.get_ident()
+    fetched, ingested = [], []
+
+    def adapter(name):
+        def fetch(query, k, report):
+            fetched.append(name)
+            assert threading.get_ident() != caller
+            rendezvous.wait()  # all three must start before any can complete
+            report.update(source_ok=True, result_count=1)
+            return [name]
+        return fetch
+
+    def ingest(records, on):
+        assert threading.get_ident() == caller
+        ingested.extend(records)
+        return records
+
+    for channel in ("europepmc", "pubmed", "crossref"):
+        monkeypatch.setattr(S, channel, adapter(channel))
+    monkeypatch.setattr(loop.corpus, "ingest", ingest)
+    added, health = loop._gather_channels("query", 3, on=lambda _: None)
+    assert sorted(fetched) == ["crossref", "europepmc", "pubmed"]
+    assert added == ingested == ["europepmc", "pubmed", "crossref"]
+    assert all(row["source_ok"] for row in health.values())
+
+
+def test_europe_pmc_channels_remain_serial_and_failure_does_not_hide_other_sources(monkeypatch):
+    import threading
+    import spiral.sources as S
+
+    loop = _loop("neuronal protein expression")
+    loop.state.channels = ["biorxiv", "pubmed", "europepmc", "medrxiv"]
+    rendezvous = threading.Barrier(2, timeout=3)
+    epmc_lock = threading.Lock()
+    epmc_calls = []
+
+    def epmc(name):
+        def fetch(query, k, report):
+            assert epmc_lock.acquire(blocking=False), "same provider was queried concurrently"
+            try:
+                epmc_calls.append(name)
+                if name == "biorxiv":
+                    rendezvous.wait()
+                    raise RuntimeError("preprint query unavailable")
+                report.update(source_ok=True, result_count=1)
+                return [name]
+            finally:
+                epmc_lock.release()
+        return fetch
+
+    def pubmed(query, k, report):
+        rendezvous.wait()
+        report.update(source_ok=True, result_count=1)
+        return ["pubmed"]
+
+    for channel in ("biorxiv", "europepmc", "medrxiv"):
+        monkeypatch.setattr(S, channel, epmc(channel))
+    monkeypatch.setattr(S, "pubmed", pubmed)
+    monkeypatch.setattr(loop.corpus, "ingest", lambda records, on: records)
+    added, health = loop._gather_channels("query", 3, on=lambda _: None)
+    assert epmc_calls == ["biorxiv", "europepmc", "medrxiv"]
+    assert added == ["pubmed", "europepmc", "medrxiv"]
+    assert health["biorxiv"]["source_ok"] is False
+    assert "preprint query unavailable" in health["biorxiv"]["error"]
+    assert all(health[channel]["source_ok"] for channel in added)
+
+
+@pytest.mark.parametrize("arxiv_ok, pubmed_ok", [(False, True), (True, False), (False, False)])
+def test_mixed_source_health_preserves_any_successful_provider(arxiv_ok, pubmed_ok, monkeypatch):
+    loop = _loop("mixed literature")
+    loop.state.channels = ["arxiv", "pubmed"]
+    loop.corpus.last_build_report = {"source_ok": arxiv_ok, "result_count": int(arxiv_ok)}
+    monkeypatch.setattr(loop.corpus, "build", lambda *_, **__: [])
+    monkeypatch.setattr(loop, "_gather_channels", lambda *_, **__: (
+        [], {"pubmed": {"source_ok": pubmed_ok, "result_count": int(pubmed_ok)}}))
+    reports = []
+    monkeypatch.setattr(loop, "_record_search", lambda *args: reports.append(args[-1]))
+    loop.gather("query")
+    assert reports[0]["source_ok"] == (arxiv_ok or pubmed_ok)
+    assert reports[0]["result_count"] == int(arxiv_ok) + int(pubmed_ok)

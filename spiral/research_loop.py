@@ -2423,24 +2423,53 @@ class ResearchLoop:
 
     def _gather_channels(self, query: str, k: int, on) -> tuple[list, dict]:
         """Fan out one query across the non-arXiv channels the planner selected, ingest
-        the normalised records, and return ``(added_papers, per-channel health)``."""
+        the normalised records, and return ``(added_papers, per-channel health)``.
+
+        Independent providers fetch concurrently; channels backed by Europe PMC
+        share one serial worker. Corpus mutation and progress callbacks remain on
+        the caller thread in planner order so duplicate resolution is deterministic.
+        """
+        from concurrent.futures import ThreadPoolExecutor
         from spiral import sources as S
 
         adapters = {
             "biorxiv": S.biorxiv, "medrxiv": S.medrxiv, "europepmc": S.europepmc,
             "pubmed": S.pubmed, "crossref": S.crossref,
         }
+        channels = list(dict.fromkeys(
+            chan for chan in self.state.channels if chan in adapters))
+        groups: dict[str, list[str]] = {}
+        for chan in channels:
+            provider = "europepmc" if chan in {"europepmc", "biorxiv", "medrxiv"} else chan
+            groups.setdefault(provider, []).append(chan)
+
+        def fetch_group(selected):
+            results = {}
+            for chan in selected:
+                rep: dict = {}
+                try:
+                    recs = adapters[chan](query, k=k, report=rep)
+                except Exception as exc:           # a provider must never break the loop
+                    rep = {"source": chan, "source_ok": False,
+                           "error": f"{type(exc).__name__}: {exc}", "result_count": 0}
+                    recs = []
+                results[chan] = recs, rep
+            return results
+
+        results = {}
+        if len(groups) > 1:
+            # At most three independent origins; metadata requests allocate no
+            # model weights or KV cache. Each adapter retains its HTTP timeouts.
+            with ThreadPoolExecutor(max_workers=len(groups), thread_name_prefix="spiral-sources") as pool:
+                futures = [pool.submit(fetch_group, selected) for selected in groups.values()]
+                for future in futures:
+                    results.update(future.result())
+        elif groups:
+            results = fetch_group(channels)
+
         added, health = [], {}
-        for chan in self.state.channels:
-            if chan == "arxiv" or chan not in adapters:
-                continue
-            rep: dict = {}
-            try:
-                recs = adapters[chan](query, k=k, report=rep)
-            except Exception as exc:               # a provider must never break the loop
-                rep = {"source": chan, "source_ok": False,
-                       "error": f"{type(exc).__name__}: {exc}", "result_count": 0}
-                recs = []
+        for chan in channels:
+            recs, rep = results[chan]
             health[chan] = {kk: rep.get(kk) for kk in
                             ("source_ok", "result_count", "error")}
             added += self.corpus.ingest(recs, on=on)
@@ -2473,8 +2502,8 @@ class ResearchLoop:
             retrieval = dict(retrieval)
             retrieval["channels"] = src_health
             # the loop's health checks read source_ok/result_count — reflect the union
-            retrieval.setdefault("source_ok", any(
-                h.get("source_ok") for h in src_health.values()))
+            retrieval["source_ok"] = bool(retrieval.get("source_ok")) or any(
+                h.get("source_ok") for h in src_health.values())
             retrieval["result_count"] = int(retrieval.get("result_count") or 0) + sum(
                 int(h.get("result_count") or 0) for h in src_health.values())
         for p in added:

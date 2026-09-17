@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import contextlib
 import os
 import signal
 import sys
@@ -18,6 +19,9 @@ from spiral.llm import ChatResult, Ollama
 class _Response:
     status_code = 200
 
+    def close(self):
+        pass
+
     @staticmethod
     def raise_for_status():
         return None
@@ -28,6 +32,7 @@ class _Response:
             "message": {"content": "done"},
             "prompt_eval_count": 1,
             "eval_count": 1,
+            "done": True,
             "done_reason": "stop",
         }
 
@@ -229,7 +234,7 @@ def test_residency_preflight_fails_closed_without_mutating_foreign_model(monkeyp
     messages = []
     for _ in range(2):
         with pytest.raises(SystemExit) as stopped:
-            cli._free_foreign_models(None, cfg)
+            cli._free_foreign_models(None, cfg, drain_seconds=0)
         messages.append(str(stopped.value))
 
     assert messages[0] == messages[1]
@@ -264,11 +269,168 @@ def test_residency_preflight_rejects_preexisting_same_configured_name(monkeypatc
     monkeypatch.delenv("SPIRAL_OFFLINE_TESTS", raising=False)
     monkeypatch.setattr(cli, "Ollama", Probe)
     with pytest.raises(SystemExit) as stopped:
-        cli._free_foreign_models(None, cfg)
+        cli._free_foreign_models(None, cfg, drain_seconds=0)
 
     assert configured_name in str(stopped.value)
     assert "resident before this run began" in str(stopped.value)
     assert mutations == []
+
+
+def _natural_drain_probe(monkeypatch, residents):
+    from spiral.config import Config
+
+    cfg = Config()
+    cfg.base_url = "http://127.0.0.1:11434"
+    clock = [0.0]
+    events = []
+
+    class Probe:
+        def __init__(self, base_url, timeout=1200.0, providers=None):
+            self.base_url = base_url
+            events.append(("open", base_url, timeout))
+
+        def resident_strict(self):
+            events.append(("probe", self.base_url, clock[0]))
+            return residents(self.base_url, clock[0])
+
+        def close(self):
+            events.append(("close", self.base_url))
+
+        def evict(self, _model):
+            raise AssertionError("natural drain mutated a model")
+
+    def sleep(seconds):
+        events.append(("sleep", seconds))
+        clock[0] += seconds
+
+    monkeypatch.delenv("SPIRAL_OFFLINE_TESTS", raising=False)
+    monkeypatch.setattr(cli, "Ollama", Probe)
+    return cfg, clock, events, sleep
+
+
+def test_natural_drain_empty_returns_after_one_snapshot_without_sleep(monkeypatch):
+    cfg, clock, events, sleep = _natural_drain_probe(monkeypatch, lambda *_: [])
+    cli._free_foreign_models(None, cfg, _clock=lambda: clock[0], _sleep=sleep)
+    assert len([event for event in events if event[0] == "probe"]) == 2
+    assert not any(event[0] == "sleep" for event in events)
+    assert clock[0] == 0
+
+
+def test_natural_drain_accepts_only_after_all_endpoints_are_strictly_empty(monkeypatch):
+    cfg, clock, events, sleep = _natural_drain_probe(
+        monkeypatch, lambda _url, now: ["host-expiring:27b"] if now < 0.3 else [])
+    cli._free_foreign_models(None, cfg, _clock=lambda: clock[0], _sleep=sleep)
+    assert 0.3 <= clock[0] < 0.5
+    assert all(0 < event[2] <= 1 for event in events if event[0] == "open")
+    assert len([event for event in events if event[0] == "open"]) == len(
+        [event for event in events if event[0] == "close"])
+
+
+def test_natural_drain_changing_foreign_names_never_reset_fixed_deadline(monkeypatch):
+    cfg, clock, events, sleep = _natural_drain_probe(
+        monkeypatch, lambda _url, now: [f"foreign-{int(now * 10)}:27b"])
+    with pytest.raises(SystemExit, match="will not claim or evict it"):
+        cli._free_foreign_models(None, cfg, _clock=lambda: clock[0], _sleep=sleep)
+    assert clock[0] == pytest.approx(4.0)
+    assert all(event[0] in {"open", "probe", "close", "sleep"} for event in events)
+
+
+def test_natural_drain_unknown_state_fails_immediately_even_after_resident(monkeypatch):
+    def residents(_url, now):
+        if now:
+            raise ValueError("malformed resident response")
+        return ["expiring:27b"]
+
+    cfg, clock, _events, sleep = _natural_drain_probe(monkeypatch, residents)
+    with pytest.raises(SystemExit, match="could not prove Ollama residency"):
+        cli._free_foreign_models(None, cfg, _clock=lambda: clock[0], _sleep=sleep)
+    assert clock[0] == pytest.approx(0.1)
+
+
+@pytest.mark.parametrize("primary_refused", [False, True])
+def test_natural_drain_preserves_auxiliary_refusal_exception(monkeypatch, primary_refused):
+    def residents(url, _now):
+        if primary_refused or "localhost" in url:
+            raise ConnectionRefusedError(61, "Connection refused")
+        return []
+
+    cfg, clock, events, sleep = _natural_drain_probe(monkeypatch, residents)
+    if primary_refused:
+        with pytest.raises(SystemExit, match="could not prove Ollama residency"):
+            cli._free_foreign_models(None, cfg, _clock=lambda: clock[0], _sleep=sleep)
+    else:
+        cli._free_foreign_models(None, cfg, _clock=lambda: clock[0], _sleep=sleep)
+    assert not any(event[0] == "sleep" for event in events)
+
+
+def test_natural_drain_remains_signal_cancellable_and_closes_clients(monkeypatch):
+    cfg, clock, events, _sleep = _natural_drain_probe(monkeypatch, lambda *_: ["foreign:27b"])
+
+    def interrupt(_seconds):
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        cli._free_foreign_models(None, cfg, _clock=lambda: clock[0], _sleep=interrupt)
+    assert len([event for event in events if event[0] == "open"]) == len(
+        [event for event in events if event[0] == "close"])
+
+
+def test_natural_drain_hard_offline_never_constructs_client(monkeypatch):
+    monkeypatch.setenv("SPIRAL_OFFLINE_TESTS", "1")
+    monkeypatch.setattr(cli, "Ollama", lambda *_args, **_kwargs: pytest.fail("offline probe"))
+    cli._free_foreign_models(None)
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+def test_managed_natural_drain_holds_existing_lane_and_releases_on_failure(monkeypatch, persistent):
+    held = [False]
+    lease_events = []
+
+    def residents(_url, _now):
+        assert held[0], "managed residency check happened outside its existing lane"
+        return ["foreign:27b"] if persistent else []
+
+    cfg, clock, _events, sleep = _natural_drain_probe(monkeypatch, residents)
+
+    class Lease:
+        path = "/already-configured/spiral-compute.lease"
+
+        @contextlib.contextmanager
+        def hold(self, **kwargs):
+            lease_events.append(kwargs)
+            # Acquiring the existing lane consumes the same fixed grace, rather
+            # than starting a fresh four-second deadline after acquisition.
+            clock[0] = 3.5
+            held[0] = True
+            try:
+                yield
+            finally:
+                held[0] = False
+                lease_events.append("released")
+
+    monkeypatch.setattr(cli.InferenceLease, "from_env", classmethod(lambda _cls: Lease()))
+    if persistent:
+        with pytest.raises(SystemExit, match="will not claim or evict it"):
+            cli._free_foreign_models(None, cfg, _clock=lambda: clock[0], _sleep=sleep)
+        assert clock[0] == pytest.approx(4)
+    else:
+        cli._free_foreign_models(None, cfg, _clock=lambda: clock[0], _sleep=sleep)
+        assert clock[0] == 3.5
+    assert lease_events == [{"model": cfg.worker.name, "operation": "admission", "timeout": 4.0}, "released"]
+    assert not held[0]
+
+
+def test_standalone_natural_drain_does_not_invent_a_global_lane(monkeypatch):
+    cfg, clock, _events, sleep = _natural_drain_probe(monkeypatch, lambda *_: [])
+
+    class NoLane:
+        path = None
+
+        def hold(self, **_kwargs):
+            pytest.fail("standalone preflight invented a cross-process lane")
+
+    monkeypatch.setattr(cli.InferenceLease, "from_env", classmethod(lambda _cls: NoLane()))
+    cli._free_foreign_models(None, cfg, _clock=lambda: clock[0], _sleep=sleep)
 
 
 @pytest.mark.parametrize(
@@ -462,6 +624,9 @@ def test_planner_fallback_consumes_prior_receipt_exactly_once(monkeypatch):
     class ModelResponse:
         status_code = 200
 
+        def close(self):
+            pass
+
         def __init__(self, model):
             self.model = model
 
@@ -476,6 +641,7 @@ def test_planner_fallback_consumes_prior_receipt_exactly_once(monkeypatch):
                 },
                 "prompt_eval_count": 1,
                 "eval_count": 1,
+                "done": True,
                 "done_reason": "stop",
             }
 

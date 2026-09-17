@@ -1625,6 +1625,9 @@ class Config:
     # tier, not a promise to spend the allowance.
     complexity_tier: str = "standard"
     prefer_single_resident_model: bool = True
+    # Opt-in experiment only: share one response for spec + deliverable analysis.
+    # This does not select a model, remove reviews, or change execution budgets.
+    planning_analysis_mode: str = "sequential"
 
     # Conductor/worker: qwen3.8:27b = the 3.8-gen 27B dense VLM (Q4_K_M GGUF).
     # RAM: ~17GB weights + mmproj + small hybrid KV @24k → ~19GB footprint,
@@ -2077,6 +2080,16 @@ class Config:
             cfg.providers = overlay.get("providers", cfg.providers)
         except Exception:
             pass  # a broken overlay must never break spiral
+        # An explicit experiment must not silently run a different variant after
+        # a typo. Validate outside the permissive legacy overlay handler.
+        analysis_mode = os.environ.get(
+            "SPIRAL_PLANNING_ANALYSIS_MODE",
+            overlay.get("planning_analysis_mode", "sequential")
+            if isinstance(overlay, dict) else "sequential",
+        )
+        if not isinstance(analysis_mode, str) or analysis_mode not in {"sequential", "joint"}:
+            raise ValueError("planning_analysis_mode must be sequential or joint")
+        cfg.planning_analysis_mode = analysis_mode
         # Academic serving is a separate, fail-closed route: an invalid or incomplete
         # manifest disables only that optional writer and leaves the established writer
         # untouched. The resolver performs no model or network access.
@@ -2112,4 +2125,34 @@ class Config:
                 )
                 for spec in local_specs:
                     spec.name = preferred
+        # A host-owned task has one explicitly selected local model. Apply this
+        # AFTER overlays and optional routes, outside their permissive error catch.
+        # Every nested Config.load (including research/compaction) gets the binding.
+        from spiral.model_binding import selected_local_model, require_selected_local_model
+        bound_model = selected_local_model()
+        if bound_model:
+            require_selected_local_model(bound_model, cfg.providers if isinstance(cfg.providers, dict) else {})
+            for spec in (cfg.worker, cfg.planner, cfg.escalation, cfg.critic,
+                         cfg.research_auditor, cfg.janitor):
+                spec.name = bound_model
+            cfg.research_notes_model = bound_model
+            cfg.uncensored_model = bound_model
+            cfg.academic_writer.enabled = False
+            cfg.academic_writer.ready = False
+            cfg.academic_planner.enabled = False
+            cfg.academic_planner.ready = False
+        requested_context = os.environ.get("SPIRAL_RUN_CONTEXT_TOKENS")
+        if requested_context is not None:
+            try:
+                context_tokens = int(requested_context)
+            except (ValueError, TypeError):
+                raise ValueError("run context allocation must be an integer") from None
+            if not bound_model or not 1024 <= context_tokens <= 1048576:
+                raise ValueError("run context allocation requires an exact selected model and 1024..1048576 tokens")
+            # This explicit per-run request overrides only this invocation. It
+            # is not a capability claim: every backend still admits exact input
+            # plus output against its own supported physical allocation.
+            for spec in (cfg.worker, cfg.planner, cfg.escalation, cfg.critic,
+                         cfg.research_auditor, cfg.janitor):
+                spec.num_ctx = context_tokens
         return cfg

@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 import hashlib
 import re
+import ast
+import unittest
 from pathlib import Path
 
 from spiral.planner import _is_product_build, product_profile
@@ -74,6 +76,37 @@ def _test_files(root: Path) -> list[Path]:
     return rows
 
 
+def _has_assertions(path: Path) -> bool:
+    """Detect assertion syntax, never claim that tests executed or passed."""
+    if path.stat().st_size >= 500_000:
+        return False
+    text = path.read_text(errors="replace")
+    if path.suffix == ".py":
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            return False
+        methods = {name for name in dir(unittest.TestCase)
+                   if name.startswith("assert") and callable(getattr(unittest.TestCase, name))}
+        pytest_modules = {alias.asname or alias.name for node in ast.walk(tree)
+                          if isinstance(node, ast.Import) for alias in node.names
+                          if alias.name == "pytest"}
+        contexts = {"raises", "warns", "deprecated_call"}
+        pytest_contexts = {alias.asname or alias.name for node in ast.walk(tree)
+                           if isinstance(node, ast.ImportFrom) and node.module == "pytest"
+                           for alias in node.names if alias.name in contexts}
+        return any(isinstance(node, ast.Assert) or (
+            isinstance(node, ast.Call) and (
+                isinstance(node.func, ast.Attribute) and (node.func.attr in methods or (
+                    isinstance(node.func.value, ast.Name) and node.func.value.id in pytest_modules
+                    and node.func.attr in contexts)) or
+                isinstance(node.func, ast.Name) and node.func.id in pytest_contexts))
+                   for node in ast.walk(tree))
+    return bool(re.search(
+        r"\b(?:assert|expect|should|test|it|describe)\s*(?:\(|\b)|@Test\b|#\[test\]",
+        text, re.I))
+
+
 def _issue(identifier: str, severity: str, evidence: str, fix: str,
            files: list[str] | None = None) -> dict:
     return {
@@ -110,24 +143,28 @@ def audit_product(workspace: str | Path, goal: str, project_kind: str = "other")
 
     workspace_root = Path(workspace).resolve()
     from spiral.builder_tools import runnable_project_roots
+    from spiral.conductor import Conductor
 
     roots = runnable_project_roots(workspace_root)
     root = workspace_root
     profile = product_profile(goal, project_kind)
-    if not _is_product_build(goal, project_kind):
-        return {"applicable": False, "profile": profile, "issues": []}
 
     manifest_path = workspace_root / ".spiral" / "artifacts.json"
     try:
         manifest = json.loads(manifest_path.read_text()) if manifest_path.is_file() else {}
-        raw_goal = str(goal).split(
-            "\n\nDESIGN SPECIFICATION (implement these decisions literally):", 1
-        )[0].split("\n\nEMPIRICAL LOCAL TOOL PROFILE", 1)[0].strip()
+        raw_goal = Conductor._raw_goal(goal)
         if manifest.get("goal_sha256") != hashlib.sha256(
                 raw_goal.encode("utf-8")).hexdigest():
             manifest = {}
     except Exception:
         manifest = {}
+    # A goal-bound deliverable declaration determines whether there is a product
+    # to audit. Runtime observations containing "build" cannot create this scope.
+    declared = [row for row in (manifest.get("deliverables") or [])
+                if isinstance(row, dict) and isinstance(row.get("kind"), str) and row["kind"] in
+                _CODE_KINDS | _DELIVERABLE_EXTENSIONS.keys()]
+    if not declared and not _is_product_build(Conductor._raw_goal(goal), project_kind):
+        return {"applicable": False, "profile": profile, "issues": []}
     deliverables = [
         row for row in (manifest.get("deliverables") or [])
         if isinstance(row, dict)
@@ -251,11 +288,7 @@ def audit_product(workspace: str | Path, goal: str, project_kind: str = "other")
             "and failure paths, then wire them into the normal test/build command.",
         ))
     elif code_required:
-        test_text = "\n".join(
-            path.read_text(errors="replace") for path in tests if path.stat().st_size < 500_000)
-        if not re.search(
-                r"\b(?:assert|expect|should|test|it|describe)\s*(?:\(|\b)|@Test\b|#\[test\]",
-                test_text, re.I):
+        if not any(_has_assertions(path) for path in tests):
             issues.append(_issue(
                 "product-test-substance", "major",
                 "Test files exist, but no executable assertions or test cases were detected.",

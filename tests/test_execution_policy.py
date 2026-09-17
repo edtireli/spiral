@@ -184,6 +184,9 @@ def test_serial_typed_dag_carries_evidence_and_uncertainty(tmp_path):
 class FakeResponse:
     status_code = 200
 
+    def close(self):
+        pass
+
     def raise_for_status(self):
         return None
 
@@ -192,6 +195,7 @@ class FakeResponse:
             "message": {"content": "done"},
             "prompt_eval_count": 7,
             "eval_count": 3,
+            "done": True,
             "done_reason": "stop",
         }
 
@@ -293,6 +297,9 @@ def test_provider_floor_fits_exactly_without_exceeding_total_ledger(monkeypatch)
 
     class Response:
         status_code = 200
+
+        def close(self):
+            pass
 
         @staticmethod
         def json():
@@ -467,6 +474,9 @@ def test_local_transport_retry_recovers_and_charges_each_dispatch(monkeypatch):
     class Response:
         status_code = 200
 
+        def close(self):
+            pass
+
         @staticmethod
         def raise_for_status():
             return None
@@ -477,6 +487,7 @@ def test_local_transport_retry_recovers_and_charges_each_dispatch(monkeypatch):
                 "message": {"content": "done"},
                 "prompt_eval_count": 3,
                 "eval_count": 4,
+                "done": True,
                 "done_reason": "stop",
             }
 
@@ -558,7 +569,7 @@ def test_local_stream_disconnect_is_retried_without_aborting_the_run(monkeypatch
     assert client.budget.total_tokens == reserve + 10 + 3 + 4
 
 
-def test_local_stream_stall_after_partial_is_closed_reset_and_retried(
+def test_local_stream_stall_after_partial_quarantines_machine_before_replay(
         tmp_path, monkeypatch):
     messages = [{"role": "user", "content": "finish"}]
     reserve = _prompt_token_reserve(messages)
@@ -599,24 +610,24 @@ def test_local_stream_stall_after_partial_is_closed_reset_and_retried(
     deltas = []
     started = time.monotonic()
     try:
-        result = client.chat(
-            "local:27b", messages, num_predict=10,
-            on_delta=lambda kind, piece: deltas.append((kind, piece)),
-        )
+        from spiral.llm import InferenceLeaseTimeout
+        with pytest.raises(InferenceLeaseTimeout, match="reconciliation required"):
+            client.chat(
+                "local:27b", messages, num_predict=10,
+                on_delta=lambda kind, piece: deltas.append((kind, piece)),
+            )
     finally:
         client.close()
 
     assert time.monotonic() - started < 1
     assert stalled_closed.is_set(), "the timed-out response was not closed"
     assert _can_lock(lease_path), "the timed-out stream leaked its inference lease"
-    assert result.text == "done"
-    assert result.raw["spiral_local_transport_attempts"] == 2
-    assert len(calls) == 2
-    assert deltas == [
-        ("text", "partial"), ("reset", ""), ("text", "done"),
-    ]
-    assert client.budget.calls == 2
-    assert client.budget.total_tokens == reserve + 10 + 3 + 4
+    assert len(calls) == 1, "socket closure cannot authorize a second backend inference"
+    assert deltas == [("text", "partial")]
+    assert client.budget.calls == 1
+    assert client.budget.total_tokens == reserve + 10
+    marker = json.loads((tmp_path / "spiral-compute.inference.json").read_text())
+    assert marker["state"] == "uncertain"
 
 
 def test_local_stream_stall_limit_does_not_cut_off_slow_first_chunk():
