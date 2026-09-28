@@ -7,9 +7,9 @@ from spiral.execution import BudgetLimits, RunBudget
 from spiral.llm import Ollama, OfflineModelAccess
 
 
-def client(monkeypatch, bridge):
+def client(monkeypatch, bridge, backend="owned_llama"):
     monkeypatch.setenv("SPIRAL_OFFLINE_TESTS", "1")
-    monkeypatch.setenv("SPIRAL_ENGINE_INFERENCE_BACKEND", "owned_llama")
+    monkeypatch.setenv("SPIRAL_ENGINE_INFERENCE_BACKEND", backend)
     model = Ollama(providers={})  # Physical no-network transport for this fixture.
     monkeypatch.delenv("SPIRAL_OFFLINE_TESTS")
     monkeypatch.setitem(sys.modules, "spiral_engine_owned", SimpleNamespace(OwnedEngineTransport=bridge))
@@ -17,7 +17,8 @@ def client(monkeypatch, bridge):
     return model
 
 
-def test_owned_seam_preserves_budget_selected_request_and_live_callback(monkeypatch):
+@pytest.mark.parametrize("backend", ["owned_llama", "slotstream"])
+def test_owned_seam_preserves_budget_selected_request_and_live_callback(monkeypatch, backend):
     seen = []
     class Bridge:
         def __init__(self, client):
@@ -30,7 +31,7 @@ def test_owned_seam_preserves_budget_selected_request_and_live_callback(monkeypa
             return {"text": "first", "prompt_tokens": 7, "completion_tokens": 1}
         def close(self):
             seen.append("closed")
-    with client(monkeypatch, Bridge) as model:
+    with client(monkeypatch, Bridge, backend) as model:
         result = model.chat("selected:exact", [{"role": "user", "content": "keep constraints"}],
             num_predict=64, num_ctx=8192, fmt={"type": "object"}, stop=["STOP"],
             on_delta=lambda kind, text: seen.append(text))
@@ -39,6 +40,16 @@ def test_owned_seam_preserves_budget_selected_request_and_live_callback(monkeypa
         assert seen[0]["format"] == {"type": "object"}
         assert seen[0]["options"]["stop"] == ["STOP"]
     assert seen[-1] == "closed"
+
+
+def test_slotstream_discovery_uses_verified_catalog_without_ollama_or_gguf(monkeypatch):
+    monkeypatch.setenv("SPIRAL_ENGINE_INFERENCE_BACKEND", "slotstream")
+    monkeypatch.setenv("SPIRAL_OFFLINE_TESTS", "1")
+    monkeypatch.setitem(sys.modules, "spiral_slotstream", SimpleNamespace(
+        catalog_entry=lambda: {"name": "qwen3.8-flash-next:4bit"}))
+    with Ollama(providers={}) as model:
+        assert model.models() == ["qwen3.8-flash-next:4bit"]
+        assert model.source_tokenizer("qwen3.8-flash-next:4bit") is None
 
 
 def test_consumer_stop_is_not_retried_as_a_transport_error(monkeypatch):
