@@ -726,7 +726,8 @@ class Ollama:
         being edited never supplies an executable or a tokenizer binding.
         """
         binary = os.environ.get("SPIRAL_CONTEXT_TOKENIZER", "")
-        if not binary or model in self.providers:
+        if (not binary or model in self.providers
+                or os.environ.get("SPIRAL_ENGINE_INFERENCE_BACKEND") == "slotstream"):
             return None
         from urllib.parse import urlsplit
         from spiral.context_measurement import ContextMeasurementUnavailable, SourceTokenizer
@@ -994,6 +995,10 @@ class Ollama:
     def models(self) -> list[str]:
         """Installed model names, or [] if unreachable — callers treat an empty
         list as 'could not check' rather than 'nothing installed'."""
+        if os.environ.get("SPIRAL_ENGINE_INFERENCE_BACKEND") == "slotstream":
+            from spiral_slotstream import catalog_entry
+            entry = catalog_entry()
+            return [entry["name"]] if entry else []
         try:
             r = self._client.get(f"{self.base_url}/api/tags")
             r.raise_for_status()
@@ -1236,9 +1241,9 @@ class Ollama:
             num_ctx=num_ctx, keep_alive=keep_alive,
         )
         backend = os.environ.get("SPIRAL_ENGINE_INFERENCE_BACKEND", "ollama")
-        if backend not in {"ollama", "owned_llama"}:
+        if backend not in {"ollama", "owned_llama", "slotstream"}:
             raise ValueError("unsupported managed engine inference backend")
-        if backend == "owned_llama":
+        if backend in {"owned_llama", "slotstream"}:
             if os.environ.get("SPIRAL_OFFLINE_TESTS"):
                 raise OfflineModelAccess("offline tests cannot start owned engine inference")
             if not hasattr(self, "_owned_engine_transport"):
