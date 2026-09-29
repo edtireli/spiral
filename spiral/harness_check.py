@@ -52,6 +52,11 @@ def require_verifier_started(output: str, code: int) -> None:
     importing a missing application dependency remains a real failing test.
     """
     if code:
+        if ("Fatal Python error: init_fs_encoding:" in (output or "")
+                and "Python runtime state: core initialized" in output):
+            raise HarnessFault(
+                "Python could not initialize its standard library; "
+                "no source-edit attempt was consumed")
         for line in (output or "").splitlines():
             if line.startswith(VERIFIER_UNAVAILABLE):
                 raise HarnessFault(line + "; no source-edit attempt was consumed")
