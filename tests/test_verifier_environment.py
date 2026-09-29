@@ -56,6 +56,44 @@ def test_project_version_constraint_is_preserved_with_harness_requirement(tmp_pa
     assert install[-2:] == ["pytest==8.3.5", "pytest"]
 
 
+@pytest.mark.parametrize("change", ["executable", "base_prefix", "version", "legacy"])
+def test_interpreter_change_rebuilds_cache_and_preserves_old_environment(tmp_path, monkeypatch, change):
+    calls = fake_installer(monkeypatch)
+    first = builder_tools.ensure_python_dependencies(tmp_path, verification_requirements=("pytest",))
+    assert first["ok"]
+    cache = tmp_path / ".spiral/dependency-cache/python"
+    marker = cache / "venv/old-environment.txt"
+    marker.write_text("old environment evidence")
+    old_state = json.loads((cache / "state.json").read_text())
+    if change == "legacy":
+        old_state.pop("interpreter")
+        old_state["input_sha256"] = "legacy requirements-only digest"
+        (cache / "state.json").write_text(json.dumps(old_state))
+    else:
+        monkeypatch.setattr(builder_tools.sys, change, getattr(sys, change) + "-new-host")
+    calls.clear()
+    again = builder_tools.ensure_python_dependencies(tmp_path, verification_requirements=("pytest",))
+    assert again["ok"] and again["changed"]
+    assert calls[0][0] == [sys.executable, "-m", "venv", str(cache / "venv")]
+    assert not marker.exists()
+    retired = list(cache.glob("venv-retired-*/old-environment.txt"))
+    assert len(retired) == 1 and retired[0].read_text() == "old environment evidence"
+    count = len(calls)
+    cached = builder_tools.ensure_python_dependencies(tmp_path, verification_requirements=("pytest",))
+    assert cached["ok"] and not cached["changed"] and len(calls) == count
+
+
+def test_failed_environment_rebuild_never_returns_old_environment_as_ready(tmp_path, monkeypatch):
+    calls = fake_installer(monkeypatch)
+    assert builder_tools.ensure_python_dependencies(tmp_path, verification_requirements=("pytest",))["ok"]
+    monkeypatch.setattr(builder_tools.sys, "base_prefix", sys.base_prefix + "-new-host")
+    monkeypatch.setattr(builder_tools.subprocess, "run", lambda *a, **k:
+                        SimpleNamespace(returncode=1, stdout="", stderr="venv creation failed"))
+    report = builder_tools.ensure_python_dependencies(tmp_path, verification_requirements=("pytest",))
+    assert not report["ok"] and "environment" not in report
+    assert not (tmp_path / ".spiral/dependency-cache/python/state.json").exists()
+
+
 def test_no_selected_ladder_does_not_acquire_test_runner(tmp_path, monkeypatch):
     (tmp_path / "pyproject.toml").write_text('[project]\nname="demo"\n')
     python_ladder(tmp_path)  # Old materialized files alone do not grant a request.
@@ -88,6 +126,15 @@ def test_actual_assertion_failure_remains_a_code_failure(tmp_path):
     result = subprocess.run(command, shell=True, cwd=tmp_path, capture_output=True, text=True)
     assert result.returncode != 0 and "1 failed" in result.stdout
     require_verifier_started(result.stdout + result.stderr, result.returncode)
+
+
+def test_python_standard_library_startup_failure_is_not_a_project_failure():
+    output = ("Fatal Python error: init_fs_encoding: failed to get the Python codec\n"
+              "Python runtime state: core initialized\n"
+              "ModuleNotFoundError: No module named 'encodings'\n")
+    with pytest.raises(HarnessFault, match="standard library"):
+        require_verifier_started(output, 1)
+    require_verifier_started("ModuleNotFoundError: No module named 'encodings'", 1)
 
 
 @pytest.mark.parametrize("entry", ["worker", "conductor"])

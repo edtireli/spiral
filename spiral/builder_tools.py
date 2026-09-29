@@ -704,11 +704,20 @@ def ensure_python_dependencies(workspace: str | Path, *, timeout: int = 900,
     venv = cache / "venv"
     state_path = cache / "state.json"
     cache.mkdir(parents=True, exist_ok=True)
+    # A packaged-host upgrade changes the trusted interpreter's location. A
+    # venv from the old host can still exist but its stdlib is outside the new
+    # sandbox profile. Dependency names alone cannot certify that environment.
+    interpreter = {
+        "executable": str(Path(sys.executable).resolve()),
+        "base_prefix": str(Path(sys.base_prefix).resolve()),
+        "version": sys.version,
+    }
     digest = hashlib.sha256()
     for path in inputs:
         digest.update(str(path.relative_to(root)).encode())
         digest.update(path.read_bytes())
     digest.update("\n".join(requirements).encode())
+    digest.update(json.dumps(interpreter, sort_keys=True).encode())
     wanted = digest.hexdigest()
     python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     bindir = python.parent
@@ -743,6 +752,10 @@ def ensure_python_dependencies(workspace: str | Path, *, timeout: int = 900,
     Path(env["PIP_CACHE_DIR"]).mkdir(exist_ok=True)
     started = time.time()
     try:
+        if venv.exists() and state.get("interpreter") != interpreter:
+            # Preserve the old cache for diagnosis; do not retarget symlinks or
+            # allow the sandbox to read an obsolete host installation.
+            venv.rename(cache / f"venv-retired-{time.time_ns()}")
         if not python.is_file():
             made = subprocess.run(
                 [sys.executable, "-m", "venv", str(venv)], cwd=root,
@@ -766,6 +779,7 @@ def ensure_python_dependencies(workspace: str | Path, *, timeout: int = 900,
             raise RuntimeError((result.stderr or result.stdout or "pip install failed")[-3000:])
         record = {
             "schema_version": 1,
+            "interpreter": interpreter,
             "input_sha256": wanted,
             "requirements": requirements,
             "verification_requirements": list(verification_requirements),
