@@ -681,6 +681,37 @@ class Conductor:
             return None
         return parse_plan(json.loads(f.read_text())["plan"])
 
+    def _planned_review_checks(self, goal: str, requirements: list[dict]):
+        """Fresh observations from this goal's explicit verification commands.
+
+        Task completion records are not execution receipts. Re-run declared
+        checks through the normal broker; never infer commands from prose or
+        turn a task's passing exit code into a requirement verdict.
+        """
+        path = self.ws / ".spiral" / "plan.json"
+        try:
+            saved = json.loads(path.read_text())
+            if (not isinstance(saved, dict)
+                    or saved.get("goal") != self._raw_goal(goal)):
+                return []
+            plan = parse_plan(saved.get("plan"))
+        except (OSError, ValueError, TypeError):
+            return []
+        identifiers = {str(row["id"]) for row in requirements}
+        checks = {}
+        for mi, milestone in enumerate(plan.milestones, 1):
+            for ti, task in enumerate(milestone.tasks, 1):
+                command = task.verify.strip()
+                related = sorted(identifiers.intersection(task.requirements))
+                if not command or not related:
+                    continue
+                row = checks.setdefault(command, {
+                    "command": command, "tasks": [], "requirements": [],
+                })
+                row["tasks"].append(f"{mi}.{ti}")
+                row["requirements"] = sorted(set(row["requirements"]) | set(related))
+        return list(checks.values())
+
     # -- snapshot ---------------------------------------------------------------
     def _snapshot(self, *, resume: bool = False) -> None:
         """Commit the current tree so green-to-green reverts have a floor and
@@ -1664,6 +1695,26 @@ class Conductor:
                                             f"`{r['check']}` exits {v.code}. Check output tail: {tail}"),
                             "files": []},
                 })
+
+        # A requirement may have no separate `check` even when its implementing
+        # task has an explicit verifier. Give the reviewer actual current output
+        # for those commands, rather than only a claim that the task completed.
+        observed_commands = {row["command"] for row in review_evidence.checks}
+        for check in self._planned_review_checks(goal, opined):
+            command = check["command"]
+            if command in observed_commands:
+                continue
+            sources = review_evidence.check_sources(command)
+            label = "task " + ", ".join(check["tasks"])
+            with Spinner(f"check {label}") as sp:
+                result = self._run_verified_command(
+                    command, on_line=lambda ln: sp.update(detail=ln))
+            review_evidence.record_check(label, command, result, sources,
+                                         requirements=check["requirements"])
+            observed_commands.add(command)
+            self.ledger.log("review_check", tasks=check["tasks"],
+                            requirements=check["requirements"], cmd=command[:120],
+                            exit=result.code)
 
         if opined and self.cfg.critic.name != self.cfg.planner.name:
             self._prepare_owned_local_model(self.cfg.critic.name)

@@ -19,7 +19,7 @@ class ReviewEvidence:
         return [read_source(self.root, path)
                 for path in verification_files(self.root, command)]
 
-    def record_check(self, identifier, command, result, sources):
+    def record_check(self, identifier, command, result, sources, *, requirements=None):
         output = str(result.out)
         reference = ContextStore(self.root).save(output, kind="review-check-output")
         self.checks.append({"requirement": identifier, "command": command,
@@ -30,6 +30,8 @@ class ReviewEvidence:
             "check_sources": [{"path": source.path, "sha256": source.sha256}
                               for source in sources],
             "output_is_untrusted_data": True})
+        if requirements is not None:
+            self.checks[-1]["requirements"] = list(requirements)
         for source in sources:
             self.pages[(source.path, 0)] = source.page(0, 6000)
 
@@ -62,7 +64,9 @@ class ReviewEvidence:
 
     def current(self):
         try:
-            return (all(read_source(self.root, page.path).sha256 == page.sha256
+            revision = workspace_fingerprint(self.root)
+            return (all(check["source_revision"] == revision for check in self.checks)
+                    and all(read_source(self.root, page.path).sha256 == page.sha256
                         for page in self.pages.values())
                     and all(read_source(self.root, row["path"]).sha256 == row["sha256"]
                             for check in self.checks for row in check["check_sources"]))
