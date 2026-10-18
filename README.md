@@ -58,6 +58,7 @@ default model set; smaller machines can run a smaller crew (see
 ```bash
 spiral setup                      # first run: detect Ollama, pull a RAM-matched model crew
 spiral tune                       # once per machine: size model context windows to your RAM
+spiral                            # choose from already installed models (no model loading)
 spiral build "make me a pomodoro TUI in python, with tests"
 ```
 
@@ -346,12 +347,63 @@ coverage report needed to state exactly what was and was not established.
 | `spiral research --taste-like "angle"` | teach the machine-local taste profile a research direction you value |
 | `spiral research --taste-dislike "angle"` | teach the machine-local taste profile a direction to de-emphasize |
 | `spiral chat ["message"]` | talk to the local thinking model; reasoning shown dimmed |
+| `spiral session <action>` | start, inspect, watch, question, steer, or cancel the same host-owned work used by SpiralChat |
 | `spiral consult ["question"]` | send the whole project to a big-context API model for review |
 | `spiral prose FILE --rewrite` | rewrite passages against the packaged Signs-of-AI-writing catalogue, keeping only candidates that preserve content and reduce raw tells |
 | `spiral prose FILE --deep` | implies `--rewrite`; for an article, research closely matched full-text papers, mine their structure and language profile, then rewrite against both profiles |
 | `spiral prose FILE --beef-up` | implies `--deep`; add bounded academic detail only after the research-grade corpus gate passes and at least four close primary full texts supply exact evidence anchors |
 | `spiral prose FILE --restructure` | implies `--deep`; move intact native section blocks toward the corpus-observed rhetorical arc without regenerating their content |
 | `spiral prose FILE --audit` | implies `--deep`; write a separate corpus-grounded high-level paper audit without silently applying its recommendations |
+
+### Shared sessions with SpiralChat
+
+`spiral session` connects to SpiralChat's existing v2 host. The host keeps the
+durable journal, tool execution and local Ollama model; the terminal and apps
+observe and control the same work. SpiralChat discovers these turns through its
+normal host recovery and creates their conversations with the same message IDs.
+
+```bash
+spiral session list
+spiral session start "Fix the tests" --dir /absolute/path/on/the/host
+spiral session watch aw_WORK_ID
+spiral session message aw_WORK_ID "What have you checked so far?"
+spiral session steer aw_WORK_ID "Keep the existing theme"
+spiral session show aw_WORK_ID
+spiral session tools aw_WORK_ID
+spiral session cancel aw_WORK_ID
+```
+
+Use `start --conversation CONVERSATION_ID` to attach work to an existing
+SpiralChat conversation, or omit it for a new one. `--model MODEL` selects an
+Ollama model on the host; otherwise the host chooses its default. `--dir` is an
+absolute **host** path; it defaults to the terminal's current directory.
+`--read-only` restricts the session to observation tools. A normal start grants
+workspace commands, writes and child runs within the host's policy.
+
+The default connection is `http://127.0.0.1:8124`. For the same HTTPS gateway
+used by the phone, set `SPIRALCHAT_HOST=https://your-host:8443/spiral`, pass
+`--token-file /path/to/token`, and use `--ca-cert /path/to/trusted-ca.pem` for a
+private CA. `SPIRALCHAT_TOKEN` and `SPIRALCHAT_CA_CERT` are also supported.
+Remote connections require HTTPS and retain certificate verification.
+
+Ctrl-C detaches from `watch`; host work continues. The printed event cursor can
+be reused with `watch --after N`. `--json` provides structured output and JSON
+lines for watching. A question uses the host's dialogue inbox; `steer` explicitly
+revises the task. Permission, clarification and budget waits remain visible in
+`show` and `watch`, and can be handled in SpiralChat. The terminal does not
+acknowledge or consume the apps' pending terminal deliveries.
+
+Every mutation prints its request ID before submission. If the connection drops
+with an unknown POST outcome, inspect `session list` and reuse the **same ID and
+arguments** with `--request-id ID`; the host deduplicates exact requests and
+rejects changed content under the same ID. Listing normally shows the newest
+work up to `--limit`; `list --delivery-state pending` or `delivered` enables the
+host's oldest-first delivery pagination with `--cursor`.
+
+This is the first shared-session bridge. Existing standalone `build` and `chat`
+commands keep their current execution paths; Claude Code feature parity is
+separate work. From a checkout, use `python -m spiral.cli session ...` or an
+editable installation to run this unreleased command.
 
 ### Research-backed prose rewriting
 
@@ -426,6 +478,17 @@ During a run:
 ## <img src="https://raw.githubusercontent.com/edtireli/spiral/main/assets/mark.svg" width="21" alt=""/> Configuration
 
 Models can be set per shell or persistently.
+
+Run `spiral` or `spiral models` in a terminal to choose from models already
+installed on the configured Ollama server. Use the arrow keys to move, type to
+filter, and press Enter to save. Escape cancels. The picker shows model sizes,
+scrolls through long lists, and saves one choice for the worker, planner,
+escalation, critic, research auditor and janitor. Embedding-only models are
+listed but cannot be selected for builds. `spiral models --list` only lists
+the inventory. Listing and selecting never download, load or run a model.
+Existing `SPIRAL_<ROLE>` shell overrides still take priority; the picker tells
+you how to clear them if necessary. Plain `spiral` keeps its status-only
+behavior when its output is piped.
 
 ```bash
 export SPIRAL_WORKER=qwen3.8:27b

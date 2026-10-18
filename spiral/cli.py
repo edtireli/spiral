@@ -1,6 +1,6 @@
 """Entry point.
 
-    spiral                                   banner + ollama health
+    spiral                                   installed-model picker (terminal)
     spiral do   "<goal>" --verify "<cmd>"    one task → green (the atom)
     spiral plan  --goal-file F [--dir D]      show the conductor's decomposition (cheap)
     spiral build --goal-file F [--dir D]      plan, then execute the whole project
@@ -11,6 +11,7 @@ import argparse
 import contextlib
 import os
 import signal
+import sys
 import threading
 import time
 from pathlib import Path
@@ -336,6 +337,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(prog="spiral", add_help=True)
     sub = parser.add_subparsers(dest="cmd")
 
+    models = sub.add_parser("models", help="choose from models already installed; never loads a model")
+    models.add_argument("--list", action="store_true", help="list installed models without changing the selection")
+
+    from spiral.session_cli import add_arguments as add_session_arguments
+    add_session_arguments(sub)
+
     do = sub.add_parser("do", help="drive a single task to green")
     do.add_argument("goal")
     do.add_argument("--verify", required=True, help="command that must exit 0")
@@ -542,10 +549,20 @@ def main() -> None:
 
     args = parser.parse_args()
     console = make_console()
+    if args.cmd == "session":
+        # The SpiralChat host owns the model, work and journal. This client must
+        # not perform local model admission/cleanup or add a banner to JSON output.
+        from spiral.session_cli import run as run_session
+        raise SystemExit(run_session(args, console))
     if getattr(args, "cmd", None) == "research":   # the one place research branding appears
         print_banner(console, tagline="local autonomous researcher · on-device", research=True)
     else:
         print_banner(console)   # shows for every command, holds ~1s, then work follows
+
+    if args.cmd == "models" or (args.cmd is None and console.is_terminal and sys.stdin.isatty()):
+        from spiral.model_picker import run as pick_model
+
+        raise SystemExit(pick_model(console, Config.load(), list_only=getattr(args, "list", False)))
 
     # Before any dispatch: every subcommand below loads its own Config, and this
     # sets the env overrides they all read.
